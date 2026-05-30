@@ -9,4 +9,3 @@ This directory contains separate review notes for the Rust codebase.
 - `005-document-ingest-should-be-transactional.md`: partial document state can be committed
 - `007-utf8-safe-chunking.md`: byte-based chunk boundaries are not safe for Unicode text
 - `008-file-filtering-and-size-guards.md`: ingest reads unsupported or oversized files too eagerly
-- `009-new-model-backfill-is-incomplete.md`: new embedding models only backfill filename chunks

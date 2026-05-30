@@ -316,16 +316,3 @@ pub fn complete_job(conn: &Connection, job_id: i64) -> Result<()> {
         .context("failed to complete job")?;
     Ok(())
 }
-
-/// Insert pending embedding rows for every existing document under a new model.
-pub fn seed_pending_for_all_docs(conn: &Connection, model_id: i64, now: i64) -> Result<usize> {
-    let docs = list_documents(conn)?;
-    let mut count = 0;
-
-    for doc in &docs {
-        insert_pending_embeddings(conn, doc.id, model_id, &[(ChunkType::Filename, 0, 0)], now)?;
-        count += 1;
-    }
-
-    Ok(count)
-}

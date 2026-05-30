@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use ask_core::models::{Document, IngestFolderPayload, JobQueueEntry};
+use ask_core::models::{Document, EmbeddingModel, IngestFolderPayload, JobQueueEntry};
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, JobType};
 use tracing::{error, info, warn};
@@ -67,6 +67,37 @@ trait JobHandler: Send + Sync {
 /// place so the row becomes claimable again only after the stale timeout.
 pub fn dispatch_job(pool: &DbPool, entry: &JobQueueEntry, model_id: i64) -> Result<()> {
     dispatch_job_with_resolver(pool, entry, model_id, resolve_handler)
+}
+
+/// Queue pending embeddings for every existing document under a new model.
+///
+/// This reuses the same filename/content chunking plan as normal ingest so a
+/// newly registered model sees the full existing corpus.
+///
+/// # Errors
+///
+/// Returns an error if existing documents cannot be listed or embedding rows
+/// cannot be queued for a document.
+pub fn backfill_pending_for_model(
+    conn: &rusqlite::Connection,
+    model: &EmbeddingModel,
+    now: i64,
+) -> Result<usize> {
+    let docs = repository::list_documents(conn)?;
+    let mut count = 0;
+
+    for doc in docs {
+        queue_pending_embeddings_for_document(conn, Path::new(&doc.filepath), doc.id, model, now)
+            .with_context(|| {
+            format!(
+                "failed to backfill pending embeddings for document {} at {}",
+                doc.id, doc.filepath
+            )
+        })?;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 fn dispatch_job_with_resolver<R>(
@@ -247,53 +278,62 @@ impl JobHandler for IngestFolderHandler {
             let doc_id = repository::insert_document(&conn, &doc)
                 .with_context(|| format!("failed to insert document for {filepath}"))?;
 
-            repository::insert_pending_embeddings(
-                &conn,
-                doc_id,
-                ctx.model_id,
-                &[(ChunkType::Filename, 0, 0)],
-                now,
-            )
-            .with_context(|| format!("failed to queue filename embedding for {filepath}"))?;
-
-            match std::fs::read_to_string(&path) {
-                Ok(content) if !content.is_empty() => {
-                    let chunk_refs: Vec<(ChunkType, i64, i64)> = chunk_content(
-                        &content,
-                        model.chunk_size as usize,
-                        model.chunk_overlap as usize,
-                    )
-                    .into_iter()
-                    .map(|(start, end)| (ChunkType::Content, start as i64, end as i64))
-                    .collect();
-
-                    if !chunk_refs.is_empty() {
-                        repository::insert_pending_embeddings(
-                            &conn,
-                            doc_id,
-                            ctx.model_id,
-                            &chunk_refs,
-                            now,
-                        )
-                        .with_context(|| {
-                            format!("failed to queue content embeddings for {filepath}")
-                        })?;
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(
-                        job_id = ctx.entry.id,
-                        path = %filepath,
-                        error = %err,
-                        "skipping content chunking for unreadable file"
-                    );
-                }
-            }
+            queue_pending_embeddings_for_document(&conn, &path, doc_id, &model, now)
+                .with_context(|| format!("failed to queue pending embeddings for {filepath}"))?;
         }
 
         Ok(())
     }
+}
+
+fn queue_pending_embeddings_for_document(
+    conn: &rusqlite::Connection,
+    path: &Path,
+    doc_id: i64,
+    model: &EmbeddingModel,
+    now: i64,
+) -> Result<()> {
+    let filepath = path.to_string_lossy();
+
+    repository::insert_pending_embeddings(
+        conn,
+        doc_id,
+        model.id,
+        &[(ChunkType::Filename, 0, 0)],
+        now,
+    )
+    .with_context(|| format!("failed to queue filename embedding for {filepath}"))?;
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) if !content.is_empty() => content,
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            warn!(
+                path = %filepath,
+                error = %err,
+                "skipping content chunking for unreadable file"
+            );
+            return Ok(());
+        }
+    };
+
+    let chunk_refs: Vec<(ChunkType, i64, i64)> = chunk_content(
+        &content,
+        model.chunk_size as usize,
+        model.chunk_overlap as usize,
+    )
+    .into_iter()
+    .map(|(start, end)| (ChunkType::Content, start as i64, end as i64))
+    .collect();
+
+    if chunk_refs.is_empty() {
+        return Ok(());
+    }
+
+    repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
+        .with_context(|| format!("failed to queue content embeddings for {filepath}"))?;
+
+    Ok(())
 }
 
 /// Split `content` into overlapping chunks by byte offset.

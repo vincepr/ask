@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_core::repository;
+use ask_core::types::DocCategory;
 use ask_core::types::JobType;
-use ask_server::worker::dispatch_job;
+use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http, migrations};
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -31,6 +32,32 @@ fn register_model(pool: &http::AppState, now: i64, name: &str) -> i64 {
         created_at: now,
     };
     repository::insert_model(&conn, &model).unwrap()
+}
+
+fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i64 {
+    let metadata = std::fs::metadata(path).unwrap();
+    let file_modified_at = metadata
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let file_type = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_string();
+    let document = ask_core::models::Document {
+        id: 0,
+        filepath: path.to_string_lossy().into_owned(),
+        file_type,
+        doc_category: DocCategory::Resource,
+        file_modified_at,
+        file_size: metadata.len() as i64,
+        updated_at: now,
+    };
+    let conn = pool.get().unwrap();
+    repository::insert_document(&conn, &document).unwrap()
 }
 
 struct TempDb {
@@ -783,6 +810,59 @@ async fn ingest_non_utf8_file_only_gets_filename_embedding() {
         )
         .unwrap();
     assert_eq!(content_emb, 0);
+}
+
+#[tokio::test]
+async fn new_model_backfill_queues_filename_and_content_embeddings_for_existing_documents() {
+    let db = TempDb::new();
+    let now = current_time();
+    let dir = db.create_dir("existing_docs");
+
+    let text_path = dir.join("notes.txt");
+    let binary_path = dir.join("blob.bin");
+    std::fs::write(&text_path, "hello world").unwrap();
+    std::fs::write(&binary_path, [0xFF, 0xFE, 0x80, 0x00]).unwrap();
+
+    insert_document(&db.pool(), now, &text_path);
+    insert_document(&db.pool(), now, &binary_path);
+
+    let conn = db.pool().get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "backfill".to_string(),
+        dimensions: 768,
+        chunk_size: 10,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    let model = ask_core::models::EmbeddingModel {
+        id: repository::insert_model(&conn, &model).unwrap(),
+        ..model
+    };
+
+    let seeded = backfill_pending_for_model(&conn, &model, now + 1).unwrap();
+    assert_eq!(seeded, 2, "both existing documents should be backfilled");
+
+    let filename_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE model_id = ?1 AND chunk_type = 'filename'",
+            [model.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(filename_emb, 2);
+
+    let content_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE model_id = ?1 AND chunk_type = 'content'",
+            [model.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        content_emb, 2,
+        "text content should be backfilled with the normal chunk plan"
+    );
 }
 
 // ---------------------------------------------------------------------------

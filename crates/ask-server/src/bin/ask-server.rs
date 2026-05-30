@@ -43,10 +43,13 @@ async fn main() -> Result<()> {
                     chunk_overlap: config.embedding_chunk_overlap,
                     created_at: now,
                 };
-                let model_id = repository::insert_model(&conn, &m)?;
-                let seeded = repository::seed_pending_for_all_docs(&conn, model_id, now)?;
-                info!(model = %m.name, seeded, "registered new embedding model");
-                EmbeddingModel { id: model_id, ..m }
+                let model = EmbeddingModel {
+                    id: repository::insert_model(&conn, &m)?,
+                    ..m
+                };
+                let seeded = worker::backfill_pending_for_model(&conn, &model, now)?;
+                info!(model = %model.name, seeded, "registered new embedding model");
+                model
             }
         }
     };
