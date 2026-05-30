@@ -544,17 +544,12 @@ async fn mark_stale_batch_updates_embeddings() {
         .unwrap()
         .as_secs() as i64;
 
-    // Seed a model and two documents.
     let conn = db.pool().get().unwrap();
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0,
-            name: "test".to_string(),
-            dimensions: 768,
-            chunk_size: 512,
-            chunk_overlap: 0,
-            created_at: now,
+            id: 0, name: "test".to_string(), dimensions: 768,
+            chunk_size: 512, chunk_overlap: 0, created_at: now,
         },
     )
     .unwrap();
@@ -587,7 +582,6 @@ async fn mark_stale_batch_updates_embeddings() {
     let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(body["status"], "ok");
 
-    // Verify: doc 1's embeddings are stale, doc 2's are still embedded.
     let conn = db.pool().get().unwrap();
     let stale_count: i64 = conn
         .query_row(
@@ -638,17 +632,12 @@ async fn mark_stale_nonexistent_ids_is_noop() {
         .unwrap()
         .as_secs() as i64;
 
-    // Seed a model and one document.
     let conn = db.pool().get().unwrap();
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0,
-            name: "test".to_string(),
-            dimensions: 768,
-            chunk_size: 512,
-            chunk_overlap: 0,
-            created_at: now,
+            id: 0, name: "test".to_string(), dimensions: 768,
+            chunk_size: 512, chunk_overlap: 0, created_at: now,
         },
     )
     .unwrap();
@@ -676,7 +665,6 @@ async fn mark_stale_nonexistent_ids_is_noop() {
 
     assert_eq!(res.status(), StatusCode::OK);
 
-    // Existing embedding should still be 'embedded'.
     let conn = db.pool().get().unwrap();
     let embedded_count: i64 = conn
         .query_row(
@@ -704,66 +692,41 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
         .unwrap()
         .as_secs() as i64;
 
-    // Two models.
     let conn = db.pool().get().unwrap();
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0,
-            name: "m1".to_string(),
-            dimensions: 768,
-            chunk_size: 512,
-            chunk_overlap: 0,
-            created_at: now,
+            id: 0, name: "m1".to_string(), dimensions: 768,
+            chunk_size: 512, chunk_overlap: 0, created_at: now,
         },
     )
     .unwrap();
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0,
-            name: "m2".to_string(),
-            dimensions: 384,
-            chunk_size: 256,
-            chunk_overlap: 0,
-            created_at: now,
+            id: 0, name: "m2".to_string(), dimensions: 384,
+            chunk_size: 256, chunk_overlap: 0, created_at: now,
         },
     )
     .unwrap();
 
-    // Two documents. Doc 1 has embeddings across both models with mixed states.
-    // Doc 2 is a control: should be untouched.
     conn.execute_batch(
         "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
          VALUES ('/doc1.txt', 'txt', 'resource', 100, 10, 100),
                 ('/doc2.txt', 'txt', 'resource', 200, 20, 200);
 
-         -- doc 1 / model 1: TWO embedded rows (will become stale)
          INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (1, 1, 'filename', 0, 0, 'embedded', 100);
-         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (1, 1, 'content',  0, 5, 'embedded', 100);
-
-         -- doc 1 / model 2: ONE embedded row (will become stale)
-         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (1, 2, 'filename', 0, 0, 'embedded', 100);
-
-         -- doc 1 / model 1: ONE pending row (should stay 'pending')
-         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (1, 1, 'content',  10, 15, 'pending', 100);
-
-         -- doc 1 / model 2: ONE already-stale row (should stay 'stale')
-         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (1, 2, 'content',  0, 10, 'stale', 100);
-
-         -- doc 2 / model 1: ONE embedded row (different doc, should be untouched)
-         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (2, 1, 'filename', 0, 0, 'embedded', 200);",
+         VALUES
+            (1, 1, 'filename', 0,  0,  'embedded', 100),
+            (1, 1, 'content',  0,  5,  'embedded', 100),
+            (1, 2, 'filename', 0,  0,  'embedded', 100),
+            (1, 1, 'content',  10, 15, 'pending',   100),
+            (1, 2, 'content',  0,  10, 'stale',     100),
+            (2, 1, 'filename', 0,  0,  'embedded', 200);",
     )
     .unwrap();
     drop(conn);
 
-    // Mark doc 1 stale.
     let res = db
         .router()
         .oneshot(
@@ -780,13 +743,11 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
 
     let conn = db.pool().get().unwrap();
 
-    // Total row count unchanged (no deletes).
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM document_embeddings", [], |r| r.get(0))
         .unwrap();
     assert_eq!(total, 6, "all rows still exist, none were deleted");
 
-    // Stale count: 2 (m1 embedded) + 1 (m2 embedded) → stale + 1 already stale = 4.
     let stale: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_embeddings WHERE state = 'stale'",
@@ -794,9 +755,8 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(stale, 4, "3 embedded→stale + 1 already stale = 4");
+    assert_eq!(stale, 4, "3 embedded->stale + 1 already stale = 4");
 
-    // The 'pending' row was NOT touched.
     let pending: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_embeddings WHERE state = 'pending'",
@@ -806,7 +766,6 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
         .unwrap();
     assert_eq!(pending, 1, "pending row was left alone");
 
-    // Doc 2's embedding was NOT touched.
     let doc2_embedded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_embeddings WHERE document_id = 2 AND state = 'embedded'",
@@ -816,7 +775,6 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
         .unwrap();
     assert_eq!(doc2_embedded, 1, "doc 2's embedding is untouched");
 
-    // Doc 1 now has ZERO 'embedded' rows.
     let doc1_embedded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_embeddings WHERE document_id = 1 AND state = 'embedded'",
