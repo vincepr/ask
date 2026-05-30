@@ -6,6 +6,7 @@ use ask_server::{
     config::{
         BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
         DEFAULT_DATA_DIR, DEFAULT_TEI_BASE_URL, EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV,
+        EMBEDDING_CHUNK_OVERLAP_ENV, EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV,
         EMBEDDING_MODE_ENV, EmbeddingProvider, load,
     },
     open_database,
@@ -108,6 +109,47 @@ fn load_rejects_unknown_embedding_mode() {
     let error = load().expect_err("config load must fail for unknown embedding mode");
 
     assert!(error.to_string().contains(EMBEDDING_MODE_ENV));
+}
+
+#[test]
+fn load_rejects_non_positive_embedding_dimensions() {
+    let _env_lock = env_lock();
+    let _dimensions_guard = EnvVarGuard::set(EMBEDDING_DIMENSIONS_ENV, "0");
+
+    let error = load().expect_err("config load must fail for non-positive dimensions");
+
+    assert!(error.to_string().contains(EMBEDDING_DIMENSIONS_ENV));
+}
+
+#[test]
+fn load_rejects_non_positive_embedding_chunk_size() {
+    let _env_lock = env_lock();
+    let _chunk_size_guard = EnvVarGuard::set(EMBEDDING_CHUNK_SIZE_ENV, "-1");
+
+    let error = load().expect_err("config load must fail for non-positive chunk size");
+
+    assert!(error.to_string().contains(EMBEDDING_CHUNK_SIZE_ENV));
+}
+
+#[test]
+fn load_rejects_negative_embedding_chunk_overlap() {
+    let _env_lock = env_lock();
+    let _chunk_overlap_guard = EnvVarGuard::set(EMBEDDING_CHUNK_OVERLAP_ENV, "-1");
+
+    let error = load().expect_err("config load must fail for negative chunk overlap");
+
+    assert!(error.to_string().contains(EMBEDDING_CHUNK_OVERLAP_ENV));
+}
+
+#[test]
+fn load_rejects_embedding_chunk_overlap_equal_to_chunk_size() {
+    let _env_lock = env_lock();
+    let _chunk_size_guard = EnvVarGuard::set(EMBEDDING_CHUNK_SIZE_ENV, "32");
+    let _chunk_overlap_guard = EnvVarGuard::set(EMBEDDING_CHUNK_OVERLAP_ENV, "32");
+
+    let error = load().expect_err("config load must fail when overlap matches chunk size");
+
+    assert!(error.to_string().contains(EMBEDDING_CHUNK_OVERLAP_ENV));
 }
 
 #[test]

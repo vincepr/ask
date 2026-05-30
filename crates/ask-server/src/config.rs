@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
 pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
@@ -149,6 +149,11 @@ pub fn load() -> Result<Config> {
         Err(_) => DEFAULT_EMBEDDING_CHUNK_OVERLAP,
     };
     let embedding_provider = load_embedding_provider()?;
+    validate_embedding_settings(
+        embedding_dimensions,
+        embedding_chunk_size,
+        embedding_chunk_overlap,
+    )?;
 
     Ok(Config {
         data_dir,
@@ -207,4 +212,39 @@ fn load_embedding_provider() -> Result<EmbeddingProvider> {
             mode
         ),
     }
+}
+
+fn validate_embedding_settings(
+    embedding_dimensions: i64,
+    embedding_chunk_size: i64,
+    embedding_chunk_overlap: i64,
+) -> Result<()> {
+    ensure!(
+        embedding_dimensions > 0,
+        "{} must be greater than 0, got {}",
+        EMBEDDING_DIMENSIONS_ENV,
+        embedding_dimensions
+    );
+    ensure!(
+        embedding_chunk_size > 0,
+        "{} must be greater than 0, got {}",
+        EMBEDDING_CHUNK_SIZE_ENV,
+        embedding_chunk_size
+    );
+    ensure!(
+        embedding_chunk_overlap >= 0,
+        "{} must be greater than or equal to 0, got {}",
+        EMBEDDING_CHUNK_OVERLAP_ENV,
+        embedding_chunk_overlap
+    );
+    ensure!(
+        embedding_chunk_overlap < embedding_chunk_size,
+        "{} must be less than {}, got {} >= {}",
+        EMBEDDING_CHUNK_OVERLAP_ENV,
+        EMBEDDING_CHUNK_SIZE_ENV,
+        embedding_chunk_overlap,
+        embedding_chunk_size
+    );
+
+    Ok(())
 }
