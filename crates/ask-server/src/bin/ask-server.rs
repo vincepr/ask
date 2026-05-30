@@ -1,8 +1,10 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
+use ask_core::models::EmbeddingModel;
 use ask_core::repository;
-use ask_core::types::EmbeddingModel;
 use ask_core::{WORKSPACE_NAME, workspace_members};
-use ask_server::{config, http, migrations, open_database};
+use ask_server::{config, http, migrations, open_database, worker};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,7 +16,6 @@ async fn main() -> Result<()> {
     let mut connection = open_database(&sqlite_path)?;
     let applied_count = migrations::apply_pending_migrations(&mut connection)?;
 
-    // Auto-register the embedding model if it doesn't exist yet.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
         }
     };
 
+    let db = Arc::new(Mutex::new(connection));
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
     println!("Starting {WORKSPACE_NAME} server workspace with {member_count} member crates.");
@@ -57,7 +59,8 @@ async fn main() -> Result<()> {
     println!("Applied {applied_count} pending migrations.");
     println!("Listening on http://{bind_address}.");
 
-    axum::serve(listener, http::router()).await?;
+    worker::spawn(db.clone());
+    axum::serve(listener, http::router(db)).await?;
 
     Ok(())
 }

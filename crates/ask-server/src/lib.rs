@@ -1,6 +1,7 @@
 pub mod config;
 pub mod http;
 pub mod migrations;
+pub mod worker;
 
 use std::path::Path;
 

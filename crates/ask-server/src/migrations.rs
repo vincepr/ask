@@ -21,6 +21,11 @@ const MIGRATIONS: &[Migration] = &[
         required_actions: None,
         sql: include_str!("../migrations/0002_create_domain_tables.sql"),
     },
+    Migration {
+        version: 3,
+        required_actions: None,
+        sql: include_str!("../migrations/0003_create_job_queue.sql"),
+    },
 ];
 
 /// Applies every embedded migration that has not yet been recorded.

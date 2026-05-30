@@ -103,39 +103,31 @@ impl fmt::Display for ChunkType {
     }
 }
 
-/// A tracked file on the host machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Document {
-    pub id: i64,
-    pub filepath: String,
-    pub file_type: String,
-    pub doc_category: DocCategory,
-    pub file_modified_at: i64,
-    pub file_size: i64,
-    pub updated_at: i64,
+/// Discriminant for every async job variant stored in the job_queue table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobType {
+    IngestFolder,
 }
 
-/// An embedding model known to the system.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingModel {
-    pub id: i64,
-    pub name: String,
-    pub dimensions: i64,
-    pub chunk_size: i64,
-    pub chunk_overlap: i64,
-    pub created_at: i64,
+impl JobType {
+    pub const INGEST_FOLDER: &'static str = "ingest_folder";
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::IngestFolder => Self::INGEST_FOLDER,
+        }
+    }
+
+    pub fn try_from_str(s: &str) -> Option<Self> {
+        match s {
+            Self::INGEST_FOLDER => Some(Self::IngestFolder),
+            _ => None,
+        }
+    }
 }
 
-/// A single embedding row — one chunk of one document for one model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentEmbedding {
-    pub id: i64,
-    pub document_id: i64,
-    pub model_id: i64,
-    pub chunk_type: ChunkType,
-    pub chunk_start: i64,
-    pub chunk_end: i64,
-    pub state: EmbedState,
-    pub embedding: Option<Vec<u8>>,
-    pub created_at: i64,
+impl fmt::Display for JobType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }

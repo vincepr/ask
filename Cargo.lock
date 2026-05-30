@@ -14,6 +14,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde",
 ]
 
 [[package]]
@@ -26,6 +27,7 @@ dependencies = [
  "dotenvy",
  "rusqlite",
  "serde",
+ "serde_json",
  "tokio",
  "tower",
 ]

@@ -27,7 +27,8 @@ data/
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
 
 # AI CLI local state and machine-specific config
 .claude/

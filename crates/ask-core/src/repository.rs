@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::models::{Document, DocumentEmbedding, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -267,6 +268,111 @@ pub fn count_pending_for_model(conn: &Connection, model_id: i64) -> Result<i64> 
         |row| row.get(0),
     )
     .context("failed to count pending embeddings")
+}
+
+// ---------------------------------------------------------------------------
+// JobQueue
+// ---------------------------------------------------------------------------
+
+/// Enqueue a new job. Returns an error if a job with the same type and payload
+/// already exists (UNIQUE constraint on `(job_type, payload)`).
+pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i64) -> Result<()> {
+    let inserted = conn
+        .execute(
+            "INSERT INTO job_queue (job_type, payload, heartbeat, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?3)",
+            params![job_type.as_str(), payload, now],
+        )
+        .context("failed to enqueue job")?;
+
+    if inserted == 0 {
+        anyhow::bail!(
+            "a job with type '{t}' and payload '{p}' is already queued or in progress",
+            t = job_type.as_str(),
+            p = payload
+        );
+    }
+
+    Ok(())
+}
+
+/// Atomically claim the oldest unclaimed job by writing a heartbeat timestamp.
+///
+/// Uses an `IMMEDIATE` transaction so that only one worker ever claims any
+/// given row. Returns `None` when no jobs are waiting.
+pub fn claim_job(conn: &mut Connection, now: i64) -> Result<Option<JobQueueEntry>> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("failed to begin claim transaction")?;
+
+    let job_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM job_queue WHERE heartbeat IS NULL ORDER BY created_at ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query for next job")?;
+
+    let job_id = match job_id {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    let updated = tx
+        .execute(
+            "UPDATE job_queue SET heartbeat = ?1, updated_at = ?1 WHERE id = ?2 AND heartbeat IS NULL",
+            params![now, job_id],
+        )
+        .context("failed to claim job")?;
+
+    if updated == 0 {
+        // Another worker claimed it between SELECT and UPDATE.
+        return Ok(None);
+    }
+
+    let entry = tx
+        .query_row(
+            "SELECT id, job_type, payload, heartbeat, created_at, updated_at FROM job_queue WHERE id = ?1",
+            params![job_id],
+            |row| {
+                let job_type_str: String = row.get(1)?;
+                let job_type = JobType::try_from_str(&job_type_str).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(format!("unknown job_type: {job_type_str}"))
+                })?;
+
+                Ok(JobQueueEntry {
+                    id: row.get(0)?,
+                    job_type,
+                    payload: row.get(2)?,
+                    heartbeat: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )
+        .context("failed to read claimed job")?;
+
+    tx.commit().context("failed to commit claim transaction")?;
+    Ok(Some(entry))
+}
+
+/// Refresh the heartbeat for an in-progress job so other workers know it is
+/// still alive.
+pub fn update_heartbeat(conn: &Connection, job_id: i64, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE job_queue SET heartbeat = ?1, updated_at = ?1 WHERE id = ?2",
+        params![now, job_id],
+    )
+    .context("failed to update job heartbeat")?;
+    Ok(())
+}
+
+/// Remove a completed job from the queue.
+pub fn complete_job(conn: &Connection, job_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM job_queue WHERE id = ?1", params![job_id])
+        .context("failed to complete job")?;
+    Ok(())
 }
 
 /// Insert pending embedding rows for every existing document under a new model.
