@@ -12,9 +12,8 @@ pub struct JobQueueEntry {
     pub id: i64,
     pub job_type: JobType,
     pub payload: String,
-    pub heartbeat: Option<i64>,
+    pub claimed_at: Option<i64>,
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 /// Payload for an IngestFolder job.

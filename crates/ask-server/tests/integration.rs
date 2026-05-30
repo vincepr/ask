@@ -524,7 +524,7 @@ async fn ingest_folder_nonexistent_path_completes_job() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn dispatch_job_missing_model_returns_error_but_completes_job() {
+async fn dispatch_job_missing_model_returns_error_and_keeps_job_claimed() {
     let db = TempDb::new();
     let now = current_time();
     let dir = db.create_dir("missing_model");
@@ -539,8 +539,9 @@ async fn dispatch_job_missing_model_returns_error_but_completes_job() {
 
     let pool = db.pool();
     let err = dispatch_job(&pool, &entry, 999).unwrap_err();
+    let err_text = format!("{err:#}");
     assert!(
-        err.to_string().contains("failed to insert embedding"),
+        err_text.contains("embedding model 999 not found"),
         "unexpected error: {err:#}"
     );
 
@@ -548,7 +549,16 @@ async fn dispatch_job_missing_model_returns_error_but_completes_job() {
     let job_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(job_count, 0, "failed jobs are still completed today");
+    assert_eq!(job_count, 1, "failed jobs should stay queued until stale");
+
+    let claimed_at: Option<i64> = conn
+        .query_row(
+            "SELECT claimed_at FROM job_queue WHERE id = ?1",
+            [entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_at, Some(now + 1));
 }
 
 #[tokio::test]
@@ -802,7 +812,7 @@ async fn job_lifecycle_claim_and_complete() {
 
     assert_eq!(entry.job_type, JobType::IngestFolder);
     assert_eq!(entry.payload, payload);
-    assert_eq!(entry.heartbeat, Some(now + 1));
+    assert_eq!(entry.claimed_at, Some(now + 1));
 
     repository::complete_job(&conn, entry.id).unwrap();
 

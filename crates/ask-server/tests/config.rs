@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_server::{
@@ -12,6 +13,7 @@ use ask_server::{
 
 #[test]
 fn load_uses_defaults_when_env_is_missing() {
+    let _env_lock = env_lock();
     let _data_dir_guard = EnvVarGuard::unset(DATA_DIR_ENV);
     let _host_guard = EnvVarGuard::unset(BIND_HOST_ENV);
     let _port_guard = EnvVarGuard::unset(BIND_PORT_ENV);
@@ -36,6 +38,7 @@ fn load_uses_defaults_when_env_is_missing() {
 
 #[test]
 fn load_uses_env_overrides_when_present() {
+    let _env_lock = env_lock();
     let _data_dir_guard = EnvVarGuard::set(DATA_DIR_ENV, "custom-data");
     let _host_guard = EnvVarGuard::set(BIND_HOST_ENV, "127.0.0.1");
     let _port_guard = EnvVarGuard::set(BIND_PORT_ENV, "4123");
@@ -59,6 +62,7 @@ fn load_uses_env_overrides_when_present() {
 
 #[test]
 fn load_rejects_invalid_bind_port() {
+    let _env_lock = env_lock();
     let _port_guard = EnvVarGuard::set(BIND_PORT_ENV, "invalid-port");
 
     let error = load().expect_err("config load must fail for invalid port");
@@ -68,6 +72,7 @@ fn load_rejects_invalid_bind_port() {
 
 #[test]
 fn load_requires_openai_credentials_in_openai_mode() {
+    let _env_lock = env_lock();
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "openai");
     let _base_url_guard = EnvVarGuard::unset(EMBEDDING_BASE_URL_ENV);
     let _token_guard = EnvVarGuard::unset(EMBEDDING_AUTH_TOKEN_ENV);
@@ -79,6 +84,7 @@ fn load_requires_openai_credentials_in_openai_mode() {
 
 #[test]
 fn load_uses_openai_provider_when_fully_configured() {
+    let _env_lock = env_lock();
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "openai");
     let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "https://api.openai.example/v1");
     let _token_guard = EnvVarGuard::set(EMBEDDING_AUTH_TOKEN_ENV, "secret-token");
@@ -96,6 +102,7 @@ fn load_uses_openai_provider_when_fully_configured() {
 
 #[test]
 fn load_rejects_unknown_embedding_mode() {
+    let _env_lock = env_lock();
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "unknown");
 
     let error = load().expect_err("config load must fail for unknown embedding mode");
@@ -170,4 +177,13 @@ fn unique_temp_dir() -> PathBuf {
         .as_nanos();
 
     std::env::temp_dir().join(format!("ask-server-tests-{unique_suffix}"))
+}
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock must not be poisoned")
 }
