@@ -223,7 +223,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 ## Docker
 
 - **ALWAYS** use normal `docker compose build` (incremental) instead of `--no-cache`. Only use `--no-cache` if explicitly asked.
-- **SET** a minimum timeout of 300000ms (5 minutes) for any `docker compose build` or `docker build` command.
+- **SET** a minimum timeout of 60000ms (1 minute) for any `docker compose build` or `docker build` command. Increase if the build is close to timing out (e.g., large Rust compilation).
 - For a one-off rebuild with code changes, `docker compose up --build` suffices — it only recompiles changed crates thanks to layer caching.
 - Never trigger a full Rust rebuild from scratch in Docker unless absolutely necessary (e.g., base image changed).
 
