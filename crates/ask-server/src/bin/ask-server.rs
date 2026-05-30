@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     );
     println!("Listening on http://{bind_address}.");
 
-    worker::spawn(pool.clone());
+    worker::spawn(pool.clone(), model.id);
     axum::serve(listener, http::router(pool)).await?;
 
     Ok(())
