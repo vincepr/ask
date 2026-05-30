@@ -1,10 +1,4 @@
 use std::path::Path;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,22 +10,14 @@ use tracing::{error, info, warn};
 use crate::DbPool;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Spawns a background task that polls for unclaimed jobs and processes them.
+/// Spawns a background task that polls for unclaimed or stale jobs.
 pub fn spawn(pool: DbPool, model_id: i64) {
-    let shutdown = ShutdownToken::default();
-
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
 
-            if shutdown.is_shutdown() {
-                info!("worker shutdown requested");
-                break;
-            }
-
-            if let Err(err) = tick(pool.clone(), model_id, shutdown.clone()).await {
+            if let Err(err) = tick(pool.clone(), model_id).await {
                 error!(error = %format!("{err:#}"), "worker tick failed");
             }
         }
@@ -40,7 +26,7 @@ pub fn spawn(pool: DbPool, model_id: i64) {
 
 /// Claim a job and process it, all on a blocking thread so the async runtime
 /// is never held up by DB or filesystem calls.
-async fn tick(pool: DbPool, model_id: i64, shutdown: ShutdownToken) -> Result<()> {
+async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let now = unix_now();
         let mut conn = pool.get()?;
@@ -52,14 +38,7 @@ async fn tick(pool: DbPool, model_id: i64, shutdown: ShutdownToken) -> Result<()
         };
 
         info!(job_id = entry.id, job_type = %entry.job_type, "claimed job");
-        dispatch_job_with_resolver(
-            &pool,
-            &entry,
-            model_id,
-            &shutdown,
-            HEARTBEAT_INTERVAL,
-            resolve_handler,
-        )
+        dispatch_job_with_resolver(&pool, &entry, model_id, resolve_handler)
     })
     .await
     .context("worker tick panicked")??;
@@ -67,27 +46,10 @@ async fn tick(pool: DbPool, model_id: i64, shutdown: ShutdownToken) -> Result<()
     Ok(())
 }
 
-#[derive(Clone, Debug, Default)]
-struct ShutdownToken {
-    state: Arc<AtomicBool>,
-}
-
-impl ShutdownToken {
-    fn is_shutdown(&self) -> bool {
-        self.state.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    fn request_shutdown(&self) {
-        self.state.store(true, Ordering::Relaxed);
-    }
-}
-
 struct JobContext<'a> {
     pool: &'a DbPool,
     entry: &'a JobQueueEntry,
     model_id: i64,
-    shutdown: &'a ShutdownToken,
 }
 
 trait JobHandler: Send + Sync {
@@ -99,73 +61,18 @@ trait JobHandler: Send + Sync {
     fn process(&self, ctx: JobContext<'_>) -> Result<()>;
 }
 
-struct HeartbeatGuard {
-    stop_tx: mpsc::Sender<()>,
-    join_handle: thread::JoinHandle<Result<()>>,
-}
-
-impl HeartbeatGuard {
-    fn start(pool: DbPool, job_id: i64, interval: Duration, shutdown: ShutdownToken) -> Self {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let join_handle = thread::spawn(move || -> Result<()> {
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if shutdown.is_shutdown() {
-                            return Ok(());
-                        }
-
-                        let conn = pool.get().with_context(|| {
-                            format!("failed to acquire connection for heartbeat on job {job_id}")
-                        })?;
-                        repository::update_heartbeat(&conn, job_id, unix_now()).with_context(
-                            || format!("failed to update heartbeat for job {job_id}"),
-                        )?;
-                    }
-                }
-            }
-        });
-
-        Self {
-            stop_tx,
-            join_handle,
-        }
-    }
-
-    fn stop(self) -> Result<()> {
-        let _ = self.stop_tx.send(());
-
-        self.join_handle
-            .join()
-            .map_err(|panic| anyhow!("heartbeat thread panicked: {panic:?}"))?
-    }
-}
-
 /// Dispatch a claimed job to the appropriate handler.
 ///
-/// The dispatcher owns the lifecycle for every job: heartbeat, handler
-/// execution, and queue completion. Handler failures remain visible to the
-/// caller even though current completion policy still removes the job.
+/// Successful handlers remove the queue row. Failed handlers leave the claim in
+/// place so the row becomes claimable again only after the stale timeout.
 pub fn dispatch_job(pool: &DbPool, entry: &JobQueueEntry, model_id: i64) -> Result<()> {
-    let shutdown = ShutdownToken::default();
-
-    dispatch_job_with_resolver(
-        pool,
-        entry,
-        model_id,
-        &shutdown,
-        HEARTBEAT_INTERVAL,
-        resolve_handler,
-    )
+    dispatch_job_with_resolver(pool, entry, model_id, resolve_handler)
 }
 
 fn dispatch_job_with_resolver<R>(
     pool: &DbPool,
     entry: &JobQueueEntry,
     model_id: i64,
-    shutdown: &ShutdownToken,
-    heartbeat_interval: Duration,
     resolve_handler: R,
 ) -> Result<()>
 where
@@ -181,35 +88,28 @@ where
         ));
     }
 
-    let heartbeat_guard =
-        HeartbeatGuard::start(pool.clone(), entry.id, heartbeat_interval, shutdown.clone());
-    let handler_result = handler.process(JobContext {
+    let result = handler.process(JobContext {
         pool,
         entry,
         model_id,
-        shutdown,
     });
-    let heartbeat_result = heartbeat_guard.stop();
-    let completion_result = complete_job(pool, entry.id);
 
-    let dispatch_result =
-        combine_dispatch_results(entry, handler_result, heartbeat_result, completion_result);
-
-    match &dispatch_result {
+    match result {
         Ok(()) => {
+            complete_job(pool, entry.id)?;
             info!(job_id = entry.id, job_type = %entry.job_type, "job completed");
+            Ok(())
         }
         Err(err) => {
             error!(
                 job_id = entry.id,
                 job_type = %entry.job_type,
                 error = %format!("{err:#}"),
-                "job failed"
+                "job failed; leaving claim in place until stale"
             );
+            Err(err.context(format!("job {} ({})", entry.id, entry.job_type)))
         }
     }
-
-    dispatch_result
 }
 
 fn resolve_handler(job_type: JobType) -> Box<dyn JobHandler> {
@@ -225,37 +125,6 @@ fn complete_job(pool: &DbPool, job_id: i64) -> Result<()> {
     repository::complete_job(&conn, job_id)
         .with_context(|| format!("failed to complete job {job_id}"))?;
     Ok(())
-}
-
-fn combine_dispatch_results(
-    entry: &JobQueueEntry,
-    handler_result: Result<()>,
-    heartbeat_result: Result<()>,
-    completion_result: Result<()>,
-) -> Result<()> {
-    let prefix = format!("job {} ({})", entry.id, entry.job_type);
-
-    match (handler_result, heartbeat_result, completion_result) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Err(err), Ok(()), Ok(())) | (Ok(()), Err(err), Ok(())) | (Ok(()), Ok(()), Err(err)) => {
-            Err(err.context(prefix))
-        }
-        (handler, heartbeat, completion) => {
-            let mut failures = Vec::with_capacity(3);
-
-            if let Err(err) = handler {
-                failures.push(format!("handler failed: {err:#}"));
-            }
-            if let Err(err) = heartbeat {
-                failures.push(format!("heartbeat failed: {err:#}"));
-            }
-            if let Err(err) = completion {
-                failures.push(format!("completion failed: {err:#}"));
-            }
-
-            Err(anyhow!("{prefix} failed: {}", failures.join("; ")))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,14 +178,6 @@ impl JobHandler for IngestFolderHandler {
             .with_context(|| format!("failed to read ingest root {}", payload.root_path))?;
 
         for entry_result in entries {
-            if ctx.shutdown.is_shutdown() {
-                return Err(anyhow!(
-                    "job {} ({}) cancelled by shutdown",
-                    ctx.entry.id,
-                    ctx.entry.job_type
-                ));
-            }
-
             let dir_entry = match entry_result {
                 Ok(dir_entry) => dir_entry,
                 Err(err) => {
@@ -475,8 +336,7 @@ fn unix_now() -> i64 {
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::sync::{Condvar, Mutex, mpsc as std_mpsc};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use ask_core::repository;
 
@@ -514,46 +374,6 @@ mod tests {
         fn drop(&mut self) {
             drop(self.pool.take());
             let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct BlockingGate {
-        state: Arc<(Mutex<bool>, Condvar)>,
-    }
-
-    impl BlockingGate {
-        fn wait(&self) {
-            let (lock, condvar) = &*self.state;
-            let mut released = lock.lock().unwrap();
-
-            while !*released {
-                released = condvar.wait(released).unwrap();
-            }
-        }
-
-        fn open(&self) {
-            let (lock, condvar) = &*self.state;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            condvar.notify_all();
-        }
-    }
-
-    struct BlockingHandler {
-        started_tx: std_mpsc::Sender<()>,
-        gate: BlockingGate,
-    }
-
-    impl JobHandler for BlockingHandler {
-        fn job_type(&self) -> JobType {
-            JobType::IngestFolder
-        }
-
-        fn process(&self, _ctx: JobContext<'_>) -> Result<()> {
-            self.started_tx.send(()).unwrap();
-            self.gate.wait();
-            Ok(())
         }
     }
 
@@ -608,94 +428,51 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_heartbeat_updates_while_handler_is_blocked() {
-        let db = TempDb::new();
-        let entry = enqueue_and_claim_job(&db, r#"{"root_path":"/tmp"}"#, 10, 100);
-        let initial_heartbeat = entry.heartbeat.expect("claimed jobs must have a heartbeat");
-        let pool = db.pool();
-        let shutdown = ShutdownToken::default();
-        let gate = BlockingGate::default();
-        let gate_for_handler = gate.clone();
-        let (started_tx, started_rx) = std_mpsc::channel();
-        let entry_for_thread = entry.clone();
-        let pool_for_thread = pool.clone();
-
-        let handle = thread::spawn(move || {
-            dispatch_job_with_resolver(
-                &pool_for_thread,
-                &entry_for_thread,
-                1,
-                &shutdown,
-                Duration::from_millis(25),
-                move |_| {
-                    Box::new(BlockingHandler {
-                        started_tx: started_tx.clone(),
-                        gate: gate_for_handler.clone(),
-                    })
-                },
-            )
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("handler should start");
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut observed_heartbeat = None;
-
-        while Instant::now() < deadline {
-            let conn = pool.get().unwrap();
-            let heartbeat: Option<i64> = conn
-                .query_row(
-                    "SELECT heartbeat FROM job_queue WHERE id = ?1",
-                    [entry.id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-
-            if let Some(heartbeat) = heartbeat
-                && heartbeat > initial_heartbeat
-            {
-                observed_heartbeat = Some(heartbeat);
-                break;
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        assert!(
-            observed_heartbeat.is_some(),
-            "expected heartbeat to advance while handler was still running"
-        );
-
-        gate.open();
-        assert!(handle.join().unwrap().is_ok());
-        assert_eq!(job_queue_count(&pool), 0);
-    }
-
-    #[test]
-    fn dispatcher_returns_handler_failures_and_still_completes_job() {
+    fn dispatcher_returns_handler_failures_and_keeps_job_row() {
         let db = TempDb::new();
         let entry = enqueue_and_claim_job(&db, r#"{"root_path":"/tmp"}"#, 10, 100);
         let pool = db.pool();
-        let shutdown = ShutdownToken::default();
 
         let err =
-            dispatch_job_with_resolver(&pool, &entry, 1, &shutdown, Duration::from_secs(1), |_| {
-                Box::new(FailingHandler)
-            })
-            .unwrap_err();
+            dispatch_job_with_resolver(&pool, &entry, 1, |_| Box::new(FailingHandler)).unwrap_err();
         let err_text = format!("{err:#}");
 
         assert!(
             err_text.contains("synthetic handler failure"),
             "unexpected error: {err:#}"
         );
-        assert_eq!(job_queue_count(&pool), 0);
+        assert_eq!(job_queue_count(&pool), 1);
+
+        let conn = pool.get().unwrap();
+        let claimed_at: Option<i64> = conn
+            .query_row(
+                "SELECT claimed_at FROM job_queue WHERE id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed_at, Some(100));
     }
 
     #[test]
-    fn dispatcher_surfaces_payload_decode_failures_and_completes_job() {
+    fn failed_job_becomes_claimable_again_after_stale_timeout() {
+        let db = TempDb::new();
+        let entry = enqueue_and_claim_job(&db, r#"{"root_path":"/tmp"}"#, 10, 100);
+        let pool = db.pool();
+
+        dispatch_job_with_resolver(&pool, &entry, 1, |_| Box::new(FailingHandler)).unwrap_err();
+
+        let mut conn = pool.get().unwrap();
+        let reclaimed = repository::claim_job(&mut conn, 100 + 86_400 + 1)
+            .unwrap()
+            .expect("stale failed job should be claimable again");
+
+        assert_eq!(reclaimed.id, entry.id);
+        assert_eq!(reclaimed.claimed_at, Some(100 + 86_400 + 1));
+    }
+
+    #[test]
+    fn dispatcher_surfaces_payload_decode_failures_and_keeps_job_row() {
         let db = TempDb::new();
         let entry = enqueue_and_claim_job(&db, "{not json", 10, 100);
         let pool = db.pool();
@@ -707,17 +484,7 @@ mod tests {
             err_text.contains("failed to decode payload"),
             "unexpected error: {err:#}"
         );
-        assert_eq!(job_queue_count(&pool), 0);
-    }
-
-    #[test]
-    fn shutdown_token_reports_requested_shutdown() {
-        let token = ShutdownToken::default();
-        assert!(!token.is_shutdown());
-
-        token.request_shutdown();
-
-        assert!(token.is_shutdown());
+        assert_eq!(job_queue_count(&pool), 1);
     }
 
     #[test]

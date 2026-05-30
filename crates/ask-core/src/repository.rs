@@ -4,8 +4,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::models::{Document, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
-/// A job with a heartbeat older than this (in seconds) is considered dead and
-/// can be replaced by a fresh enqueue.
+/// A job with a claim older than this (in seconds) is considered dead and can
+/// be reclaimed or replaced by a fresh enqueue.
 const STALE_JOB_AGE_SECS: i64 = 86400;
 
 // ---------------------------------------------------------------------------
@@ -230,25 +230,22 @@ pub fn insert_pending_embeddings(
 // JobQueue
 // ---------------------------------------------------------------------------
 
-/// Enqueue a job, or re-enqueue it if the existing one is stale.
+/// Enqueue a job, or reset it if the existing row is stale.
 ///
-/// If a row with the same `(job_type, payload)` already exists **and** its
-/// heartbeat is older than `STALE_JOB_AGE_SECS`, the job is reset (heartbeat
-/// cleared, timestamps refreshed). Otherwise returns an error — the job is
-/// still active and cannot be duplicated.
+/// If a row with the same `(job_type, payload)` already exists and its claim
+/// timestamp is older than `STALE_JOB_AGE_SECS`, the job becomes unclaimed
+/// again and is treated as freshly queued. Otherwise returns an error.
 pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i64) -> Result<()> {
     let stale_cutoff = now - STALE_JOB_AGE_SECS;
 
     let affected = conn
         .execute(
-            "INSERT INTO job_queue (job_type, payload, heartbeat, created_at, updated_at)
-             VALUES (?1, ?2, NULL, ?3, ?3)
+            "INSERT INTO job_queue (job_type, payload, claimed_at, created_at)
+             VALUES (?1, ?2, NULL, ?3)
              ON CONFLICT(job_type, payload) DO UPDATE SET
-                 heartbeat = NULL,
-                 payload   = EXCLUDED.payload,
-                 created_at = EXCLUDED.created_at,
-                 updated_at = EXCLUDED.updated_at
-              WHERE job_queue.heartbeat < ?4",
+                 claimed_at = NULL,
+                 created_at = EXCLUDED.created_at
+              WHERE job_queue.claimed_at < ?4",
             params![job_type.as_str(), payload, now, stale_cutoff],
         )
         .context("failed to enqueue job")?;
@@ -264,75 +261,53 @@ pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i6
     Ok(())
 }
 
-/// Atomically claim the oldest pending job by writing a heartbeat timestamp.
+/// Atomically claim the next pending or stale job.
 ///
 /// Uses an `IMMEDIATE` transaction so that only one worker ever claims any
 /// given row. Returns `None` when no jobs are waiting.
 pub fn claim_job(conn: &mut Connection, now: i64) -> Result<Option<JobQueueEntry>> {
+    let stale_cutoff = now - STALE_JOB_AGE_SECS;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("failed to begin claim transaction")?;
 
-    let job_id: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM job_queue WHERE heartbeat IS NULL ORDER BY created_at ASC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("failed to query for next job")?;
-
-    let job_id = match job_id {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    let updated = tx
-        .execute(
-            "UPDATE job_queue SET heartbeat = ?1, updated_at = ?1 WHERE id = ?2 AND heartbeat IS NULL",
-            params![now, job_id],
-        )
-        .context("failed to claim job")?;
-
-    if updated == 0 {
-        return Ok(None);
-    }
-
+    // SQLite needs the surrounding IMMEDIATE transaction here; PostgreSQL would require FOR UPDATE SKIP LOCKED.
     let entry = tx
         .query_row(
-            "SELECT id, job_type, payload, heartbeat, created_at, updated_at FROM job_queue WHERE id = ?1",
-            params![job_id],
+            "WITH picked AS (
+                 SELECT id
+                 FROM job_queue
+                 WHERE claimed_at IS NULL OR claimed_at < ?1
+                 ORDER BY id ASC
+                 LIMIT 1
+             )
+             UPDATE job_queue
+             SET claimed_at = ?2
+             WHERE id IN (SELECT id FROM picked)
+             RETURNING id, job_type, payload, claimed_at, created_at",
+            params![stale_cutoff, now],
             |row| {
                 let job_type_str: String = row.get(1)?;
                 let job_type = JobType::try_from_str(&job_type_str).ok_or_else(|| {
-                    rusqlite::Error::InvalidParameterName(format!("unknown job_type: {job_type_str}"))
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "unknown job_type: {job_type_str}"
+                    ))
                 })?;
 
                 Ok(JobQueueEntry {
                     id: row.get(0)?,
                     job_type,
                     payload: row.get(2)?,
-                    heartbeat: row.get(3)?,
+                    claimed_at: row.get(3)?,
                     created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
                 })
             },
         )
-        .context("failed to read claimed job")?;
+        .optional()
+        .context("failed to claim and read next job")?;
 
     tx.commit().context("failed to commit claim transaction")?;
-    Ok(Some(entry))
-}
-
-/// Refresh the heartbeat for an in-progress job so other workers know it is
-/// still alive.
-pub fn update_heartbeat(conn: &Connection, job_id: i64, now: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE job_queue SET heartbeat = ?1, updated_at = ?1 WHERE id = ?2",
-        params![now, job_id],
-    )
-    .context("failed to update job heartbeat")?;
-    Ok(())
+    Ok(entry)
 }
 
 /// Remove a completed job from the queue.
@@ -369,9 +344,8 @@ mod tests {
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_type    TEXT    NOT NULL,
                 payload     TEXT    NOT NULL,
-                heartbeat   INTEGER,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL
+                claimed_at  INTEGER,
+                created_at  INTEGER NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_job_queue_unique
                 ON job_queue (job_type, payload);",
@@ -396,16 +370,15 @@ mod tests {
 
     fn get_job(conn: &Connection, id: i64) -> JobQueueEntry {
         conn.query_row(
-            "SELECT id, job_type, payload, heartbeat, created_at, updated_at FROM job_queue WHERE id = ?1",
+            "SELECT id, job_type, payload, claimed_at, created_at FROM job_queue WHERE id = ?1",
             params![id],
             |row| {
                 Ok(JobQueueEntry {
                     id: row.get(0)?,
                     job_type: JobType::try_from_str(&row.get::<_, String>(1)?).unwrap(),
                     payload: row.get(2)?,
-                    heartbeat: row.get(3)?,
+                    claimed_at: row.get(3)?,
                     created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
                 })
             },
         )
@@ -448,16 +421,16 @@ mod tests {
         assert_eq!(count(&conn), 2);
     }
 
-    /// A stale job (heartbeat older than STALE_JOB_AGE_SECS) can be replaced.
+    /// A stale claimed job can be reset by a fresh enqueue.
     #[test]
     fn enqueue_replaces_stale_job() {
         let conn = setup_db();
         let now = 100_000i64;
         enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, now).unwrap();
 
-        // Manually set heartbeat to make it stale.
+        // Manually set the claim to make it stale.
         conn.execute(
-            "UPDATE job_queue SET heartbeat = ?1",
+            "UPDATE job_queue SET claimed_at = ?1",
             params![now - STALE_JOB_AGE_SECS - 1],
         )
         .unwrap();
@@ -469,20 +442,19 @@ mod tests {
 
         // The job's timestamps should be refreshed.
         let job = get_job(&conn, 1);
-        assert_eq!(job.heartbeat, None); // reset on re-enqueue
+        assert_eq!(job.claimed_at, None);
         assert_eq!(job.created_at, later);
-        assert_eq!(job.updated_at, later);
     }
 
-    /// An active job (fresh heartbeat) cannot be replaced before stale age.
+    /// An active claimed job cannot be replaced before stale age.
     #[test]
     fn enqueue_rejects_active_job() {
         let conn = setup_db();
         let now = 100_000i64;
         enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, now).unwrap();
 
-        // Manually set a fresh heartbeat.
-        conn.execute("UPDATE job_queue SET heartbeat = ?1", params![now])
+        // Manually set a fresh claim.
+        conn.execute("UPDATE job_queue SET claimed_at = ?1", params![now])
             .unwrap();
 
         let err = enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, now + 10).unwrap_err();
@@ -490,7 +462,7 @@ mod tests {
         assert_eq!(count(&conn), 1);
     }
 
-    /// Even with a claimed heartbeat, a job can still be replaced once stale.
+    /// Even with an existing claim, a job can still be replaced once stale.
     #[test]
     fn enqueue_active_becomes_stale_and_replaced() {
         let conn = setup_db();
@@ -498,7 +470,7 @@ mod tests {
         enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, now).unwrap();
 
         // Simulate worker claim.
-        conn.execute("UPDATE job_queue SET heartbeat = ?1", params![now])
+        conn.execute("UPDATE job_queue SET claimed_at = ?1", params![now])
             .unwrap();
 
         // Advance time past stale threshold.
@@ -506,9 +478,8 @@ mod tests {
         enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, later).unwrap();
         assert_eq!(count(&conn), 1);
         let job = get_job(&conn, 1);
-        assert_eq!(job.heartbeat, None);
+        assert_eq!(job.claimed_at, None);
         assert_eq!(job.created_at, later);
-        assert_eq!(job.updated_at, later);
     }
 
     // ------------------------------------------------------------------
@@ -532,7 +503,7 @@ mod tests {
         // Should get the oldest (smallest created_at).
         let parsed: serde_json::Value = serde_json::from_str(&entry.payload).unwrap();
         assert_eq!(parsed["root_path"], "/a");
-        assert_eq!(entry.heartbeat, Some(1000));
+        assert_eq!(entry.claimed_at, Some(1000));
         assert_eq!(count(&conn), 2); // job still exists
     }
 
@@ -545,6 +516,44 @@ mod tests {
         // Second claim should return None — only one job exists and it's claimed.
         let result = claim_job(&mut conn, 300).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn claim_reclaims_stale_job() {
+        let mut conn = setup_db();
+        let now = 100_000i64;
+        enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, now).unwrap();
+        conn.execute(
+            "UPDATE job_queue SET claimed_at = ?1 WHERE id = 1",
+            params![now - STALE_JOB_AGE_SECS - 1],
+        )
+        .unwrap();
+
+        let entry = claim_job(&mut conn, now + STALE_JOB_AGE_SECS + 10)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(entry.id, 1);
+        assert_eq!(entry.claimed_at, Some(now + STALE_JOB_AGE_SECS + 10));
+    }
+
+    #[test]
+    fn claim_rejects_unknown_job_type() {
+        let mut conn = setup_db();
+        conn.execute(
+            "INSERT INTO job_queue (job_type, payload, claimed_at, created_at)
+             VALUES (?1, ?2, NULL, ?3)",
+            params!["not_a_real_job_type", r#"{"root_path":"/tmp"}"#, 100],
+        )
+        .unwrap();
+
+        let err = claim_job(&mut conn, 200).unwrap_err();
+        let err_text = format!("{err:#}");
+
+        assert!(
+            err_text.contains("unknown job_type"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -576,9 +585,8 @@ mod tests {
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_type    TEXT    NOT NULL,
                     payload     TEXT    NOT NULL,
-                    heartbeat   INTEGER,
-                    created_at  INTEGER NOT NULL,
-                    updated_at  INTEGER NOT NULL
+                    claimed_at  INTEGER,
+                    created_at  INTEGER NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_queue_unique
                     ON job_queue (job_type, payload);",
@@ -618,21 +626,5 @@ mod tests {
         let entry = claim_job(&mut conn, 200).unwrap().unwrap();
         complete_job(&conn, entry.id).unwrap();
         assert_eq!(count(&conn), 0);
-    }
-
-    // ------------------------------------------------------------------
-    // update_heartbeat
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn heartbeat_updated() {
-        let mut conn = setup_db();
-        enqueue(&conn, "ingest_folder", r#"{"root_path":"/tmp"}"#, 100).unwrap();
-        let entry = claim_job(&mut conn, 200).unwrap().unwrap();
-        assert_eq!(entry.heartbeat, Some(200));
-
-        update_heartbeat(&conn, entry.id, 300).unwrap();
-        let job = get_job(&conn, entry.id);
-        assert_eq!(job.heartbeat, Some(300));
     }
 }
