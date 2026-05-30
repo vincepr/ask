@@ -37,12 +37,7 @@ async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
         };
 
         println!("claimed job {} ({})", entry.id, entry.job_type.as_str());
-
-        match entry.job_type {
-            JobType::IngestFolder => {
-                process_ingest_folder(&pool, entry.id, &entry.payload, model_id)
-            }
-        }
+        dispatch_job(&pool, &entry, model_id)
     })
     .await
     .context("worker tick panicked")??;
@@ -50,154 +45,174 @@ async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Synchronously process an IngestFolder job.  Called from within
-/// `spawn_blocking`, so blocking calls like `std::fs::read_dir`,
-/// `std::thread::sleep`, and `pool.get()` are all fine here.
-/// Process an IngestFolder job: iterate files, insert documents and pending embeddings.
+/// Implemented by job-type-specific handlers that process claimed jobs.
 ///
-/// # Arguments
+/// The framework handles claiming, initial heartbeat, and completion.
+/// Long-running handlers should call `repository::update_heartbeat`
+/// periodically via the pool to prevent the job from being considered stale.
+trait JobHandler: Send {
+    /// Process the job.
+    ///
+    /// Called from within `spawn_blocking`, so blocking I/O is fine.
+    fn handle(&self, pool: &DbPool, job_id: i64, model_id: i64) -> Result<()>;
+}
+
+/// Dispatch a claimed job to the appropriate handler.
 ///
-/// * `pool` - Database connection pool
-/// * `job_id` - ID of the job being processed (for heartbeat updates)
-/// * `payload_json` - JSON with `{"root_path": "..."}`
-/// * `model_id` - Embedding model ID for pending embedding rows
-///
-/// # Errors
-///
-/// Returns an error if the job payload is invalid or a database operation fails.
-pub fn process_ingest_folder(
+/// Sets the initial heartbeat, runs the handler, and always completes the
+/// job (removes it from the queue) regardless of the handler's result.
+pub fn dispatch_job(
     pool: &DbPool,
-    job_id: i64,
-    payload_json: &str,
+    entry: &ask_core::models::JobQueueEntry,
     model_id: i64,
 ) -> Result<()> {
-    let payload: IngestFolderPayload = serde_json::from_str(payload_json)?;
-    let root_path = Path::new(&payload.root_path);
-
-    if !root_path.is_dir() {
-        eprintln!(
-            "ingest_folder path does not exist (skipped): {}",
-            payload.root_path
-        );
-        let conn = pool.get()?;
-        repository::complete_job(&conn, job_id)?;
-        return Ok(());
-    }
-
-    println!("processing ingest_folder: {}", payload.root_path);
-
-    // Cache model for chunking parameters — we'll use it for content chunking.
-    let model = {
-        let conn = pool.get()?;
-        repository::find_model_by_id(&conn, model_id)?
+    let handler: Box<dyn JobHandler> = match entry.job_type {
+        JobType::IngestFolder => {
+            let payload: IngestFolderPayload = serde_json::from_str(&entry.payload)?;
+            Box::new(IngestFolderHandler { payload })
+        }
     };
 
-    if let Ok(entries) = std::fs::read_dir(root_path) {
-        for result in entries {
-            let entry = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("  failed to read directory entry: {e}");
-                    continue;
-                }
-            };
-            let now = unix_now();
-            let path = entry.path();
+    let now = unix_now();
+    let conn = pool.get()?;
+    repository::update_heartbeat(&conn, entry.id, now)?;
 
-            if !path.is_file() {
-                continue;
-            }
+    let result = handler.handle(pool, entry.id, model_id);
 
-            let metadata = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("  failed to read metadata for {:?}: {e}", path);
-                    continue;
-                }
-            };
+    let conn = pool.get()?;
+    repository::complete_job(&conn, entry.id)?;
 
-            let filepath = path.to_string_lossy().to_string();
-            let file_type = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_string();
-            let file_modified_at = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(now);
-            let file_size = metadata.len() as i64;
+    result
+}
 
+// ---------------------------------------------------------------------------
+// IngestFolder
+// ---------------------------------------------------------------------------
+
+struct IngestFolderHandler {
+    payload: IngestFolderPayload,
+}
+
+impl JobHandler for IngestFolderHandler {
+    fn handle(&self, pool: &DbPool, job_id: i64, model_id: i64) -> Result<()> {
+        let root_path = Path::new(&self.payload.root_path);
+
+        if !root_path.is_dir() {
+            eprintln!(
+                "ingest_folder path does not exist (skipped): {}",
+                self.payload.root_path
+            );
+            return Ok(());
+        }
+
+        println!("processing ingest_folder: {}", self.payload.root_path);
+
+        let model = {
             let conn = pool.get()?;
+            repository::find_model_by_id(&conn, model_id)?
+        };
 
-            // Skip if document exists and is unchanged.
-            if let Some(existing) = repository::find_document_by_path(&conn, &filepath)? {
-                if existing.file_modified_at == file_modified_at && existing.file_size == file_size
-                {
-                    repository::update_heartbeat(&conn, job_id, now)?;
+        if let Ok(entries) = std::fs::read_dir(root_path) {
+            for result in entries {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("  failed to read directory entry: {e}");
+                        continue;
+                    }
+                };
+                let now = unix_now();
+                let path = entry.path();
+
+                if !path.is_file() {
                     continue;
                 }
-            }
 
-            let doc = Document {
-                id: 0,
-                filepath: filepath.clone(),
-                file_type: file_type.clone(),
-                doc_category: DocCategory::Resource,
-                file_modified_at,
-                file_size,
-                updated_at: now,
-            };
+                let metadata = match std::fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("  failed to read metadata for {:?}: {e}", path);
+                        continue;
+                    }
+                };
 
-            let doc_id = repository::insert_document(&conn, &doc)?;
+                let filepath = path.to_string_lossy().to_string();
+                let file_type = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let file_modified_at = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(now);
+                let file_size = metadata.len() as i64;
 
-            // Always insert a filename embedding.
-            repository::insert_pending_embeddings(
-                &conn,
-                doc_id,
-                model_id,
-                &[(ChunkType::Filename, 0, 0)],
-                now,
-            )?;
+                let conn = pool.get()?;
 
-            // Content-chunk text-like files.
-            if let Some(ref m) = model {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if !content.is_empty() {
-                        let chunk_size = m.chunk_size as usize;
-                        let overlap = m.chunk_overlap as usize;
-                        let chunks = chunk_content(&content, chunk_size, overlap);
+                if let Some(existing) = repository::find_document_by_path(&conn, &filepath)? {
+                    if existing.file_modified_at == file_modified_at
+                        && existing.file_size == file_size
+                    {
+                        repository::update_heartbeat(&conn, job_id, now)?;
+                        continue;
+                    }
+                }
 
-                        if !chunks.is_empty() {
-                            let chunk_refs: Vec<(ChunkType, i64, i64)> = chunks
-                                .iter()
-                                .map(|(start, end)| {
-                                    (ChunkType::Content, *start as i64, *end as i64)
-                                })
-                                .collect();
-                            repository::insert_pending_embeddings(
-                                &conn,
-                                doc_id,
-                                model_id,
-                                &chunk_refs,
-                                now,
-                            )?;
+                let doc = Document {
+                    id: 0,
+                    filepath: filepath.clone(),
+                    file_type: file_type.clone(),
+                    doc_category: DocCategory::Resource,
+                    file_modified_at,
+                    file_size,
+                    updated_at: now,
+                };
+
+                let doc_id = repository::insert_document(&conn, &doc)?;
+
+                repository::insert_pending_embeddings(
+                    &conn,
+                    doc_id,
+                    model_id,
+                    &[(ChunkType::Filename, 0, 0)],
+                    now,
+                )?;
+
+                if let Some(ref m) = model {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if !content.is_empty() {
+                            let chunk_size = m.chunk_size as usize;
+                            let overlap = m.chunk_overlap as usize;
+                            let chunks = chunk_content(&content, chunk_size, overlap);
+
+                            if !chunks.is_empty() {
+                                let chunk_refs: Vec<(ChunkType, i64, i64)> = chunks
+                                    .iter()
+                                    .map(|(start, end)| {
+                                        (ChunkType::Content, *start as i64, *end as i64)
+                                    })
+                                    .collect();
+                                repository::insert_pending_embeddings(
+                                    &conn,
+                                    doc_id,
+                                    model_id,
+                                    &chunk_refs,
+                                    now,
+                                )?;
+                            }
                         }
                     }
                 }
+
+                repository::update_heartbeat(&conn, job_id, now)?;
             }
-
-            repository::update_heartbeat(&conn, job_id, now)?;
         }
+
+        Ok(())
     }
-
-    let conn = pool.get()?;
-    repository::complete_job(&conn, job_id)?;
-    println!("completed job {job_id}");
-
-    Ok(())
 }
 
 /// Split `content` into overlapping chunks by byte offset.
@@ -271,9 +286,6 @@ mod tests {
     #[test]
     fn chunk_content_with_overlap() {
         let chunks = chunk_content("abcdefghij", 6, 2);
-        // step = 6 - 2 = 4
-        // chunk 1: 0..6  -> "abcdef"
-        // chunk 2: 4..10 -> "efghij"
         assert_eq!(chunks, vec![(0, 6), (4, 10)]);
     }
 
@@ -297,9 +309,7 @@ mod tests {
 
     #[test]
     fn chunk_content_multibyte_utf8() {
-        // "ñ" is 2 bytes in UTF-8
         let chunks = chunk_content("añb", 3, 0);
-        // "añ" is 3 bytes, "b" is 1 byte
         assert_eq!(chunks, vec![(0, 3), (3, 4)]);
     }
 }

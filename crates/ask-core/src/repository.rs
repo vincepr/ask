@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::models::{Document, DocumentEmbedding, EmbeddingModel, JobQueueEntry};
+use crate::models::{Document, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
 /// A job with a heartbeat older than this (in seconds) is considered dead and
@@ -58,40 +58,36 @@ pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option
     }
 }
 
-/// Update the file metadata and mark the document's embeddings for the given
-/// model as stale.
-pub fn mark_document_changed(
-    conn: &mut Connection,
-    doc_id: i64,
-    file_modified_at: i64,
-    file_size: i64,
-    model_id: i64,
-    now: i64,
-) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("failed to start transaction for mark_document_changed")?;
+/// Mark all embeddings for the given documents as stale across every model.
+///
+/// Only `'embedded'` rows are affected — `'pending'` and already-`'stale'` rows are
+/// left as-is. Document IDs that do not exist in the `documents` table are silently
+/// filtered out by the subquery.
+pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
+    if doc_ids.is_empty() {
+        return Ok(());
+    }
 
-    tx.execute(
-        "UPDATE documents SET file_modified_at = ?1, file_size = ?2, updated_at = ?3 WHERE id = ?4",
-        params![file_modified_at, file_size, now, doc_id],
-    )
-    .context("failed to update document metadata")?;
+    let placeholders: Vec<String> = doc_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "UPDATE document_embeddings SET state = 'stale' \
+         WHERE document_id IN (SELECT id FROM documents WHERE id IN ({})) \
+         AND state = 'embedded'",
+        placeholders.join(", ")
+    );
 
-    tx.execute(
-        "UPDATE document_embeddings SET state = 'stale' WHERE document_id = ?1 AND model_id = ?2 AND state = 'embedded'",
-        params![doc_id, model_id],
-    )
-    .context("failed to mark embeddings as stale")?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("failed to prepare mark_documents_stale")?;
 
-    tx.commit()
-        .context("failed to commit mark_document_changed")
-}
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = doc_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
 
-/// Delete a document and its cascaded embeddings.
-pub fn delete_document(conn: &Connection, doc_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])
-        .context("failed to delete document")?;
+    stmt.execute(param_refs.as_slice())
+        .context("failed to mark embeddings as stale")?;
+
     Ok(())
 }
 
@@ -228,76 +224,6 @@ pub fn insert_pending_embeddings(
     }
 
     Ok(())
-}
-
-/// Return all pending embeddings for a given model, ordered by document id.
-pub fn pending_embeddings_for_model(
-    conn: &Connection,
-    model_id: i64,
-) -> Result<Vec<DocumentEmbedding>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at
-             FROM document_embeddings
-             WHERE model_id = ?1 AND (state = 'pending' OR state = 'stale')
-             ORDER BY document_id",
-        )
-        .context("failed to prepare pending_embeddings_for_model")?;
-
-    let rows = stmt
-        .query_map(params![model_id], |row| {
-            Ok(DocumentEmbedding {
-                id: row.get(0)?,
-                document_id: row.get(1)?,
-                model_id: row.get(2)?,
-                chunk_type: ChunkType::try_from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(ChunkType::Content),
-                chunk_start: row.get(4)?,
-                chunk_end: row.get(5)?,
-                state: EmbedState::try_from_str(&row.get::<_, String>(6)?)
-                    .unwrap_or(EmbedState::Pending),
-                embedding: row.get(7)?,
-                created_at: row.get(8)?,
-            })
-        })
-        .context("failed to query pending embeddings")?;
-
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to collect pending embeddings")
-}
-
-/// Mark a single embedding row as embedded.
-pub fn mark_embedded(conn: &Connection, emb_id: i64, embedding: &[u8], now: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE document_embeddings SET state = 'embedded', embedding = ?1, created_at = ?2 WHERE id = ?3",
-        params![embedding, now, emb_id],
-    )
-    .context("failed to mark embedding as embedded")?;
-    Ok(())
-}
-
-/// Delete all embedding rows for a document + model (used during re-embed).
-pub fn delete_embeddings_for_doc_model(
-    conn: &Connection,
-    doc_id: i64,
-    model_id: i64,
-) -> Result<()> {
-    conn.execute(
-        "DELETE FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
-        params![doc_id, model_id],
-    )
-    .context("failed to delete embeddings for doc+model")?;
-    Ok(())
-}
-
-/// Count pending or stale embeddings for a model (to check if work remains).
-pub fn count_pending_for_model(conn: &Connection, model_id: i64) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM document_embeddings WHERE model_id = ?1 AND (state = 'pending' OR state = 'stale')",
-        params![model_id],
-        |row| row.get(0),
-    )
-    .context("failed to count pending embeddings")
 }
 
 // ---------------------------------------------------------------------------

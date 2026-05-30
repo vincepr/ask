@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_core::repository;
 use ask_core::types::JobType;
-use ask_server::worker::process_ingest_folder;
+use ask_server::worker::dispatch_job;
 use ask_server::{create_pool, http, migrations};
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -259,7 +259,7 @@ async fn ingest_different_dirs_both_succeed() {
 }
 
 // ---------------------------------------------------------------------------
-// process_ingest_folder — documents are actually inserted
+// dispatch_job — documents are actually inserted
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -309,7 +309,7 @@ async fn ingest_folder_inserts_documents_and_pending_embeddings() {
 
     // Process it.
     let pool = db.pool();
-    process_ingest_folder(&pool, entry.id, &entry.payload, model.id).unwrap();
+    dispatch_job(&pool, &entry, model.id).unwrap();
 
     // Verify: documents were inserted.
     let conn = db.pool().get().unwrap();
@@ -395,7 +395,7 @@ async fn ingest_folder_skips_unchanged_files() {
 
     let model_id = 1;
     let pool = db.pool();
-    process_ingest_folder(&pool, entry.id, &entry.payload, model_id).unwrap();
+    dispatch_job(&pool, &entry, model_id).unwrap();
 
     // Doc count after first ingest.
     let conn = db.pool().get().unwrap();
@@ -409,7 +409,7 @@ async fn ingest_folder_skips_unchanged_files() {
     let mut conn = db.pool().get().unwrap();
     let entry2 = repository::claim_job(&mut conn, now + 11).unwrap().unwrap();
     drop(conn);
-    process_ingest_folder(&pool, entry2.id, &entry2.payload, model_id).unwrap();
+    dispatch_job(&pool, &entry2, model_id).unwrap();
 
     // Doc count should NOT have increased.
     let conn = db.pool().get().unwrap();
@@ -453,7 +453,7 @@ async fn ingest_folder_empty_dir_completes_job() {
     drop(conn);
 
     let pool = db.pool();
-    process_ingest_folder(&pool, entry.id, &entry.payload, 1).unwrap();
+    dispatch_job(&pool, &entry, 1).unwrap();
 
     // No documents, no errors, job completed.
     let conn = db.pool().get().unwrap();
@@ -483,7 +483,7 @@ async fn ingest_folder_nonexistent_path_completes_job() {
     drop(conn);
 
     let pool = db.pool();
-    process_ingest_folder(&pool, entry.id, &entry.payload, 1).unwrap();
+    dispatch_job(&pool, &entry, 1).unwrap();
 
     let conn = db.pool().get().unwrap();
     let job_count: i64 = conn
@@ -530,4 +530,299 @@ async fn job_lifecycle_claim_and_complete() {
         .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// POST /documents/stale
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mark_stale_batch_updates_embeddings() {
+    let db = TempDb::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Seed a model and two documents.
+    let conn = db.pool().get().unwrap();
+    repository::insert_model(
+        &conn,
+        &ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "test".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
+        },
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+         VALUES ('/a.txt', 'txt', 'resource', 100, 10, 100),
+                ('/b.txt', 'txt', 'resource', 101, 20, 101);
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 1, 'filename', 0, 0, 'embedded', 100),
+                (1, 1, 'content', 0, 5, 'embedded', 100),
+                (2, 1, 'filename', 0, 0, 'embedded', 101);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/documents/stale")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"document_ids":[1]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["status"], "ok");
+
+    // Verify: doc 1's embeddings are stale, doc 2's are still embedded.
+    let conn = db.pool().get().unwrap();
+    let stale_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'stale'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_count, 2, "doc 1 has 2 stale embeddings");
+
+    let embedded_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'embedded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedded_count, 1, "doc 2 still has 1 embedded embedding");
+}
+
+#[tokio::test]
+async fn mark_stale_empty_list_returns_400() {
+    let db = TempDb::new();
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/documents/stale")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"document_ids":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn mark_stale_nonexistent_ids_is_noop() {
+    let db = TempDb::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Seed a model and one document.
+    let conn = db.pool().get().unwrap();
+    repository::insert_model(
+        &conn,
+        &ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "test".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
+        },
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+         VALUES ('/keep.txt', 'txt', 'resource', 100, 10, 100);
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 1, 'filename', 0, 0, 'embedded', 100);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/documents/stale")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"document_ids":[999]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Existing embedding should still be 'embedded'.
+    let conn = db.pool().get().unwrap();
+    let embedded_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'embedded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedded_count, 1);
+    let stale_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'stale'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_count, 0);
+}
+
+#[tokio::test]
+async fn mark_stale_affects_all_models_and_preserves_rows() {
+    let db = TempDb::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Two models.
+    let conn = db.pool().get().unwrap();
+    repository::insert_model(
+        &conn,
+        &ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "m1".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
+        },
+    )
+    .unwrap();
+    repository::insert_model(
+        &conn,
+        &ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "m2".to_string(),
+            dimensions: 384,
+            chunk_size: 256,
+            chunk_overlap: 0,
+            created_at: now,
+        },
+    )
+    .unwrap();
+
+    // Two documents. Doc 1 has embeddings across both models with mixed states.
+    // Doc 2 is a control: should be untouched.
+    conn.execute_batch(
+        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+         VALUES ('/doc1.txt', 'txt', 'resource', 100, 10, 100),
+                ('/doc2.txt', 'txt', 'resource', 200, 20, 200);
+
+         -- doc 1 / model 1: TWO embedded rows (will become stale)
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 1, 'filename', 0, 0, 'embedded', 100);
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 1, 'content',  0, 5, 'embedded', 100);
+
+         -- doc 1 / model 2: ONE embedded row (will become stale)
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 2, 'filename', 0, 0, 'embedded', 100);
+
+         -- doc 1 / model 1: ONE pending row (should stay 'pending')
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 1, 'content',  10, 15, 'pending', 100);
+
+         -- doc 1 / model 2: ONE already-stale row (should stay 'stale')
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (1, 2, 'content',  0, 10, 'stale', 100);
+
+         -- doc 2 / model 1: ONE embedded row (different doc, should be untouched)
+         INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (2, 1, 'filename', 0, 0, 'embedded', 200);",
+    )
+    .unwrap();
+    drop(conn);
+
+    // Mark doc 1 stale.
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/documents/stale")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"document_ids":[1]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let conn = db.pool().get().unwrap();
+
+    // Total row count unchanged (no deletes).
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM document_embeddings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 6, "all rows still exist, none were deleted");
+
+    // Stale count: 2 (m1 embedded) + 1 (m2 embedded) → stale + 1 already stale = 4.
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'stale'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 4, "3 embedded→stale + 1 already stale = 4");
+
+    // The 'pending' row was NOT touched.
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE state = 'pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1, "pending row was left alone");
+
+    // Doc 2's embedding was NOT touched.
+    let doc2_embedded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = 2 AND state = 'embedded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(doc2_embedded, 1, "doc 2's embedding is untouched");
+
+    // Doc 1 now has ZERO 'embedded' rows.
+    let doc1_embedded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = 1 AND state = 'embedded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(doc1_embedded, 0, "doc 1 has no remaining 'embedded' rows");
 }

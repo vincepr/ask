@@ -3,7 +3,6 @@ pub const WORKSPACE_NAME: &str = "ask";
 
 pub mod models;
 pub mod repository;
-pub mod schema;
 pub mod types;
 
 /// Describes a workspace member and its responsibility.

@@ -1,13 +1,14 @@
 use std::path::Path;
 
 use ask_core::models::IngestFolderPayload;
-use ask_core::types::JobType;
+use ask_core::{repository, types::JobType};
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
     routing::{get, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::DbPool;
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ingest", post(ingest))
+        .route("/documents/stale", post(mark_stale))
         .with_state(state)
 }
 
@@ -93,6 +95,42 @@ async fn ingest(
         )),
         IngestOutcome::Conflict(msg) => Err(error_response(StatusCode::CONFLICT, "conflict", msg)),
     }
+}
+
+#[derive(Deserialize)]
+struct MarkStalePayload {
+    document_ids: Vec<i64>,
+}
+
+async fn mark_stale(
+    State(pool): State<AppState>,
+    Json(body): Json<MarkStalePayload>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.document_ids.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "document_ids must not be empty".to_string(),
+        ));
+    }
+
+    let doc_ids = body.document_ids;
+
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(|e| format!("database error: {e}"))?;
+        repository::mark_documents_stale(&conn, &doc_ids).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("request panicked: {e}"),
+        )
+    })?
+    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e))?;
+
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 fn error_response(status: StatusCode, code: &str, message: String) -> (StatusCode, Json<Value>) {
