@@ -1,4 +1,4 @@
-# 002: File System Watching and Orphan Cleanup
+# 006: File System Watching and Orphan Cleanup
 
 ## Context
 

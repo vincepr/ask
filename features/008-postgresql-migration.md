@@ -1,4 +1,4 @@
-# 003: Switch to PostgreSQL
+# 008: Switch to PostgreSQL
 
 ## Context
 

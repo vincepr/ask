@@ -1,4 +1,4 @@
-# 001: Re-embedding of Stale Documents
+# 004: Re-embedding of Stale Documents
 
 ## Context
 
