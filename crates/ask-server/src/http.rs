@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 
 use crate::DbPool;
 
-/// Shared application state held by every request handler.
 pub type AppState = DbPool;
 
 /// Returns the HTTP router with all routes registered.
@@ -27,14 +26,26 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
-/// Enqueue an IngestFolder job.
 async fn ingest(
     State(pool): State<AppState>,
     Json(body): Json<IngestFolderPayload>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let root_path = Path::new(&body.root_path);
+    let root_path = body.root_path.clone();
 
-    if !root_path.exists() {
+    let path_exists = tokio::task::spawn_blocking(move || {
+        let p = Path::new(&root_path);
+        (p.exists(), p.is_dir())
+    })
+    .await
+    .map_err(|e| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("path check panicked: {e}"),
+        )
+    })?;
+
+    if !path_exists.0 {
         return Err(error_response(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -42,7 +53,7 @@ async fn ingest(
         ));
     }
 
-    if !root_path.is_dir() {
+    if !path_exists.1 {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "bad_request",
@@ -50,35 +61,31 @@ async fn ingest(
         ));
     }
 
-    let payload_json =
-        serde_json::to_string(&body).expect("IngestFolderPayload is always serializable");
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_secs() as i64;
-
-    let conn = pool.get().map_err(|e| {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let payload_json = serde_json::to_string(&body)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_secs() as i64;
+        let conn = pool.get()?;
+        ask_core::repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now)
+            .map(|_| json!({ "status": "queued", "job_type": "ingest_folder" }))
+    })
+    .await
+    .map_err(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
-            format!("failed to acquire database connection: {e}"),
+            format!("enqueue panicked: {e}"),
         )
     })?;
 
-    match ask_core::repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now) {
-        Ok(()) => Ok(Json(
-            json!({ "status": "queued", "job_type": "ingest_folder" }),
-        )),
-        Err(e) => Err(error_response(
-            StatusCode::CONFLICT,
-            "conflict",
-            e.to_string(),
-        )),
-    }
+    let inner =
+        result.map_err(|e| error_response(StatusCode::CONFLICT, "conflict", e.to_string()))?;
+
+    Ok(Json(inner))
 }
 
-/// Build a standardized error response body.
 fn error_response(status: StatusCode, code: &str, message: String) -> (StatusCode, Json<Value>) {
     (
         status,
