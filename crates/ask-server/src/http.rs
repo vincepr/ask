@@ -26,64 +26,73 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
+/// Discriminated outcome of the ingest validation + enqueue step, produced
+/// inside a single `spawn_blocking` call so that no async-runtime thread is
+/// ever blocked by a filesystem syscall or a `pool.get()` wait.
+enum IngestOutcome {
+    Queued,
+    NotFound(String),
+    NotADirectory(String),
+    Conflict(String),
+}
+
 async fn ingest(
     State(pool): State<AppState>,
     Json(body): Json<IngestFolderPayload>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let root_path = body.root_path.clone();
-
-    let path_exists = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
+        let root_path = body.root_path.clone();
         let p = Path::new(&root_path);
-        (p.exists(), p.is_dir())
-    })
-    .await
-    .map_err(|e| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("path check panicked: {e}"),
-        )
-    })?;
 
-    if !path_exists.0 {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            format!("path does not exist: {}", body.root_path),
-        ));
-    }
+        if !p.exists() {
+            return IngestOutcome::NotFound(root_path);
+        }
+        if !p.is_dir() {
+            return IngestOutcome::NotADirectory(root_path);
+        }
 
-    if !path_exists.1 {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            format!("path is not a directory: {}", body.root_path),
-        ));
-    }
-
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let payload_json = serde_json::to_string(&body)?;
+        let payload_json =
+            serde_json::to_string(&body).expect("IngestFolderPayload is always serializable");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before epoch")
             .as_secs() as i64;
-        let conn = pool.get()?;
-        ask_core::repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now)
-            .map(|_| json!({ "status": "queued", "job_type": "ingest_folder" }))
+
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => return IngestOutcome::Conflict(format!("database error: {e}")),
+        };
+
+        match ask_core::repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now) {
+            Ok(()) => IngestOutcome::Queued,
+            Err(e) => IngestOutcome::Conflict(e.to_string()),
+        }
     })
     .await
     .map_err(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
-            format!("enqueue panicked: {e}"),
+            format!("request panicked: {e}"),
         )
     })?;
 
-    let inner =
-        result.map_err(|e| error_response(StatusCode::CONFLICT, "conflict", e.to_string()))?;
-
-    Ok(Json(inner))
+    match result {
+        IngestOutcome::Queued => Ok(Json(
+            json!({ "status": "queued", "job_type": "ingest_folder" }),
+        )),
+        IngestOutcome::NotFound(p) => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("path does not exist: {p}"),
+        )),
+        IngestOutcome::NotADirectory(p) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("path is not a directory: {p}"),
+        )),
+        IngestOutcome::Conflict(msg) => Err(error_response(StatusCode::CONFLICT, "conflict", msg)),
+    }
 }
 
 fn error_response(status: StatusCode, code: &str, message: String) -> (StatusCode, Json<Value>) {

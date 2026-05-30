@@ -23,72 +23,62 @@ pub fn spawn(pool: DbPool) {
     });
 }
 
+/// Claim a job and process it, all on a blocking thread so the async runtime
+/// is never held up by DB or filesystem calls.
 async fn tick(pool: DbPool) -> Result<()> {
-    let pool2 = pool.clone();
-    let entry = tokio::task::spawn_blocking(move || -> Result<_> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let now = unix_now();
-        let mut conn = pool2.get()?;
-        repository::claim_job(&mut conn, now)
+        let mut conn = pool.get()?;
+        let entry = repository::claim_job(&mut conn, now)?;
+
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        println!("claimed job {} ({})", entry.id, entry.job_type.as_str());
+
+        match entry.job_type {
+            JobType::IngestFolder => process_ingest_folder(&pool, entry.id, &entry.payload),
+        }
     })
     .await
-    .context("worker claim_job panicked")??;
+    .context("worker tick panicked")??;
 
-    let entry = match entry {
-        Some(e) => e,
-        None => return Ok(()),
-    };
-
-    println!("claimed job {} ({})", entry.id, entry.job_type.as_str());
-
-    match entry.job_type {
-        JobType::IngestFolder => process_ingest_folder(pool, entry.id, entry.payload).await,
-    }
+    Ok(())
 }
 
-async fn process_ingest_folder(pool: DbPool, job_id: i64, payload_json: String) -> Result<()> {
-    let payload: IngestFolderPayload = serde_json::from_str(&payload_json)?;
-    let root_path = Path::new(&payload.root_path).to_path_buf();
+/// Synchronously process an IngestFolder job.  Called from within
+/// `spawn_blocking`, so blocking calls like `std::fs::read_dir`,
+/// `std::thread::sleep`, and `pool.get()` are all fine here.
+fn process_ingest_folder(pool: &DbPool, job_id: i64, payload_json: &str) -> Result<()> {
+    let payload: IngestFolderPayload = serde_json::from_str(payload_json)?;
+    let root_path = Path::new(&payload.root_path);
 
-    let is_dir = tokio::task::spawn_blocking({
-        let p = root_path.clone();
-        move || p.is_dir()
-    })
-    .await
-    .context("path check panicked")?;
-
-    if !is_dir {
+    if !root_path.is_dir() {
         eprintln!(
             "ingest_folder path does not exist (skipped): {}",
             payload.root_path
         );
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = pool.get()?;
-            repository::complete_job(&conn, job_id)
-        })
-        .await
-        .context("worker complete_job panicked")??;
+        let conn = pool.get()?;
+        repository::complete_job(&conn, job_id)?;
         return Ok(());
     }
 
     println!("processing ingest_folder: {}", payload.root_path);
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        if let Ok(mut entries) = std::fs::read_dir(&root_path) {
-            while let Some(Ok(_entry)) = entries.next() {
-                let now = unix_now();
-                let conn = pool.get()?;
-                repository::update_heartbeat(&conn, job_id, now)?;
-                std::thread::sleep(Duration::from_secs(1));
-            }
+    if let Ok(mut entries) = std::fs::read_dir(root_path) {
+        while let Some(Ok(_entry)) = entries.next() {
+            let now = unix_now();
+            let conn = pool.get()?;
+            repository::update_heartbeat(&conn, job_id, now)?;
+            std::thread::sleep(Duration::from_secs(1));
         }
+    }
 
-        let conn = pool.get()?;
-        repository::complete_job(&conn, job_id)?;
-        println!("completed job {job_id}");
-        Ok(())
-    })
-    .await
-    .context("worker ingest_folder panicked")??;
+    let conn = pool.get()?;
+    repository::complete_job(&conn, job_id)?;
+    println!("completed job {job_id}");
 
     Ok(())
 }
