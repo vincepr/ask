@@ -28,6 +28,6 @@ system can retry or cleanly classify the failure.
 
 
 ## Human review:
-- As simplicity is the main goal for the queue system this seems fine.
+- As simplicity is the main goal for the queue system this seems fine for now. But for the future:
 - Too much logic for what it currently does. Would rather go the route to pass in a lambda to update a heartbeet while the process is running. Can be also used to check if the db-entry can no longer be updated -> someone delted the entry -> we terminate this process. that heartbeat then allows to move the 24hour delay down to maybe an hour. (if heartbeat untouched for an hour we just assume its dead -> we then DELETE the old one so a still working process will then stop on its next heartbeat -> and create a duplicate with a new id) -> new worker picks it up. And transient falures can just write a heartbeat in the future (means something like retry after 3 h)
 - BUT DEFINITLY NEEDS SOME BIG REWRITING, before coming a feature in that regard. Also really low prio

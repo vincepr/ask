@@ -24,6 +24,7 @@ The worker attempts to read every file in the target directory into memory as UT
 - Keep filename-only indexing as a deliberate fallback rather than an accidental side effect.
 
 ## Human review:
-- Implement that.
+- LOW PRIO: Might need some research first. But definitly should implement.
+- check if instead of reading whole file to string we can just read parts of it. But how to handle encoding, buffer (1-3 byte boundaries)...
 - added line about if > max filesize, just embedd only up to the limit
 - limit should probably be const muliplicative of current models configured chunksize? with maybe a uper max (then take the chunksize time X below that). 

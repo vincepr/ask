@@ -26,3 +26,7 @@ state behind.
 - If content chunk generation fails before any database write should be committed, abort the whole
   transaction.
 - Add regression tests for an injected failure between document creation and embedding queue creation.
+
+## Human review:
+- Question postgres can't do usize properly, so even if sqlite can handle it better, its probably not worth switching
+- So just add some validation for now.

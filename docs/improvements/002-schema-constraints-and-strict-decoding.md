@@ -28,3 +28,7 @@ The schema accepts invalid values and the Rust side silently coerces some of the
 - Decode enum values strictly and return a typed repository error instead of silently substituting
   `Resource`.
 - Centralize row decoding so every query uses the same invariant checks.
+
+## Human review:
+- How does rust handle this enums coming from the db? -> as there really seems nothing premade in rusqlite
+- ideally implement rusqlite::types::FromSql and ToSql for the enum seems reasonable
