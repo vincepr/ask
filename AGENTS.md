@@ -146,6 +146,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Follow the Arrange-Act-Assert pattern
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code
+- Put tests for public crate behavior in `tests/`; keep source-file `#[cfg(test)]` tests only for private helpers or internals that integration tests cannot reach
 - **MUST** add regression tests (unit or integration) when fixing any bug, to prevent re-occurrence
 
 ## Imports and Dependencies
