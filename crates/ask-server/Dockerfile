@@ -18,6 +18,7 @@ WORKDIR /app
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ask-server /usr/local/bin/ask-server
 
 ENV ASK_SERVER_DATA_DIR=/data
+ENV ASK_SERVER_RESOURCE_DIR=/resources
 
 EXPOSE 3000
 

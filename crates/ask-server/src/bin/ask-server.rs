@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
 
     println!("Starting {WORKSPACE_NAME} server workspace with {member_count} member crates.");
     println!("Using SQLite database at {sqlite_path}.");
+    println!("Resource directory: {}.", config.resource_dir);
     println!(
         "Embedding provider mode '{}' at {}.",
         config.embedding_provider.mode_name(),

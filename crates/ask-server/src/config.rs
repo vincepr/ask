@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 
 pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
+pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
 pub const BIND_HOST_ENV: &str = "ASK_SERVER_BIND_HOST";
 pub const BIND_PORT_ENV: &str = "ASK_SERVER_BIND_PORT";
 pub const EMBEDDING_MODE_ENV: &str = "ASK_SERVER_EMBEDDING_MODE";
@@ -8,6 +9,7 @@ pub const EMBEDDING_BASE_URL_ENV: &str = "ASK_SERVER_EMBEDDING_BASE_URL";
 pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
 
 pub const DEFAULT_DATA_DIR: &str = ".data";
+pub const DEFAULT_RESOURCE_DIR: &str = ".";
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_BIND_PORT: u16 = 3000;
 pub const DEFAULT_TEI_BASE_URL: &str = "http://localhost:18080";
@@ -53,6 +55,8 @@ impl EmbeddingProvider {
 pub struct Config {
     /// Filesystem path to the directory containing persistent server data.
     pub data_dir: String,
+    /// Filesystem path to the directory containing resource files (code, configs, etc.).
+    pub resource_dir: String,
     /// Host or interface the HTTP server binds to.
     pub bind_host: String,
     /// TCP port the HTTP server binds to.
@@ -86,6 +90,8 @@ impl Config {
 /// missing required configuration.
 pub fn load() -> Result<Config> {
     let data_dir = std::env::var(DATA_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_DATA_DIR));
+    let resource_dir =
+        std::env::var(RESOURCE_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_RESOURCE_DIR));
     let bind_host =
         std::env::var(BIND_HOST_ENV).unwrap_or_else(|_| String::from(DEFAULT_BIND_HOST));
     let bind_port = match std::env::var(BIND_PORT_ENV) {
@@ -101,6 +107,7 @@ pub fn load() -> Result<Config> {
 
     Ok(Config {
         data_dir,
+        resource_dir,
         bind_host,
         bind_port,
         embedding_provider,
