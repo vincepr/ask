@@ -23,12 +23,20 @@ The expected evolution is:
 `ask-server` owns database startup and migration application.
 
 - SQLite is the initial storage layer
-- the SQLite file location is selected through `ASK_SERVER_SQLITE_PATH`
-- the default path is `data/ask.sqlite3`, which matches a future mounted data directory
+- the SQLite file location is derived from `ASK_SERVER_DATA_DIR`
+- the default path is `.data/ask.sqlite3`, which matches the ignored local data directory
 - migration definitions are embedded in the binary from `ask-server/migrations/`
 - a `migrations` table tracks applied versions in ascending order
 - each applied row stores `version` and optional `required_actions`
 - the server creates the tracking table if needed, then applies any missing migrations in version order during startup
+
+## Embedding provider configuration
+
+`ask-server` reads one of two embedding backends from environment variables:
+
+- `ASK_SERVER_EMBEDDING_MODE=tei` targets a local OpenAI-compatible TEI service
+- `ASK_SERVER_EMBEDDING_MODE=openai` targets an external OpenAI-compatible provider
+- `ASK_SERVER_EMBEDDING_AUTH_TOKEN` is only required in `openai` mode
 
 ## Robustness
 

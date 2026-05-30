@@ -16,6 +16,10 @@
 !.env.sample
 *.local
 
+# Local persistent data
+.data/
+data/
+
 # Logs
 *.log
 

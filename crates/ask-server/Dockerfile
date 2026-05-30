@@ -5,8 +5,8 @@ RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY ask-core ./ask-core
-COPY ask-server ./ask-server
+COPY crates/ask-core ./crates/ask-core
+COPY crates/ask-server ./crates/ask-server
 
 RUN cargo build --locked --release --target x86_64-unknown-linux-musl -p ask-server --bin ask-server
 
@@ -17,7 +17,7 @@ RUN apk add --no-cache ca-certificates wget
 WORKDIR /app
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ask-server /usr/local/bin/ask-server
 
-ENV ASK_SERVER_SQLITE_PATH=/data/ask.sqlite3
+ENV ASK_SERVER_DATA_DIR=/data
 
 EXPOSE 3000
 

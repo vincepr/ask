@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.100"
+dotenvy = "0.15.7"
 ask-core = { path = "../ask-core" }
 axum = "0.8.7"
 rusqlite = { version = "0.37.0", features = ["bundled"] }

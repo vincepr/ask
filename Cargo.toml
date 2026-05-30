@@ -1,5 +1,5 @@
 [workspace]
-members = ["ask-core", "ask-server"]
+members = ["crates/ask-core", "crates/ask-server"]
 resolver = "2"
 
 [workspace.package]
