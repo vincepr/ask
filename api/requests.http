@@ -7,4 +7,7 @@
 GET {{baseUrl}}/health
 
 ### Ingest a directory (enqueues an ingest_folder job)
-POST {{baseUrl}}/ingest/{{resourceDir}}/some-folder
+POST {{baseUrl}}/ingest
+Content-Type: application/json
+
+{ "root_path": "{{resourceDir}}" }

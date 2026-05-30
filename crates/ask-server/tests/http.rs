@@ -1,5 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use ask_server::create_pool;
 use ask_server::http;
 use axum::{
     body::{Body, to_bytes},
@@ -8,8 +9,12 @@ use axum::{
 use tower::ServiceExt;
 
 fn dummy_state() -> http::AppState {
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
-    Arc::new(Mutex::new(conn))
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("ask-server-test-{unique_suffix}.db"));
+    create_pool(&path.to_string_lossy()).expect("test pool")
 }
 
 #[tokio::test]

@@ -4,6 +4,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::models::{Document, DocumentEmbedding, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
+/// A job with a heartbeat older than this (in seconds) is considered dead and
+/// can be replaced by a fresh enqueue.
+const STALE_JOB_AGE_SECS: i64 = 86400;
+
 // ---------------------------------------------------------------------------
 // Document
 // ---------------------------------------------------------------------------
@@ -274,18 +278,31 @@ pub fn count_pending_for_model(conn: &Connection, model_id: i64) -> Result<i64> 
 // JobQueue
 // ---------------------------------------------------------------------------
 
-/// Enqueue a new job. Returns an error if a job with the same type and payload
-/// already exists (UNIQUE constraint on `(job_type, payload)`).
+/// Enqueue a job, or re-enqueue it if the existing one is stale.
+///
+/// If a row with the same `(job_type, payload)` already exists **and** its
+/// heartbeat is older than `STALE_JOB_AGE_SECS`, the job is reset (heartbeat
+/// cleared, timestamps refreshed). Otherwise returns an error — the job is
+/// still active and cannot be duplicated.
 pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i64) -> Result<()> {
-    let inserted = conn
+    let stale_cutoff = now - STALE_JOB_AGE_SECS;
+
+    let affected = conn
         .execute(
             "INSERT INTO job_queue (job_type, payload, heartbeat, created_at, updated_at)
-             VALUES (?1, ?2, NULL, ?3, ?3)",
-            params![job_type.as_str(), payload, now],
+             VALUES (?1, ?2, NULL, ?3, ?3)
+             ON CONFLICT(job_type, payload) DO UPDATE SET
+                 heartbeat = NULL,
+                 payload   = EXCLUDED.payload,
+                 created_at = EXCLUDED.created_at,
+                 updated_at = EXCLUDED.updated_at
+             WHERE job_queue.heartbeat IS NULL
+                OR job_queue.heartbeat < ?4",
+            params![job_type.as_str(), payload, now, stale_cutoff],
         )
         .context("failed to enqueue job")?;
 
-    if inserted == 0 {
+    if affected == 0 {
         anyhow::bail!(
             "a job with type '{t}' and payload '{p}' is already queued or in progress",
             t = job_type.as_str(),
@@ -296,7 +313,7 @@ pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i6
     Ok(())
 }
 
-/// Atomically claim the oldest unclaimed job by writing a heartbeat timestamp.
+/// Atomically claim the oldest pending job by writing a heartbeat timestamp.
 ///
 /// Uses an `IMMEDIATE` transaction so that only one worker ever claims any
 /// given row. Returns `None` when no jobs are waiting.
@@ -327,7 +344,6 @@ pub fn claim_job(conn: &mut Connection, now: i64) -> Result<Option<JobQueueEntry
         .context("failed to claim job")?;
 
     if updated == 0 {
-        // Another worker claimed it between SELECT and UPDATE.
         return Ok(None);
     }
 

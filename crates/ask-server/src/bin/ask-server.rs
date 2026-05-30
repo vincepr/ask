@@ -1,10 +1,8 @@
-use std::sync::{Arc, Mutex};
-
 use anyhow::Result;
 use ask_core::models::EmbeddingModel;
 use ask_core::repository;
 use ask_core::{WORKSPACE_NAME, workspace_members};
-use ask_server::{config, http, migrations, open_database, worker};
+use ask_server::{config, create_pool, http, migrations, worker};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,35 +11,43 @@ async fn main() -> Result<()> {
     let config = config::load()?;
     let bind_address = config.bind_address();
     let sqlite_path = config.sqlite_path();
-    let mut connection = open_database(&sqlite_path)?;
-    let applied_count = migrations::apply_pending_migrations(&mut connection)?;
+    let pool = create_pool(&sqlite_path)?;
+
+    // Run migrations on a dedicated connection.
+    {
+        let mut conn = pool.get()?;
+        let applied_count = migrations::apply_pending_migrations(&mut conn)?;
+        println!("Applied {applied_count} pending migrations.");
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
 
-    let model = match repository::find_model_by_name(&connection, &config.embedding_model)? {
-        Some(m) => m,
-        None => {
-            let m = EmbeddingModel {
-                id: 0,
-                name: config.embedding_model.clone(),
-                dimensions: config.embedding_dimensions,
-                chunk_size: config.embedding_chunk_size,
-                chunk_overlap: config.embedding_chunk_overlap,
-                created_at: now,
-            };
-            let model_id = repository::insert_model(&connection, &m)?;
-            let seeded = repository::seed_pending_for_all_docs(&connection, model_id, now)?;
-            println!(
-                "Registered new model '{}' with {seeded} pending documents.",
-                m.name
-            );
-            EmbeddingModel { id: model_id, ..m }
+    let model = {
+        let conn = pool.get()?;
+        match repository::find_model_by_name(&conn, &config.embedding_model)? {
+            Some(m) => m,
+            None => {
+                let m = EmbeddingModel {
+                    id: 0,
+                    name: config.embedding_model.clone(),
+                    dimensions: config.embedding_dimensions,
+                    chunk_size: config.embedding_chunk_size,
+                    chunk_overlap: config.embedding_chunk_overlap,
+                    created_at: now,
+                };
+                let model_id = repository::insert_model(&conn, &m)?;
+                let seeded = repository::seed_pending_for_all_docs(&conn, model_id, now)?;
+                println!(
+                    "Registered new model '{}' with {seeded} pending documents.",
+                    m.name
+                );
+                EmbeddingModel { id: model_id, ..m }
+            }
         }
     };
 
-    let db = Arc::new(Mutex::new(connection));
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
     println!("Starting {WORKSPACE_NAME} server workspace with {member_count} member crates.");
@@ -56,11 +62,10 @@ async fn main() -> Result<()> {
         config.embedding_provider.mode_name(),
         config.embedding_provider.base_url()
     );
-    println!("Applied {applied_count} pending migrations.");
     println!("Listening on http://{bind_address}.");
 
-    worker::spawn(db.clone());
-    axum::serve(listener, http::router(db)).await?;
+    worker::spawn(pool.clone());
+    axum::serve(listener, http::router(pool)).await?;
 
     Ok(())
 }
