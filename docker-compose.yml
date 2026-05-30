@@ -1,4 +1,19 @@
 services:
+  ask-server:
+    build:
+      context: .
+      dockerfile: ask-server/Dockerfile
+    container_name: ask-server
+    environment:
+      ASK_SERVER_BIND_HOST: 0.0.0.0
+      ASK_SERVER_BIND_PORT: "3000"
+      ASK_SERVER_SQLITE_PATH: /data/ask.sqlite3
+    ports:
+      - "13000:3000"
+    volumes:
+      - ./data:/data
+
+  # text embedding server using openai-standard api
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
     container_name: ask-tei-qwen3-embedding

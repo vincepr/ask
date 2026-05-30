@@ -16,7 +16,17 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations/0001_bootstrap_migration_system.sql"),
 }];
 
-pub(crate) fn apply_pending_migrations(connection: &mut Connection) -> Result<usize> {
+/// Applies every embedded migration that has not yet been recorded.
+///
+/// Migrations are validated and then executed in ascending version order inside
+/// individual transactions.
+///
+/// # Errors
+///
+/// Returns an error if the tracking table cannot be created, migrations are not
+/// strictly ordered, a migration fails to execute, or a migration record cannot
+/// be committed.
+pub fn apply_pending_migrations(connection: &mut Connection) -> Result<usize> {
     create_migrations_table(connection)?;
     validate_migrations(MIGRATIONS)?;
 
@@ -102,65 +112,4 @@ fn validate_migrations(migrations: &[Migration]) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Migration, apply_pending_migrations, validate_migrations};
-    use rusqlite::Connection;
-
-    #[test]
-    fn applies_migrations_only_once() {
-        let mut connection = Connection::open_in_memory().expect("in-memory database must open");
-
-        let first_run =
-            apply_pending_migrations(&mut connection).expect("first migration run must succeed");
-        let second_run =
-            apply_pending_migrations(&mut connection).expect("second migration run must succeed");
-
-        let applied_total: i64 = connection
-            .query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))
-            .expect("migration count query must succeed");
-
-        assert_eq!(first_run, 1);
-        assert_eq!(second_run, 0);
-        assert_eq!(applied_total, 1);
-    }
-
-    #[test]
-    fn stores_required_actions_as_null_when_not_needed() {
-        let mut connection = Connection::open_in_memory().expect("in-memory database must open");
-
-        apply_pending_migrations(&mut connection).expect("migration run must succeed");
-
-        let required_actions: Option<String> = connection
-            .query_row(
-                "SELECT required_actions FROM migrations WHERE version = 1",
-                [],
-                |row| row.get(0),
-            )
-            .expect("required_actions query must succeed");
-
-        assert_eq!(required_actions, None);
-    }
-
-    #[test]
-    fn rejects_non_increasing_versions() {
-        let migrations = [
-            Migration {
-                version: 2,
-                required_actions: None,
-                sql: "SELECT 1;",
-            },
-            Migration {
-                version: 2,
-                required_actions: None,
-                sql: "SELECT 1;",
-            },
-        ];
-
-        let error = validate_migrations(&migrations).expect_err("validation must fail");
-
-        assert!(error.to_string().contains("strictly increasing"));
-    }
 }

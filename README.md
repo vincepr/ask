@@ -20,6 +20,23 @@
 This fits the intended Docker deployment model where a host-mounted directory can hold both the
 SQLite database file and additional markdown knowledge files.
 
+## HTTP
+
+`ask-server` exposes a minimal health endpoint.
+
+- `GET /health` returns `{"status":"healthy"}`
+- bind host env var: `ASK_SERVER_BIND_HOST`
+- bind port env var: `ASK_SERVER_BIND_PORT`
+- default bind address: `0.0.0.0:3000`
+
+## Docker Compose
+
+`docker-compose.yml` includes `ask-server` with:
+
+- port mapping `13000:3000`
+- a host-mounted `./data` directory at `/data`
+- SQLite stored at `/data/ask.sqlite3`
+
 ## Goals
 
 - keep the codebase small and maintainable

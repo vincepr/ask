@@ -5,7 +5,7 @@
 The repository starts as a Rust workspace with two crates:
 
 - `ask-core` for shared data types and reusable logic
-- `ask-server` for the long-running service process and future HTTP or MCP entrypoints
+- `ask-server` for the long-running service process and HTTP or MCP entrypoints
 
 ## Direction
 

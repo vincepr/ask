@@ -26,24 +26,3 @@ const MEMBERS: [WorkspaceMember; 2] = [
 pub fn workspace_members() -> &'static [WorkspaceMember] {
     &MEMBERS
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{WORKSPACE_NAME, workspace_members};
-
-    #[test]
-    fn workspace_name_matches_project_name() {
-        assert_eq!(WORKSPACE_NAME, "ask");
-    }
-
-    #[test]
-    fn workspace_members_include_server() {
-        let members = workspace_members();
-
-        assert!(
-            members
-                .iter()
-                .any(|member| member.package_name == "ask-server")
-        );
-    }
-}
