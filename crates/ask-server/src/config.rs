@@ -4,6 +4,10 @@ pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
 pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
 pub const BIND_HOST_ENV: &str = "ASK_SERVER_BIND_HOST";
 pub const BIND_PORT_ENV: &str = "ASK_SERVER_BIND_PORT";
+pub const EMBEDDING_MODEL_ENV: &str = "ASK_SERVER_EMBEDDING_MODEL";
+pub const EMBEDDING_DIMENSIONS_ENV: &str = "ASK_SERVER_EMBEDDING_DIMENSIONS";
+pub const EMBEDDING_CHUNK_SIZE_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_SIZE";
+pub const EMBEDDING_CHUNK_OVERLAP_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_OVERLAP";
 pub const EMBEDDING_MODE_ENV: &str = "ASK_SERVER_EMBEDDING_MODE";
 pub const EMBEDDING_BASE_URL_ENV: &str = "ASK_SERVER_EMBEDDING_BASE_URL";
 pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
@@ -12,6 +16,10 @@ pub const DEFAULT_DATA_DIR: &str = ".data";
 pub const DEFAULT_RESOURCE_DIR: &str = ".";
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_BIND_PORT: u16 = 3000;
+pub const DEFAULT_EMBEDDING_MODEL: &str = "default";
+pub const DEFAULT_EMBEDDING_DIMENSIONS: i64 = 768;
+pub const DEFAULT_EMBEDDING_CHUNK_SIZE: i64 = 512;
+pub const DEFAULT_EMBEDDING_CHUNK_OVERLAP: i64 = 0;
 pub const DEFAULT_TEI_BASE_URL: &str = "http://localhost:18080";
 
 /// Embedding backend configuration loaded from the environment.
@@ -61,6 +69,14 @@ pub struct Config {
     pub bind_host: String,
     /// TCP port the HTTP server binds to.
     pub bind_port: u16,
+    /// Embedding model name.
+    pub embedding_model: String,
+    /// Embedding vector dimensions.
+    pub embedding_dimensions: i64,
+    /// Max tokens per chunk for this model.
+    pub embedding_chunk_size: i64,
+    /// Token overlap between consecutive chunks.
+    pub embedding_chunk_overlap: i64,
     /// Embedding provider configuration.
     pub embedding_provider: EmbeddingProvider,
 }
@@ -103,6 +119,35 @@ pub fn load() -> Result<Config> {
         })?,
         Err(_) => DEFAULT_BIND_PORT,
     };
+    let embedding_model = std::env::var(EMBEDDING_MODEL_ENV)
+        .unwrap_or_else(|_| String::from(DEFAULT_EMBEDDING_MODEL));
+    let embedding_dimensions = match std::env::var(EMBEDDING_DIMENSIONS_ENV) {
+        Ok(raw) => raw.parse::<i64>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                EMBEDDING_DIMENSIONS_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_EMBEDDING_DIMENSIONS,
+    };
+    let embedding_chunk_size = match std::env::var(EMBEDDING_CHUNK_SIZE_ENV) {
+        Ok(raw) => raw.parse::<i64>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                EMBEDDING_CHUNK_SIZE_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_EMBEDDING_CHUNK_SIZE,
+    };
+    let embedding_chunk_overlap = match std::env::var(EMBEDDING_CHUNK_OVERLAP_ENV) {
+        Ok(raw) => raw.parse::<i64>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                EMBEDDING_CHUNK_OVERLAP_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_EMBEDDING_CHUNK_OVERLAP,
+    };
     let embedding_provider = load_embedding_provider()?;
 
     Ok(Config {
@@ -110,6 +155,10 @@ pub fn load() -> Result<Config> {
         resource_dir,
         bind_host,
         bind_port,
+        embedding_model,
+        embedding_dimensions,
+        embedding_chunk_size,
+        embedding_chunk_overlap,
         embedding_provider,
     })
 }

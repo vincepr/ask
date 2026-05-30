@@ -41,3 +41,7 @@ CODEX.local.md
 
 # Local task scratchpad
 todos/
+
+# Temporary directories
+.data.tmp/
+

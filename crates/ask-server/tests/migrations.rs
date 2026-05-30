@@ -14,9 +14,9 @@ fn applies_migrations_only_once() {
         .query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))
         .expect("migration count query must succeed");
 
-    assert_eq!(first_run, 1);
+    assert_eq!(first_run, 2);
     assert_eq!(second_run, 0);
-    assert_eq!(applied_total, 1);
+    assert_eq!(applied_total, 2);
 }
 
 #[test]

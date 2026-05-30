@@ -10,11 +10,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    required_actions: None,
-    sql: include_str!("../migrations/0001_bootstrap_migration_system.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        required_actions: None,
+        sql: include_str!("../migrations/0001_bootstrap_migration_system.sql"),
+    },
+    Migration {
+        version: 2,
+        required_actions: None,
+        sql: include_str!("../migrations/0002_create_domain_tables.sql"),
+    },
+];
 
 /// Applies every embedded migration that has not yet been recorded.
 ///

@@ -6,3 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow = "1.0.100"
+rusqlite = { version = "0.37.0", features = ["bundled"] }

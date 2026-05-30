@@ -220,6 +220,13 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - For projects which build a Python package, **NEVER** build with `cargo build --features python`: this will always fail. Instead, **ALWAYS** use `maturin`.
 - **NEVER** uses the `Explore` tool for `Cargo.lock`: it is large and irrelevant. Read `Cargo.lock` **ONLY** if it's extremely relevant.
 
+## Docker
+
+- **ALWAYS** use normal `docker compose build` (incremental) instead of `--no-cache`. Only use `--no-cache` if explicitly asked.
+- **SET** a minimum timeout of 300000ms (5 minutes) for any `docker compose build` or `docker build` command.
+- For a one-off rebuild with code changes, `docker compose up --build` suffices — it only recompiles changed crates thanks to layer caching.
+- Never trigger a full Rust rebuild from scratch in Docker unless absolutely necessary (e.g., base image changed).
+
 ## Before Committing
 
 - [ ] All tests pass (`cargo test`)

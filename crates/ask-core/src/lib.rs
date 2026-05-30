@@ -1,6 +1,10 @@
 /// The shared workspace name.
 pub const WORKSPACE_NAME: &str = "ask";
 
+pub mod repository;
+pub mod schema;
+pub mod types;
+
 /// Describes a workspace member and its responsibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceMember {

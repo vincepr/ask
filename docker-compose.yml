@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: crates/ask-server/Dockerfile
     container_name: ask-server
+    user: "1000:1000"
     environment:
       ASK_SERVER_BIND_HOST: 0.0.0.0
       ASK_SERVER_BIND_PORT: "3000"
