@@ -2,39 +2,60 @@
 
 ## Context
 
-Currently the ingest process targets only `.md`, `.rs`, and `.cs` files via hardcoded extension checks. This is inflexible and does not adapt to different projects. Additionally, git-ignored files (secrets, build artifacts, vendored dependencies) are not excluded and may be indexed — leaking secrets and wasting storage.
+The ingest process needs a configurable definition of "text document". The current
+behavior is too implicit: there is no user-supplied include pattern, and unreadable or
+binary files are only avoided indirectly when UTF-8 decoding fails. Additionally,
+ignored files (secrets, build artifacts, vendored dependencies) should not be indexed.
 
 ## Problem
 
-1. File matching is hardcoded to three extensions — users cannot customize what gets indexed.
-2. Git-ignored files (secrets, `target/`, `node_modules/`, build artifacts) are not excluded.
+1. Users cannot customize what gets indexed.
+2. Relying on "can this file be read as UTF-8?" is not a real inclusion policy.
+3. Git-ignored files (secrets, `target/`, `node_modules/`, build artifacts) are not excluded.
 3. No mechanism to pass a filter pattern through the API into the job payload.
 
 ## Research: Identifying Text Documents
 
-**Recommendation: regex**. Operating systems do not provide a standard cross-platform "is this a text file?" heuristic that is reliable and configurable. The `file` command / `libmagic` can identify MIME types but adds a dependency and is language-agnostic — it cannot match against project-specific patterns (e.g. "only `*.py` files"). A regex pattern is simpler, more explicit, and gives the user full control.
+**Recommendation: regex, but only for inclusion rules**. Operating systems do not
+provide a standard cross-platform "is this a text file?" heuristic that is both
+reliable and project-configurable. The `file` command / `libmagic` can identify MIME
+types, but that adds a dependency and still does not express project-specific policy
+such as "index only source files and Markdown". A regex pattern is simpler and keeps
+the rule explicit.
 
-**Git-ignore exclusion**: `git check-ignore` (via `git2` crate or shelling out) can reliably determine whether a file is git-ignored. This is straightforward for projects inside a git repo. For non-git directories, fall back to just the regex filter.
+**Git-ignore exclusion**: do not shell out to `git check-ignore` per file. That would
+be slow, harder to test, and incomplete unless every parent path is handled correctly.
+Use the `ignore` crate walker so ignore handling happens as part of traversal. Outside
+git repositories it naturally degrades to plain traversal plus the regex include rule.
 
 ## Required Feature
 
-1. **API change**: `POST /ingest` accepts an optional `file_pattern` field (string regex). If absent, a default pattern is used: `\.(md|rs|cs|txt|py|js|ts|json|yaml|toml)$`.
-2. **Payload change**: `IngestFolderPayload` stores the `file_pattern` field (required for internal construction, optional for the HTTP call).
-3. **Handler change**: When walking files, the handler matches each filename against the regex before inserting.
-4. **Git-ignore exclusion**: Before inserting a matched file, check `git check-ignore` (if inside a git repo). If the file is git-ignored, skip it.
-5. **Fallback**: Outside a git repo, apply only the regex filter.
+1. **API change**: `POST /ingest` accepts an optional `file_pattern` field (string
+   regex). If absent, a default pattern is used:
+   `(?i)\.(md|txt|rst|rs|py|js|ts|tsx|jsx|json|ya?ml|toml|ini|cfg|csv|sql)$`.
+2. **Payload change**: `IngestFolderPayload` stores the resolved `file_pattern`
+   string so worker retries are deterministic.
+3. **Validation**: Compile the regex in the request path and reject invalid patterns
+   early, rather than enqueueing jobs that are guaranteed to fail later.
+4. **Handler change**: Match the regex against a normalized relative path, not just
+   the basename. That gives users control over both filename and subdirectory layout.
+5. **Ignore exclusion**: Let the recursive walker honor git-ignore and related ignore
+   files during traversal.
+6. **Fallback**: Outside a git repo, apply the regex filter with no special casing.
 
 ## Required Sub-tasks
 
 - [ ] Add optional `file_pattern` field to `POST /ingest` request body
-- [ ] Add `file_pattern` field to `IngestFolderPayload` (required)
+- [ ] Add `file_pattern` field to `IngestFolderPayload` (required once queued)
 - [ ] Add default regex constant in configuration or code
-- [ ] Implement regex matching in `IngestFolderHandler`
-- [ ] Implement git-ignore check (research `git2` crate vs. shelling out to `git check-ignore`)
-- [ ] Handle non-git directories gracefully (skip gitignore check)
+- [ ] Validate and normalize the regex before enqueuing the job
+- [ ] Implement relative-path regex matching in `IngestFolderHandler`
+- [ ] Use traversal-layer ignore handling instead of per-file subprocess checks
+- [ ] Handle non-git directories gracefully
 - [ ] Update existing tests; add tests for regex matching and gitignore exclusion
-- [ ] Update `.env.example` / config docs if needed
+- [ ] Add tests proving ignored files are skipped without shelling out to `git`
 
 ## Why Now
 
-Hardcoded extensions are a constant source of friction — every new project type requires a code change. Git-ignore exclusion prevents accidental indexing of secrets and build artifacts, which is a security and correctness concern.
+An explicit include pattern is more predictable than accidental UTF-8 sniffing, and
+ignore-aware traversal prevents accidental indexing of secrets and build artifacts.

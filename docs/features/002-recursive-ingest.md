@@ -12,22 +12,36 @@ When ingesting a folder, only top-level files are currently added. Files in subd
 
 ## Decision
 
-Recursion happens in a **single worker** — no sub-queuing. This avoids concurrency issues (two workers accidentally processing overlapping roots) and is simpler to implement: one `walkdir` traversal, one transaction.
+Recursion happens in a **single worker** — no sub-queuing. This avoids concurrency
+issues (two workers accidentally processing overlapping roots) and is simpler to
+implement.
+
+Use the `ignore` crate's walker instead of hand-rolled recursion or `walkdir` plus
+separate git-ignore checks. It already handles recursive traversal efficiently and
+can honor `.gitignore`, `.ignore`, and parent ignore files when present.
 
 ## Required Feature
 
 1. `IngestFolderHandler` walks the entire directory tree recursively, not just the top level.
-2. Hidden directories (names starting with `.`) are skipped (`.git`, `.hidden`, etc.).
-3. Symlinks are canonicalized and deduplicated by real path.
-4. The entire traversal runs in one worker without enqueuing additional jobs.
+2. Traversal stays inside a single worker without enqueuing additional jobs.
+3. Ignore handling comes from the walker configuration rather than ad hoc
+   filename checks.
+4. Symlinks are **not** followed by default. That avoids cycles, duplicate content,
+   and escaping the requested root unexpectedly.
+
+Do not require one giant database transaction for the whole tree. A long-lived write
+transaction would increase lock contention and make recovery worse on very large
+directories. One traversal is required; one monolithic transaction is not.
 
 ## Required Sub-tasks
 
-- [ ] Update the file-walking logic in `IngestFolderHandler` to recurse into subdirectories
-- [ ] Add skip logic for dot-prefixed directories
-- [ ] Handle symlinks: canonicalize, deduplicate by real path
+- [ ] Replace top-level `read_dir` logic with recursive traversal
+- [ ] Use `ignore::WalkBuilder` (or equivalent) as the traversal primitive
+- [ ] Configure traversal to avoid following symlinks
 - [ ] Add/update tests verifying nested files are ingested
 - [ ] Verify no performance regression on shallow directories
+- [ ] Verify ignored directories are skipped by traversal configuration, not by
+  blanket dot-prefix filtering
 
 ## Why Now
 
