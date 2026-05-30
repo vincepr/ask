@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/target/
+
+# Build and coverage outputs
+/dist/
+/build/
+/coverage/
+*.profraw
+*.profdata
+
+# Environment and local overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+
+# Logs
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# AI CLI local state and machine-specific config
+.claude/
+.codex/
+.opencode/
+opencode.json
+opencode.jsonc
+*.opencode.json
+CLAUDE.local.md
+CODEX.local.md
+
+# Local task scratchpad
+todos/

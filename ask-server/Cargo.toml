@@ -1,0 +1,11 @@
+[package]
+name = "ask-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+ask-core = { path = "../ask-core" }
+rusqlite = { version = "0.37.0", features = ["bundled"] }

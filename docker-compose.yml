@@ -1,0 +1,25 @@
+services:
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    container_name: ask-tei-qwen3-embedding
+    command:
+      - --model-id
+      - onnx-community/Qwen3-Embedding-0.6B-ONNX
+      - --pooling
+      - last-token
+      - --max-batch-tokens
+      - "2048"
+      - --max-concurrent-requests
+      - "64"
+    ports:
+      - "18080:80"
+    volumes:
+      - hf_cache:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  hf_cache:
