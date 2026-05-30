@@ -44,17 +44,24 @@ async fn ingest(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let result = tokio::task::spawn_blocking(move || {
         let root_path = body.root_path.clone();
-        let p = Path::new(&root_path);
+        let canonical_root = match std::fs::canonicalize(Path::new(&root_path)) {
+            Ok(path) => path,
+            Err(_) => {
+                return IngestOutcome::NotFound(root_path);
+            }
+        };
 
-        if !p.exists() {
-            return IngestOutcome::NotFound(root_path);
-        }
-        if !p.is_dir() {
+        if !canonical_root.is_dir() {
             return IngestOutcome::NotADirectory(root_path);
         }
 
+        let canonical_root = canonical_root.to_string_lossy().into_owned();
+        let payload = IngestFolderPayload {
+            root_path: canonical_root,
+        };
+
         let payload_json =
-            serde_json::to_string(&body).expect("IngestFolderPayload is always serializable");
+            serde_json::to_string(&payload).expect("IngestFolderPayload is always serializable");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before epoch")

@@ -1,29 +1,29 @@
 # Ingest Paths Need Sandboxing and Normalization
 
-## Problem
+## Remaining Problem
 
-The HTTP API currently accepts any readable directory path on the host and uses the raw request string
-as the deduplication key.
+The ingest path is now canonicalized, but the server still accepts any readable directory on the
+container or host-visible filesystem.
 
-## Evidence
+## Done
 
-- `crates/ask-server/src/config.rs:63-82` defines `resource_dir`, but the ingest route does not use it.
-- `crates/ask-server/src/http.rs:45-71` only checks `exists()` and `is_dir()` before queueing work.
-- `crates/ask-core/src/repository.rs:241-258` deduplicates jobs by `(job_type, payload)`, which means
-  `"/tmp/x"` and `"/tmp/./x"` are different jobs.
-- `crates/ask-server/src/worker.rs:211-213` persists the path exactly as discovered, not as a canonical
-  identity.
+- The API now canonicalizes the requested ingest directory before queueing work.
+- New document rows now store canonical file paths instead of discovered path aliases.
+- Path aliases such as `"/tmp/x"` and `"/tmp/./x"` now collapse onto the same queue payload.
+
+## Remaining Evidence
+
+- `crates/ask-server/src/config.rs` defines `resource_dir`, but the ingest route still does not use it
+  to constrain requests.
 
 ## Why This Is Risky
 
-- Any client that can hit `POST /ingest` can make the service scan arbitrary host directories.
-- The same directory can be ingested multiple times through path aliases, symlinks, or non-canonical
-  spellings.
-- Duplicate work at the job layer feeds directly into duplicate documents at the storage layer.
+- Any client that can hit `POST /ingest` can still make the service scan arbitrary readable
+  directories.
+- Historical non-canonical `documents.filepath` rows from older runs are not normalized automatically.
 
 ## Simplest Stable Fix
 
-- Canonicalize the requested path before queueing anything.
-- Reject paths outside a configured allowed root, most likely `resource_dir`.
-- Store and compare canonical paths everywhere the code uses file identity.
-- Deduplicate jobs on normalized structured data, not on raw JSON text.
+- Reject paths outside a configured allowed root, most likely `resource_dir`, if you want the API to
+  be a narrow managed ingest surface instead of a generic filesystem scanner.
+- Decide whether existing non-canonical document rows need a cleanup migration or can be tolerated.

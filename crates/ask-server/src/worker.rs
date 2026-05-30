@@ -226,12 +226,25 @@ impl JobHandler for IngestFolderHandler {
                 continue;
             }
 
-            let metadata = match std::fs::metadata(&path) {
-                Ok(metadata) => metadata,
+            let canonical_path = match std::fs::canonicalize(&path) {
+                Ok(path) => path,
                 Err(err) => {
                     warn!(
                         job_id = ctx.entry.id,
                         path = ?path,
+                        error = %err,
+                        "failed to canonicalize file path; continuing"
+                    );
+                    continue;
+                }
+            };
+
+            let metadata = match std::fs::metadata(&canonical_path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    warn!(
+                        job_id = ctx.entry.id,
+                        path = ?canonical_path,
                         error = %err,
                         "failed to read file metadata; continuing"
                     );
@@ -240,8 +253,8 @@ impl JobHandler for IngestFolderHandler {
             };
 
             let now = unix_now();
-            let filepath = path.to_string_lossy().into_owned();
-            let file_type = path
+            let filepath = canonical_path.to_string_lossy().into_owned();
+            let file_type = canonical_path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .unwrap_or("")
@@ -278,7 +291,7 @@ impl JobHandler for IngestFolderHandler {
             let doc_id = repository::insert_document(&conn, &doc)
                 .with_context(|| format!("failed to insert document for {filepath}"))?;
 
-            queue_pending_embeddings_for_document(&conn, &path, doc_id, &model, now)
+            queue_pending_embeddings_for_document(&conn, &canonical_path, doc_id, &model, now)
                 .with_context(|| format!("failed to queue pending embeddings for {filepath}"))?;
         }
 

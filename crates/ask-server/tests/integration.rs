@@ -272,6 +272,45 @@ async fn ingest_duplicate_path_returns_409() {
 }
 
 #[tokio::test]
+async fn ingest_canonicalized_duplicate_path_returns_409() {
+    let db = TempDb::new();
+    let dir = db.create_dir("canonical_docs");
+    let canonical_payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let aliased_payload = format!(r#"{{"root_path":"{}/."}}"#, dir.display());
+
+    let res1 = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&canonical_payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    let res2 = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&aliased_payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res2.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&body_text(res2).await).unwrap();
+    assert_eq!(body["error"]["code"], "conflict");
+}
+
+#[tokio::test]
 async fn ingest_different_dirs_both_succeed() {
     let db = TempDb::new();
     let dir_a = db.create_dir("a");
@@ -702,8 +741,8 @@ async fn ingest_mixed_file_types() {
         .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
         .unwrap();
     assert!(
-        doc_count >= 5,
-        "all expected top-level filesystem entries should be ingested"
+        doc_count >= 4,
+        "symlink aliases should collapse onto the canonical target path"
     );
 
     let content_emb: i64 = conn
@@ -713,7 +752,10 @@ async fn ingest_mixed_file_types() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(content_emb, 3, "valid UTF-8 non-empty files are chunked");
+    assert_eq!(
+        content_emb, 2,
+        "canonicalized duplicates should not queue duplicate content chunks"
+    );
 
     let empty_doc_id: i64 = conn
         .query_row(
