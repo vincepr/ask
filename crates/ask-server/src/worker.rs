@@ -72,7 +72,6 @@ fn process_ingest_folder(pool: &DbPool, job_id: i64, payload_json: &str) -> Resu
             let now = unix_now();
             let conn = pool.get()?;
             repository::update_heartbeat(&conn, job_id, now)?;
-            std::thread::sleep(Duration::from_secs(1));
         }
     }
 

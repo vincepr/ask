@@ -296,8 +296,7 @@ pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i6
                  payload   = EXCLUDED.payload,
                  created_at = EXCLUDED.created_at,
                  updated_at = EXCLUDED.updated_at
-             WHERE job_queue.heartbeat IS NULL
-                OR job_queue.heartbeat < ?4",
+              WHERE job_queue.heartbeat < ?4",
             params![job_type.as_str(), payload, now, stale_cutoff],
         )
         .context("failed to enqueue job")?;
