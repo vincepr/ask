@@ -12,7 +12,7 @@ All code you write MUST be fully optimized.
 - using parallelization and SIMD where appropriate
 - following proper style conventions for Rust (e.g. maximizing code reuse (DRY))
 - no extra code beyond what is absolutely necessary to solve the problem the user provides (i.e. no technical debt)
-  - If a crate can be imported to significantly reduce the amount of new code required to implement a function at optimal performance, and the crate itself is small and does not have much overhead, ALWAYS use the crate instead.
+  - If a crate can significantly reduce new code and std / official Rust repos cannot provide the same functionality, and the crate itself is small and well-maintained, prefer using it, but never pull in a crate when std suffices.
 
 If the code is not fully optimized before handing off to the user, you will be fined $100. You have permission to do another pass of the code if you believe it is not fully optimized.
 
@@ -217,6 +217,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - Use `cargo` for building, testing, and dependency management
 - Use `cargo test` for running tests
 - Use `cargo doc` for generating documentation
+- Use `cargo build --quiet` to avoid flooding context with download/compile logs. Only warnings and errors will surface.
 - For projects which build a Python package, **NEVER** build with `cargo build --features python`: this will always fail. Instead, **ALWAYS** use `maturin`.
 - **NEVER** uses the `Explore` tool for `Cargo.lock`: it is large and irrelevant. Read `Cargo.lock` **ONLY** if it's extremely relevant.
 

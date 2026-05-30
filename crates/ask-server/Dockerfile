@@ -8,7 +8,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ask-core ./crates/ask-core
 COPY crates/ask-server ./crates/ask-server
 
-RUN cargo build --locked --release --target x86_64-unknown-linux-musl -p ask-server --bin ask-server
+RUN cargo build --locked --release --quiet --target x86_64-unknown-linux-musl -p ask-server --bin ask-server
 
 FROM alpine:3.22
 
