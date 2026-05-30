@@ -20,7 +20,7 @@ pub fn insert_document(conn: &Connection, doc: &Document) -> Result<i64> {
         params![
             doc.filepath,
             doc.file_type,
-            doc.doc_category.as_str(),
+            doc.doc_category,
             doc.file_modified_at,
             doc.file_size,
             doc.updated_at,
@@ -42,8 +42,7 @@ pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option
                 id: row.get(0)?,
                 filepath: row.get(1)?,
                 file_type: row.get(2)?,
-                doc_category: DocCategory::try_from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(DocCategory::Resource),
+                doc_category: row.get(3)?,
                 file_modified_at: row.get(4)?,
                 file_size: row.get(5)?,
                 updated_at: row.get(6)?,
@@ -68,11 +67,13 @@ pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
 
-    let placeholders: Vec<String> = doc_ids.iter().map(|_| "?".to_string()).collect();
+    let placeholders: Vec<String> = (0..doc_ids.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect();
     let sql = format!(
-        "UPDATE document_embeddings SET state = 'stale' \
+        "UPDATE document_embeddings SET state = ?1 \
          WHERE document_id IN (SELECT id FROM documents WHERE id IN ({})) \
-         AND state = 'embedded'",
+         AND state = ?2",
         placeholders.join(", ")
     );
 
@@ -80,10 +81,12 @@ pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
         .prepare(&sql)
         .context("failed to prepare mark_documents_stale")?;
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = doc_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::types::ToSql)
-        .collect();
+    let stale = EmbedState::Stale;
+    let embedded = EmbedState::Embedded;
+    let mut param_refs: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(doc_ids.len() + 2);
+    param_refs.push(&stale);
+    param_refs.push(&embedded);
+    param_refs.extend(doc_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql));
 
     stmt.execute(param_refs.as_slice())
         .context("failed to mark embeddings as stale")?;
@@ -103,8 +106,7 @@ pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
                 id: row.get(0)?,
                 filepath: row.get(1)?,
                 file_type: row.get(2)?,
-                doc_category: DocCategory::try_from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(DocCategory::Resource),
+                doc_category: row.get(3)?,
                 file_modified_at: row.get(4)?,
                 file_size: row.get(5)?,
                 updated_at: row.get(6)?,
@@ -205,7 +207,7 @@ pub fn insert_pending_embeddings(
         .prepare(
             "INSERT INTO document_embeddings
                 (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .context("failed to prepare insert_pending_embeddings")?;
 
@@ -213,9 +215,10 @@ pub fn insert_pending_embeddings(
         stmt.execute(params![
             doc_id,
             model_id,
-            chunk_type.as_str(),
+            chunk_type,
             start,
             end,
+            EmbedState::Pending,
             now
         ])
         .with_context(|| {
@@ -246,7 +249,7 @@ pub fn enqueue_job(conn: &Connection, job_type: &JobType, payload: &str, now: i6
                  claimed_at = NULL,
                  created_at = EXCLUDED.created_at
               WHERE job_queue.claimed_at < ?4",
-            params![job_type.as_str(), payload, now, stale_cutoff],
+            params![job_type, payload, now, stale_cutoff],
         )
         .context("failed to enqueue job")?;
 
@@ -281,22 +284,15 @@ pub fn claim_job(conn: &mut Connection, now: i64) -> Result<Option<JobQueueEntry
                  ORDER BY id ASC
                  LIMIT 1
              )
-             UPDATE job_queue
-             SET claimed_at = ?2
-             WHERE id IN (SELECT id FROM picked)
-             RETURNING id, job_type, payload, claimed_at, created_at",
+            UPDATE job_queue
+            SET claimed_at = ?2
+            WHERE id IN (SELECT id FROM picked)
+            RETURNING id, job_type, payload, claimed_at, created_at",
             params![stale_cutoff, now],
             |row| {
-                let job_type_str: String = row.get(1)?;
-                let job_type = JobType::try_from_str(&job_type_str).ok_or_else(|| {
-                    rusqlite::Error::InvalidParameterName(format!(
-                        "unknown job_type: {job_type_str}"
-                    ))
-                })?;
-
                 Ok(JobQueueEntry {
                     id: row.get(0)?,
-                    job_type,
+                    job_type: row.get(1)?,
                     payload: row.get(2)?,
                     claimed_at: row.get(3)?,
                     created_at: row.get(4)?,

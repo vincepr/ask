@@ -1,5 +1,25 @@
 use std::fmt;
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+
+#[derive(Debug)]
+struct TextEnumParseError {
+    enum_name: &'static str,
+    value: String,
+}
+
+impl fmt::Display for TextEnumParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid {} value stored in database: {}",
+            self.enum_name, self.value
+        )
+    }
+}
+
+impl std::error::Error for TextEnumParseError {}
+
 /// Whether a document lives in the knowledge directory or an arbitrary resource path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocCategory {
@@ -30,6 +50,24 @@ impl DocCategory {
 impl fmt::Display for DocCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl FromSql for DocCategory {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = String::column_result(value)?;
+        Self::try_from_str(&value).ok_or_else(|| {
+            FromSqlError::Other(Box::new(TextEnumParseError {
+                enum_name: "DocCategory",
+                value,
+            }))
+        })
+    }
+}
+
+impl ToSql for DocCategory {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
     }
 }
 
@@ -70,6 +108,24 @@ impl fmt::Display for EmbedState {
     }
 }
 
+impl FromSql for EmbedState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = String::column_result(value)?;
+        Self::try_from_str(&value).ok_or_else(|| {
+            FromSqlError::Other(Box::new(TextEnumParseError {
+                enum_name: "EmbedState",
+                value,
+            }))
+        })
+    }
+}
+
+impl ToSql for EmbedState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
 /// Whether an embedding row represents a content chunk or a filename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkType {
@@ -103,6 +159,24 @@ impl fmt::Display for ChunkType {
     }
 }
 
+impl FromSql for ChunkType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = String::column_result(value)?;
+        Self::try_from_str(&value).ok_or_else(|| {
+            FromSqlError::Other(Box::new(TextEnumParseError {
+                enum_name: "ChunkType",
+                value,
+            }))
+        })
+    }
+}
+
+impl ToSql for ChunkType {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
 /// Discriminant for every async job variant stored in the job_queue table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobType {
@@ -129,5 +203,23 @@ impl JobType {
 impl fmt::Display for JobType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl FromSql for JobType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = String::column_result(value)?;
+        Self::try_from_str(&value).ok_or_else(|| {
+            FromSqlError::Other(Box::new(TextEnumParseError {
+                enum_name: "JobType",
+                value,
+            }))
+        })
+    }
+}
+
+impl ToSql for JobType {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
     }
 }

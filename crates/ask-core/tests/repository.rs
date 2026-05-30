@@ -1,5 +1,5 @@
 use ask_core::models::JobQueueEntry;
-use ask_core::repository::{claim_job, complete_job, enqueue_job};
+use ask_core::repository::{claim_job, complete_job, enqueue_job, find_document_by_path};
 use ask_core::types::JobType;
 use rusqlite::{Connection, params};
 
@@ -38,8 +38,7 @@ fn get_job(conn: &Connection, id: i64) -> JobQueueEntry {
         |row| {
             Ok(JobQueueEntry {
                 id: row.get(0)?,
-                job_type: JobType::try_from_str(&row.get::<_, String>(1)?)
-                    .expect("job_type must decode"),
+                job_type: row.get(1)?,
                 payload: row.get(2)?,
                 claimed_at: row.get(3)?,
                 created_at: row.get(4)?,
@@ -197,7 +196,7 @@ fn claim_rejects_unknown_job_type() {
     let err_text = format!("{err:#}");
 
     assert!(
-        err_text.contains("unknown job_type"),
+        err_text.contains("invalid JobType value"),
         "unexpected error: {err:#}"
     );
 }
@@ -265,4 +264,36 @@ fn complete_removes_job() {
     let entry = claim_job(&mut conn, 200).unwrap().unwrap();
     complete_job(&conn, entry.id).unwrap();
     assert_eq!(count(&conn), 0);
+}
+
+#[test]
+fn find_document_by_path_rejects_unknown_doc_category() {
+    let conn = Connection::open_in_memory().expect("in-memory database must open");
+    conn.execute_batch(
+        "CREATE TABLE documents (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath         TEXT NOT NULL,
+            file_type        TEXT NOT NULL,
+            doc_category     TEXT NOT NULL,
+            file_modified_at INTEGER NOT NULL,
+            file_size        INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );",
+    )
+    .expect("documents schema must be created");
+    conn.execute(
+        "INSERT INTO documents
+            (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params!["/tmp/a.txt", "txt", "not_a_real_category", 100, 10, 100],
+    )
+    .expect("document insert must succeed");
+
+    let err = find_document_by_path(&conn, "/tmp/a.txt")
+        .expect_err("invalid doc_category must fail to decode");
+
+    assert!(
+        err.to_string().contains("invalid DocCategory value"),
+        "unexpected error: {err:#}"
+    );
 }
