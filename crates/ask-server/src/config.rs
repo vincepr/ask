@@ -10,7 +10,7 @@ pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
 pub const DEFAULT_DATA_DIR: &str = ".data";
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_BIND_PORT: u16 = 3000;
-pub const DEFAULT_TEI_BASE_URL: &str = "http://tei:80";
+pub const DEFAULT_TEI_BASE_URL: &str = "http://localhost:18080";
 
 /// Embedding backend configuration loaded from the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
