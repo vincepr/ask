@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_core::repository;
@@ -9,6 +10,28 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
+
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn current_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn register_model(pool: &http::AppState, now: i64, name: &str) -> i64 {
+    let conn = pool.get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: name.to_string(),
+        dimensions: 768,
+        chunk_size: 512,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    repository::insert_model(&conn, &model).unwrap()
+}
 
 struct TempDb {
     dir: PathBuf,
@@ -62,7 +85,8 @@ fn unique_temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("ask-integration-{unique}"))
+    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ask-integration-{unique}-{counter}"))
 }
 
 fn json_body(text: &str) -> Body {
@@ -496,6 +520,262 @@ async fn ingest_folder_nonexistent_path_completes_job() {
 }
 
 // ---------------------------------------------------------------------------
+// dispatch_job - worker regression coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatch_job_missing_model_returns_error_but_completes_job() {
+    let db = TempDb::new();
+    let now = current_time();
+    let dir = db.create_dir("missing_model");
+    std::fs::write(dir.join("a.txt"), "content").unwrap();
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    let pool = db.pool();
+    let err = dispatch_job(&pool, &entry, 999).unwrap_err();
+    assert!(
+        err.to_string().contains("failed to insert embedding"),
+        "unexpected error: {err:#}"
+    );
+
+    let conn = db.pool().get().unwrap();
+    let job_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(job_count, 0, "failed jobs are still completed today");
+}
+
+#[tokio::test]
+async fn multiple_ingest_jobs_sequentially_all_complete() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "multi");
+
+    let dir1 = db.create_dir("set_a");
+    let dir2 = db.create_dir("set_b");
+    std::fs::write(dir1.join("a.txt"), "a").unwrap();
+    std::fs::write(dir1.join("b.txt"), "b").unwrap();
+    std::fs::write(dir2.join("c.txt"), "c").unwrap();
+
+    let payload1 = format!(r#"{{"root_path":"{}"}}"#, dir1.display());
+    let payload2 = format!(r#"{{"root_path":"{}"}}"#, dir2.display());
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload1, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry1 = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry1, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload2, now + 10).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry2 = repository::claim_job(&mut conn, now + 11).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry2, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let doc_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(doc_count, 3, "all files from both dirs ingested");
+    let job_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(job_count, 0, "both jobs completed");
+}
+
+#[tokio::test]
+async fn ingest_files_with_special_characters_in_names() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "special");
+
+    let dir = db.create_dir("special_chars");
+    let names = [
+        "file with spaces.txt",
+        "file(with)parens.txt",
+        "resume-dash.txt",
+        "a-b+c*d?.txt",
+    ];
+
+    for name in &names {
+        std::fs::write(dir.join(name), b"content").unwrap();
+    }
+
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let doc_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(doc_count, names.len() as i64);
+
+    for name in &names {
+        let abs_path = dir.join(name).to_string_lossy().to_string();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
+                [&abs_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "document for '{name}' should exist");
+    }
+}
+
+#[tokio::test]
+async fn ingest_mixed_file_types() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "mixed");
+
+    let dir = db.create_dir("mixed");
+    std::fs::write(dir.join("readme.txt"), "hello").unwrap();
+    std::fs::write(dir.join("empty.md"), "").unwrap();
+    std::fs::write(dir.join("data.bin"), [0x00, 0xFF, 0xFE]).unwrap();
+    std::fs::write(dir.join("Makefile"), "all:").unwrap();
+
+    let target = dir.join("readme.txt");
+    let link = dir.join("link_to_readme.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let doc_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        doc_count >= 5,
+        "all expected top-level filesystem entries should be ingested"
+    );
+
+    let content_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE chunk_type = 'content'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(content_emb, 3, "valid UTF-8 non-empty files are chunked");
+
+    let empty_doc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM documents WHERE filepath LIKE '%empty.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let empty_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = ?1",
+            [empty_doc_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(empty_emb, 1, "empty file gets filename embedding only");
+}
+
+#[tokio::test]
+async fn ingest_large_file_produces_many_chunks() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    let conn = db.pool().get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "small-chunks".to_string(),
+        dimensions: 768,
+        chunk_size: 10,
+        chunk_overlap: 2,
+        created_at: now,
+    };
+    let model_id = repository::insert_model(&conn, &model).unwrap();
+    drop(conn);
+
+    let dir = db.create_dir("large");
+    let content: String = (0..100)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    assert_eq!(content.len(), 100);
+    std::fs::write(dir.join("big.txt"), &content).unwrap();
+
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let content_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE chunk_type = 'content'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(content_emb, 13);
+}
+
+#[tokio::test]
+async fn ingest_non_utf8_file_only_gets_filename_embedding() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "nonutf8");
+
+    let dir = db.create_dir("nonutf8");
+    std::fs::write(dir.join("data.bin"), [0xFF, 0xFE, 0x80, 0x00]).unwrap();
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let filename_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE chunk_type = 'filename'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(filename_emb, 1);
+
+    let content_emb: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE chunk_type = 'content'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(content_emb, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Claim + complete via the repository layer (full SQLite round-trip)
 // ---------------------------------------------------------------------------
 
@@ -548,8 +828,12 @@ async fn mark_stale_batch_updates_embeddings() {
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0, name: "test".to_string(), dimensions: 768,
-            chunk_size: 512, chunk_overlap: 0, created_at: now,
+            id: 0,
+            name: "test".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
         },
     )
     .unwrap();
@@ -638,8 +922,12 @@ async fn mark_stale_nonexistent_ids_is_noop() {
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0, name: "test".to_string(), dimensions: 768,
-            chunk_size: 512, chunk_overlap: 0, created_at: now,
+            id: 0,
+            name: "test".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
         },
     )
     .unwrap();
@@ -699,16 +987,24 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0, name: "m1".to_string(), dimensions: 768,
-            chunk_size: 512, chunk_overlap: 0, created_at: now,
+            id: 0,
+            name: "m1".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
         },
     )
     .unwrap();
     repository::insert_model(
         &conn,
         &ask_core::models::EmbeddingModel {
-            id: 0, name: "m2".to_string(), dimensions: 384,
-            chunk_size: 256, chunk_overlap: 0, created_at: now,
+            id: 0,
+            name: "m2".to_string(),
+            dimensions: 384,
+            chunk_size: 256,
+            chunk_overlap: 0,
+            created_at: now,
         },
     )
     .unwrap();
