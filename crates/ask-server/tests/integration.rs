@@ -539,8 +539,9 @@ async fn dispatch_job_missing_model_returns_error_but_completes_job() {
 
     let pool = db.pool();
     let err = dispatch_job(&pool, &entry, 999).unwrap_err();
+    let err_text = format!("{err:#}");
     assert!(
-        err.to_string().contains("failed to insert embedding"),
+        err_text.contains("embedding model 999 not found"),
         "unexpected error: {err:#}"
     );
 

@@ -3,10 +3,16 @@ use ask_core::models::EmbeddingModel;
 use ask_core::repository;
 use ask_core::{WORKSPACE_NAME, workspace_members};
 use ask_server::{config, create_pool, http, migrations, worker};
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .try_init()
+        .ok();
     let member_count = workspace_members().len();
     let config = config::load()?;
     let bind_address = config.bind_address();
@@ -17,7 +23,7 @@ async fn main() -> Result<()> {
     {
         let mut conn = pool.get()?;
         let applied_count = migrations::apply_pending_migrations(&mut conn)?;
-        println!("Applied {applied_count} pending migrations.");
+        info!(applied_count, "applied pending migrations");
     }
 
     let now = std::time::SystemTime::now()
@@ -39,10 +45,7 @@ async fn main() -> Result<()> {
                 };
                 let model_id = repository::insert_model(&conn, &m)?;
                 let seeded = repository::seed_pending_for_all_docs(&conn, model_id, now)?;
-                println!(
-                    "Registered new model '{}' with {seeded} pending documents.",
-                    m.name
-                );
+                info!(model = %m.name, seeded, "registered new embedding model");
                 EmbeddingModel { id: model_id, ..m }
             }
         }
@@ -50,19 +53,20 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
 
-    println!("Starting {WORKSPACE_NAME} server workspace with {member_count} member crates.");
-    println!("Using SQLite database at {sqlite_path}.");
-    println!("Resource directory: {}.", config.resource_dir);
-    println!(
-        "Embedding model '{}' ({} dimensions, chunk size {}, overlap {}).",
-        model.name, model.dimensions, model.chunk_size, model.chunk_overlap
+    info!(
+        workspace = WORKSPACE_NAME,
+        member_count,
+        sqlite_path,
+        resource_dir = %config.resource_dir,
+        model = %model.name,
+        model_dimensions = model.dimensions,
+        model_chunk_size = model.chunk_size,
+        model_chunk_overlap = model.chunk_overlap,
+        embedding_mode = config.embedding_provider.mode_name(),
+        embedding_base_url = config.embedding_provider.base_url(),
+        bind_address,
+        "starting ask-server"
     );
-    println!(
-        "Embedding provider mode '{}' at {}.",
-        config.embedding_provider.mode_name(),
-        config.embedding_provider.base_url()
-    );
-    println!("Listening on http://{bind_address}.");
 
     worker::spawn(pool.clone(), model.id);
     axum::serve(listener, http::router(pool)).await?;
