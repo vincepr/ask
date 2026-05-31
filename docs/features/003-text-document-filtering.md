@@ -1,61 +1,83 @@
-# 003: Text Document Filtering
+# 003: Path-Based Ingest Filtering
 
 ## Context
 
-The ingest process needs a configurable definition of "text document". The current
-behavior is too implicit: there is no user-supplied include pattern, and unreadable or
-binary files are only avoided indirectly when UTF-8 decoding fails. Additionally,
-ignored files (secrets, build artifacts, vendored dependencies) should not be indexed.
+The current ingest path has no explicit inclusion policy. Every regular file is
+treated as a candidate, and the worker only discovers some bad inputs after
+trying to read them as UTF-8.
+
+That is not really "text document detection". It is just an implicit fallback.
 
 ## Problem
 
-1. Users cannot customize what gets indexed.
-2. Relying on "can this file be read as UTF-8?" is not a real inclusion policy.
-3. Git-ignored files (secrets, `target/`, `node_modules/`, build artifacts) are not excluded.
-3. No mechanism to pass a filter pattern through the API into the job payload.
+1. Users cannot control which files are eligible for ingest.
+2. A regex on its own does not prove a file is text, but it can express a clear
+   include policy.
+3. The current API uses `IngestFolderPayload` directly as the HTTP request body,
+   which makes queue-payload changes awkward.
+4. Ignore-file handling should happen in traversal, not by shelling out.
 
-## Research: Identifying Text Documents
+## Decision
 
-**Recommendation: regex, but only for inclusion rules**. Operating systems do not
-provide a standard cross-platform "is this a text file?" heuristic that is both
-reliable and project-configurable. The `file` command / `libmagic` can identify MIME
-types, but that adds a dependency and still does not express project-specific policy
-such as "index only source files and Markdown". A regex pattern is simpler and keeps
-the rule explicit.
+Treat this feature as **path-based inclusion**, not as a complete binary/text
+classifier.
 
-**Git-ignore exclusion**: do not shell out to `git check-ignore` per file. That would
-be slow, harder to test, and incomplete unless every parent path is handled correctly.
-Use the `ignore` crate walker so ignore handling happens as part of traversal. Outside
-git repositories it naturally degrades to plain traversal plus the regex include rule.
+Add a separate request type for the HTTP API:
+
+```rust
+pub struct IngestRequest {
+    pub root_path: String,
+    pub file_pattern: Option<String>,
+}
+```
+
+The queue payload stores the resolved pattern so retries are deterministic:
+
+```rust
+pub struct IngestFolderPayload {
+    pub root_path: String,
+    pub file_pattern: String,
+}
+```
+
+If `file_pattern` is absent, resolve it to a default include regex before the
+job is queued.
+
+Match the regex against the normalized relative path from the ingest root using
+forward slashes. This lets users filter by filename or by subdirectory layout.
+
+## Non-Goals
+
+This feature does **not** fully solve:
+
+- binary-file sniffing
+- large-file limits
+- partial file reads
+
+Those should be handled separately as file-size and content-safety guards.
 
 ## Required Feature
 
-1. **API change**: `POST /ingest` accepts an optional `file_pattern` field (string
-   regex). If absent, a default pattern is used:
-   `(?i)\.(md|txt|rst|rs|py|js|ts|tsx|jsx|json|ya?ml|toml|ini|cfg|csv|sql)$`.
-2. **Payload change**: `IngestFolderPayload` stores the resolved `file_pattern`
-   string so worker retries are deterministic.
-3. **Validation**: Compile the regex in the request path and reject invalid patterns
-   early, rather than enqueueing jobs that are guaranteed to fail later.
-4. **Handler change**: Match the regex against a normalized relative path, not just
-   the basename. That gives users control over both filename and subdirectory layout.
-5. **Ignore exclusion**: Let the recursive walker honor git-ignore and related ignore
-   files during traversal.
-6. **Fallback**: Outside a git repo, apply the regex filter with no special casing.
+1. `POST /ingest` accepts an optional `file_pattern`.
+2. The request path validates the regex before queueing the job.
+3. `IngestFolderPayload` stores the resolved regex string.
+4. The worker applies the regex before opening file content.
+5. Recursive traversal uses ignore-file support from feature 002 instead of
+   subprocess checks.
 
 ## Required Sub-tasks
 
-- [ ] Add optional `file_pattern` field to `POST /ingest` request body
-- [ ] Add `file_pattern` field to `IngestFolderPayload` (required once queued)
-- [ ] Add default regex constant in configuration or code
-- [ ] Validate and normalize the regex before enqueuing the job
-- [ ] Implement relative-path regex matching in `IngestFolderHandler`
-- [ ] Use traversal-layer ignore handling instead of per-file subprocess checks
-- [ ] Handle non-git directories gracefully
-- [ ] Update existing tests; add tests for regex matching and gitignore exclusion
-- [ ] Add tests proving ignored files are skipped without shelling out to `git`
+- [ ] Add `IngestRequest` for HTTP input
+- [ ] Extend `IngestFolderPayload` with `file_pattern`
+- [ ] Define one default include regex constant
+- [ ] Compile and validate user-supplied regexes in the request path
+- [ ] Normalize candidate paths relative to the ingest root before matching
+- [ ] Add tests for default matching, custom matching, and invalid regex input
+- [ ] Add tests proving ignore files and regex matching compose correctly
 
-## Why Now
+## Acceptance Criteria
 
-An explicit include pattern is more predictable than accidental UTF-8 sniffing, and
-ignore-aware traversal prevents accidental indexing of secrets and build artifacts.
+1. Ingest eligibility is driven by an explicit path filter.
+2. Job retries use the same resolved filter as the original request.
+3. Invalid regexes fail fast in the API instead of becoming poison jobs.
+4. The feature does not claim to solve binary detection by regex alone.

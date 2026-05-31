@@ -1,4 +1,4 @@
-# Ingest Needs File-Type and Size Guards
+# 006: File Filtering and Size Guards
 
 ## Problem
 

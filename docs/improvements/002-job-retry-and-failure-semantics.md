@@ -1,4 +1,4 @@
-# Failed Jobs Stay Poisoned for Too Long
+# 002: Job Retry and Failure Semantics
 
 ## Problem
 
