@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use ask_core::models::IngestFolderPayload;
-use ask_core::models::{DocumentSearchResult, EmbeddingModel};
+use ask_core::models::{DocumentFilepathSearchResult, DocumentSearchResult, EmbeddingModel};
 use ask_core::{repository, types::JobType};
 use axum::{
     Json, Router,
@@ -121,6 +121,14 @@ struct SearchRequest {
     query: String,
     limit: Option<usize>,
     include_location: Option<bool>,
+    mode: Option<SearchMode>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum SearchMode {
+    Semantic,
+    FilepathFuzzy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -174,6 +182,7 @@ async fn search(
     }
 
     let include_location = body.include_location.unwrap_or(false);
+    let mode = body.mode.unwrap_or(SearchMode::Semantic);
     let pool = state.pool().clone();
     let embedding_client = state.embedding_client();
 
@@ -184,6 +193,7 @@ async fn search(
             query,
             limit,
             include_location,
+            mode,
         )
     })
     .await
@@ -380,16 +390,29 @@ fn search_documents(
     query: String,
     limit: usize,
     include_location: bool,
+    mode: SearchMode,
 ) -> Result<Vec<SearchDocumentResult>, SearchFailure> {
     let conn = pool
         .get()
         .map_err(|err| SearchFailure::Internal(format!("database error: {err}")))?;
+
+    if matches!(mode, SearchMode::FilepathFuzzy) {
+        let hits = repository::search_documents_by_filepath_fuzzy(&conn, &query, limit).map_err(
+            |err| SearchFailure::Internal(format!("failed to run filepath search: {err:#}")),
+        )?;
+        return Ok(collapse_filepath_results(hits));
+    }
+
     let model = load_active_model(&conn)
         .map_err(|err| SearchFailure::Internal(format!("failed to load active model: {err:#}")))?;
 
     let vectors = embedding_client
         .embed(&model, std::slice::from_ref(&query))
-        .map_err(|err| SearchFailure::BadGateway(format!("failed to embed query: {err:#}")))?;
+        .map_err(|err| {
+            SearchFailure::BadGateway(format!(
+                "failed to embed query: {err:#}; retry with {{\"mode\":\"filepath_fuzzy\"}}"
+            ))
+        })?;
     let query_embedding = vectors.first().ok_or_else(|| {
         SearchFailure::BadGateway("embedding provider returned no vectors".into())
     })?;
@@ -449,6 +472,17 @@ fn collapse_to_documents(
     }
 
     results
+}
+
+fn collapse_filepath_results(hits: Vec<DocumentFilepathSearchResult>) -> Vec<SearchDocumentResult> {
+    hits.into_iter()
+        .map(|hit| SearchDocumentResult {
+            filepath: hit.filepath,
+            match_score: hit.match_score.clamp(0.0, 1.0),
+            byte_start: None,
+            byte_end: None,
+        })
+        .collect()
 }
 
 fn distance_to_score(distance: f64) -> f64 {
