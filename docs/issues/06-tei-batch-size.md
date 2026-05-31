@@ -1,6 +1,85 @@
-# TEI Batch Size, Concurrency, and Model Registry
+# TEI Provider Integration: Request Batch Limit and Model Name Mismatch
 
-## Batch / Concurrency Configuration
+## Logs
+
+```
+ask-tei-qwen3-embedding  | 2026-05-31T13:35:35.770646Z ERROR openai_embed:
+  text_embeddings_router::http::server:
+  router/src/http/server.rs:1233:
+  batch size 53 > maximum allowed batch size 32
+ask-server               | 2026-05-31T13:35:35.771984Z ERROR job failed;
+  leaving claim in place until stale
+  job_id=632 job_type=embed_document
+  error=failed to embed document 35 with model 1:
+  embedding provider returned 422 Unprocessable Entity:
+  {"message":"batch size 53 > maximum allowed batch size 32",
+   "code":422,"type":"Validation"}
+ask-server               | 2026-05-31T13:35:35.777460Z ERROR worker tick failed
+  error=job 632 (embed_document):
+  failed to embed document 35 with model 1:
+  embedding provider returned 422 Unprocessable Entity:
+  {"message":"batch size 53 > maximum allowed batch size 32",
+   "code":422,"type":"Validation"}
+
+ask-server               | 2026-05-31T13:35:40.851327Z INFO claimed job
+  job_id=863 job_type=embed_document
+ask-server               | 2026-05-31T13:35:40.851372Z INFO processing
+  embed_document job job_id=863 document_id=41 model_id=1
+ask-tei-qwen3-embedding  | 2026-05-31T13:35:40.855250Z WARN openai_embed:
+  text_embeddings_router::http::server:
+  router/src/http/server.rs:1161:
+  The provided `model=default` has not been found, the `model` parameter
+  should be provided either empty or with
+  `model=onnx-community/Qwen3-Embedding-0.6B-ONNX` instead.
+ask-tei-qwen3-embedding  | 2026-05-31T13:35:40.855293Z ERROR openai_embed:
+  text_embeddings_router::http::server:
+  router/src/http/server.rs:1233:
+  batch size 106 > maximum allowed batch size 32
+ask-server               | 2026-05-31T13:35:40.856260Z ERROR job failed;
+  leaving claim in place until stale
+  job_id=863 job_type=embed_document
+  error=failed to embed document 41 with model 1:
+  embedding provider returned 422 Unprocessable Entity:
+  {"message":"batch size 106 > maximum allowed batch size 32",
+   "code":422,"type":"Validation"}
+ask-server               | 2026-05-31T13:35:40.856491Z ERROR worker tick failed
+  error=job 863 (embed_document):
+  failed to embed document 41 with model 1:
+  embedding provider returned 422 Unprocessable Entity:
+  {"message":"batch size 106 > maximum allowed batch size 32",
+   "code":422,"type":"Validation"}
+```
+
+## What Happened
+
+Two separate `embed_document` jobs failed for the same underlying reason:
+
+- document 35 produced 53 embedding inputs
+- document 41 produced 106 embedding inputs
+
+The worker prepares every chunk for a document, collects every chunk string into
+one `Vec<String>`, and sends that vector in one call to
+`embedding_client.embed()` at `crates/ask-server/src/worker.rs:236-242`.
+
+The HTTP client then sends the `embedding_models.name` field as the request
+model identifier and forwards the entire input slice in one JSON request body at
+`crates/ask-server/src/embeddings.rs:69-72`.
+
+This yields two distinct provider-side problems in the same request path:
+
+- TEI enforces a maximum of 32 inputs per embeddings request, so requests with
+  53 or 106 inputs fail with `422 Unprocessable Entity`.
+- The application sends `model=default`, but TEI expects either an empty model
+  field or the concrete model id
+  `onnx-community/Qwen3-Embedding-0.6B-ONNX`.
+
+The batch-size failure is fatal for the job. The model-name mismatch is only a
+warning today, but it proves the app is not sending a provider-valid model
+identifier.
+
+## Context
+
+### TEI Request Limits
 
 The TEI container is configured with `--max-concurrent-requests 64`, but the
 ONNX backend for Qwen3-Embedding-0.6B caps actual concurrency at 8:
@@ -10,15 +89,17 @@ Backend does not support a batch size > 8
 forcing max_batch_requests=8
 ```
 
+That concurrency cap is separate from the failing limit in the logs above. The
+observed failures come from TEI's per-request input-count limit of 32, not from
+the number of requests in flight.
+
 Additionally, `--max-batch-tokens 2048` is far below the model's 32768-token
 maximum input length. TEI will silently truncate longer sequences.
 
-## Embedding Model Registry
+### Embedding Model Registry
 
-The `embedding_models` table contains a row with `name='default'` — not the
-actual model identifier. Relevant details:
+The `embedding_models` table stores `name` as a unique application identifier:
 
-**Schema** (from `0002_create_domain_tables.sql`):
 ```sql
 CREATE TABLE embedding_models (
     name TEXT NOT NULL UNIQUE,
@@ -29,61 +110,45 @@ CREATE TABLE embedding_models (
 );
 ```
 
-The UNIQUE constraint is on `name` alone. At startup (`ask-server.rs:35-57`):
-- If a row with `name` matching `ASK_SERVER_EMBEDDING_MODEL` exists, it is used
-  as-is
-- If not, a new row is inserted with the current config values
+At startup in `crates/ask-server/src/bin/ask-server.rs:37-57`:
+
+- if a row exists whose `name` matches `ASK_SERVER_EMBEDDING_MODEL`, it is reused
+- otherwise a new row is inserted from current config
 
 This means:
-- The model name `"default"` is hardcoded (`config.rs:19`) — not the actual
-  TEI model name (`Qwen3-Embedding-0.6B`)
-- Changing `dimensions`, `chunk_size`, or `chunk_overlap` in env vars after the
-  first startup has no effect — the existing row is always reused
-- The `model` field in the embedding HTTP request
-  (`embeddings.rs:69-72`) sends this meaningless name to TEI
 
-No startup validation exists: the server never queries TEI to confirm the
-actual model name, output dimensions, or supported features.
+- the default configured model name is `"default"`, not the real TEI model id
+- changing dimensions or chunking env vars after first startup does not update
+  the existing row
+- the HTTP client forwards that same application-level name to TEI as if it were
+  a provider model identifier
 
-**Live evidence**: At runtime, TEI logs this warning on every request:
+No startup validation checks TEI for the actual model id, dimensions, or
+provider limits.
 
-```
-WARN openai_embed: The provided `model=default` has not been found,
-the `model` parameter should be provided either empty or
-with `model=onnx-community/Qwen3-Embedding-0.6B-ONNX` instead.
-```
+## Why This Matters
 
-TEI currently handles it gracefully (warns and proceeds), but this is
-implementation-specific. It would break under stricter providers or if TEI
-enforces model name validation in a future version.
+- Any document that produces more than 32 embedding chunks is a permanent
+  failure under the current code path.
+- Retrying those jobs without code changes will fail identically after the stale
+  claim timeout.
+- The system currently conflates an internal model registry key with the
+  provider's real model identifier.
+- The request path has no source of truth for provider limits such as maximum
+  request batch size.
 
 ## Questions
 
-**Batch / Concurrency:**
-- Should `--max-concurrent-requests` track the actual backend limit, or is it
-  harmless to over-provision and let the provider queue internally?
-- Is the 2048-token truncation acceptable for the expected document types
-  (code, configs), or should `--max-batch-tokens` be raised to match the model's
-  full window?
-- Should `ASK_SERVER_EMBEDDING_CHUNK_SIZE` be tuned relative to
-  `--max-batch-tokens`, or are these independent concerns?
-
-**Model Registry:**
-- What is the purpose of the `embedding_models` table? Does it describe the
-  provider's capabilities, or is it purely for the application's chunking
-  parameters?
-- Should the model name reflect the actual provider model (e.g., discovered
-  from TEI `/info`), or is an opaque identifier fine as long as chunking
-  parameters are correct?
-- When parameters change, should a new row be created (with a unique constraint
-  on `(name, dimensions, chunk_size, chunk_overlap)`), or should the row be
-  updated in-place? Each choice has different implications for existing
-  embeddings and backfill semantics.
-- Do we need the table at all for single-model deployments? Could chunking
-  parameters live in config and be passed directly to the worker, removing the
-  indirection and the stale-row problem?
-- If multiple models are a future concern, what minimal schema supports that
-  without over-engineering today?
+- Should batch splitting happen in the worker, in `HttpEmbeddingClient`, or in a
+  provider-aware abstraction that can apply limits consistently?
+- Where should the max-request batch size come from: static config, TEI
+  discovery metadata, or provider-specific defaults?
+- Should the application store both an internal model key and a provider model
+  id instead of reusing one `name` field for both concerns?
+- If the configured chunking or dimensions change, should that create a new
+  model row or mutate the existing row and trigger re-embedding?
+- Should startup validate TEI metadata early and fail fast when the configured
+  model id is not provider-valid?
 
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
