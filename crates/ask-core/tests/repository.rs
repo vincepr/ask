@@ -1,6 +1,9 @@
-use ask_core::models::JobQueueEntry;
-use ask_core::repository::{claim_job, complete_job, enqueue_job, find_document_by_path};
-use ask_core::types::JobType;
+use ask_core::models::{Document, JobQueueEntry};
+use ask_core::repository::{
+    claim_job, complete_job, enqueue_job, find_document_by_path, insert_pending_embeddings,
+    upsert_document,
+};
+use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use rusqlite::{Connection, params};
 
 const STALE_JOB_AGE_SECS: i64 = 86_400;
@@ -19,6 +22,36 @@ fn setup_db() -> Connection {
             ON job_queue (job_type, payload);",
     )
     .expect("job_queue schema must be created");
+    conn
+}
+
+fn setup_documents_db() -> Connection {
+    let conn = Connection::open_in_memory().expect("in-memory database must open");
+    conn.execute_batch(
+        "CREATE TABLE documents (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath         TEXT NOT NULL,
+            file_type        TEXT NOT NULL,
+            doc_category     TEXT NOT NULL,
+            file_modified_at INTEGER NOT NULL,
+            file_size        INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE TABLE document_embeddings (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            model_id        INTEGER NOT NULL,
+            chunk_type      TEXT    NOT NULL,
+            chunk_start     INTEGER NOT NULL,
+            chunk_end       INTEGER NOT NULL,
+            state           TEXT    NOT NULL,
+            embedding       BLOB,
+            created_at      INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_embeddings_unique
+            ON document_embeddings (document_id, model_id, chunk_type, chunk_start);",
+    )
+    .expect("document schema must be created");
     conn
 }
 
@@ -267,20 +300,150 @@ fn complete_removes_job() {
 }
 
 #[test]
-fn find_document_by_path_rejects_unknown_doc_category() {
-    let conn = Connection::open_in_memory().expect("in-memory database must open");
-    conn.execute_batch(
-        "CREATE TABLE documents (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            filepath         TEXT NOT NULL,
-            file_type        TEXT NOT NULL,
-            doc_category     TEXT NOT NULL,
-            file_modified_at INTEGER NOT NULL,
-            file_size        INTEGER NOT NULL,
-            updated_at       INTEGER NOT NULL
-        );",
+fn upsert_document_reuses_existing_row_for_unchanged_file() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    let (first_id, first_changed) = upsert_document(&mut conn, &doc).unwrap();
+    let (second_id, second_changed) = upsert_document(&mut conn, &doc).unwrap();
+
+    assert_eq!(first_id, second_id);
+    assert!(first_changed);
+    assert!(!second_changed);
+
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 1, "unchanged upserts must not create duplicates");
+}
+
+#[test]
+fn upsert_document_updates_existing_row_and_marks_embeddings_stale() {
+    let mut conn = setup_documents_db();
+    let original = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+    let (doc_id, _) = upsert_document(&mut conn, &original).unwrap();
+
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, X'01', ?7)",
+        params![doc_id, 1, ChunkType::Filename, 0, 0, EmbedState::Embedded, 100],
     )
-    .expect("documents schema must be created");
+    .unwrap();
+
+    let updated = Document {
+        updated_at: 200,
+        file_modified_at: 200,
+        file_size: 20,
+        ..original
+    };
+    let (updated_id, changed) = upsert_document(&mut conn, &updated).unwrap();
+
+    assert_eq!(updated_id, doc_id);
+    assert!(changed);
+
+    let stored = find_document_by_path(&conn, "/tmp/a.txt").unwrap().unwrap();
+    assert_eq!(stored.id, doc_id);
+    assert_eq!(stored.file_modified_at, 200);
+    assert_eq!(stored.file_size, 20);
+    assert_eq!(stored.updated_at, 200);
+
+    let state: EmbedState = conn
+        .query_row(
+            "SELECT state FROM document_embeddings WHERE document_id = ?1",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, EmbedState::Stale);
+}
+
+#[test]
+fn find_document_by_path_prefers_latest_row_when_duplicates_exist() {
+    let conn = setup_documents_db();
+    conn.execute(
+        "INSERT INTO documents
+            (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6),
+                (?1, ?2, ?3, ?7, ?8, ?9)",
+        params![
+            "/tmp/a.txt",
+            "txt",
+            DocCategory::Resource,
+            100,
+            10,
+            100,
+            200,
+            20,
+            200
+        ],
+    )
+    .unwrap();
+
+    let doc = find_document_by_path(&conn, "/tmp/a.txt").unwrap().unwrap();
+    assert_eq!(doc.file_modified_at, 200);
+    assert_eq!(doc.file_size, 20);
+    assert_eq!(doc.updated_at, 200);
+}
+
+#[test]
+fn insert_pending_embeddings_replaces_existing_row() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+    let (doc_id, _) = upsert_document(&mut conn, &doc).unwrap();
+
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, X'01', ?7)",
+        params![doc_id, 1, ChunkType::Content, 0, 4, EmbedState::Embedded, 100],
+    )
+    .unwrap();
+
+    insert_pending_embeddings(&conn, doc_id, 1, &[(ChunkType::Content, 0, 8)], 200).unwrap();
+
+    let (chunk_end, state, embedding_is_null, created_at): (i64, EmbedState, i64, i64) = conn
+        .query_row(
+            "SELECT chunk_end, state, embedding IS NULL, created_at
+             FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2 AND chunk_type = ?3 AND chunk_start = ?4",
+            params![doc_id, 1, ChunkType::Content, 0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(chunk_end, 8);
+    assert_eq!(state, EmbedState::Pending);
+    assert_eq!(embedding_is_null, 1);
+    assert_eq!(created_at, 200);
+}
+
+#[test]
+fn find_document_by_path_rejects_unknown_doc_category() {
+    let conn = setup_documents_db();
     conn.execute(
         "INSERT INTO documents
             (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
@@ -291,9 +454,10 @@ fn find_document_by_path_rejects_unknown_doc_category() {
 
     let err = find_document_by_path(&conn, "/tmp/a.txt")
         .expect_err("invalid doc_category must fail to decode");
+    let err_text = format!("{err:#}");
 
     assert!(
-        err.to_string().contains("invalid DocCategory value"),
+        err_text.contains("invalid DocCategory value"),
         "unexpected error: {err:#}"
     );
 }

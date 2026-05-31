@@ -267,16 +267,9 @@ impl JobHandler for IngestFolderHandler {
                 .unwrap_or(now);
             let file_size = metadata.len() as i64;
 
-            let conn = ctx.pool.get().with_context(|| {
+            let mut conn = ctx.pool.get().with_context(|| {
                 format!("failed to acquire connection while ingesting {filepath}")
             })?;
-
-            if let Some(existing) = repository::find_document_by_path(&conn, &filepath)?
-                && existing.file_modified_at == file_modified_at
-                && existing.file_size == file_size
-            {
-                continue;
-            }
 
             let doc = Document {
                 id: 0,
@@ -288,8 +281,15 @@ impl JobHandler for IngestFolderHandler {
                 updated_at: now,
             };
 
-            let doc_id = repository::insert_document(&conn, &doc)
-                .with_context(|| format!("failed to insert document for {filepath}"))?;
+            let (doc_id, changed) = repository::upsert_document(&mut conn, &doc)
+                .with_context(|| format!("failed to upsert document for {filepath}"))?;
+
+            if !changed {
+                continue;
+            }
+
+            repository::delete_pending_embeddings_for_model(&conn, doc_id, model.id)
+                .with_context(|| format!("failed to clear pending embeddings for {filepath}"))?;
 
             queue_pending_embeddings_for_document(&conn, &canonical_path, doc_id, &model, now)
                 .with_context(|| format!("failed to queue pending embeddings for {filepath}"))?;

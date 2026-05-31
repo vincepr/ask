@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::models::{Document, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
@@ -12,32 +12,15 @@ const STALE_JOB_AGE_SECS: i64 = 86400;
 // Document
 // ---------------------------------------------------------------------------
 
-/// Insert a new document row. Returns the generated id.
-pub fn insert_document(conn: &Connection, doc: &Document) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            doc.filepath,
-            doc.file_type,
-            doc.doc_category,
-            doc.file_modified_at,
-            doc.file_size,
-            doc.updated_at,
-        ],
-    )
-    .context("failed to insert document row")?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Find a document by its filepath.
-pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Document>> {
-    let mut stmt = conn
-        .prepare("SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at FROM documents WHERE filepath = ?1")
-        .context("failed to prepare find_document_by_path")?;
-
-    let mut rows = stmt
-        .query_map(params![filepath], |row| {
+fn load_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Document>> {
+    conn.query_row(
+        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at
+         FROM documents
+         WHERE filepath = ?1
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1",
+        params![filepath],
+        |row| {
             Ok(Document {
                 id: row.get(0)?,
                 filepath: row.get(1)?,
@@ -47,14 +30,92 @@ pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option
                 file_size: row.get(5)?,
                 updated_at: row.get(6)?,
             })
-        })
-        .context("failed to query document by path")?;
+        },
+    )
+    .optional()
+    .context("failed to query document by path")
+}
 
-    match rows.next() {
-        Some(Ok(doc)) => Ok(Some(doc)),
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(None),
-    }
+/// Insert a new document row or update the latest row for the same filepath.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc` - Canonical document snapshot to persist.
+///
+/// # Returns
+///
+/// A tuple of `(document_id, changed)`. `changed` is `true` when a row was
+/// inserted or its tracked metadata changed, and `false` when the stored row
+/// already matched the provided document metadata.
+///
+/// # Errors
+///
+/// Returns an error if the lookup, insert, update, or stale-marking query
+/// fails.
+pub fn upsert_document(conn: &mut Connection, doc: &Document) -> Result<(i64, bool)> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start upsert_document transaction")?;
+
+    let existing = load_document_by_path(&tx, &doc.filepath)?;
+
+    let outcome = match existing {
+        Some(existing)
+            if existing.file_type == doc.file_type
+                && existing.doc_category == doc.doc_category
+                && existing.file_modified_at == doc.file_modified_at
+                && existing.file_size == doc.file_size =>
+        {
+            (existing.id, false)
+        }
+        Some(existing) => {
+            tx.execute(
+                "UPDATE documents
+                 SET file_type = ?1,
+                     doc_category = ?2,
+                     file_modified_at = ?3,
+                     file_size = ?4,
+                     updated_at = ?5
+                 WHERE id = ?6",
+                params![
+                    doc.file_type,
+                    doc.doc_category,
+                    doc.file_modified_at,
+                    doc.file_size,
+                    doc.updated_at,
+                    existing.id,
+                ],
+            )
+            .context("failed to update document row")?;
+            mark_documents_stale(&tx, &[existing.id])?;
+            (existing.id, true)
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    doc.filepath,
+                    doc.file_type,
+                    doc.doc_category,
+                    doc.file_modified_at,
+                    doc.file_size,
+                    doc.updated_at,
+                ],
+            )
+            .context("failed to insert document row")?;
+            (tx.last_insert_rowid(), true)
+        }
+    };
+
+    tx.commit().context("failed to commit upsert_document")?;
+    Ok(outcome)
+}
+
+/// Find a document by its filepath.
+pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Document>> {
+    load_document_by_path(conn, filepath)
 }
 
 /// Mark all embeddings for the given documents as stale across every model.
@@ -207,7 +268,12 @@ pub fn insert_pending_embeddings(
         .prepare(
             "INSERT INTO document_embeddings
                 (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(document_id, model_id, chunk_type, chunk_start) DO UPDATE SET
+                 chunk_end = excluded.chunk_end,
+                 state = excluded.state,
+                 embedding = NULL,
+                 created_at = excluded.created_at",
         )
         .context("failed to prepare insert_pending_embeddings")?;
 
@@ -225,6 +291,36 @@ pub fn insert_pending_embeddings(
             format!("failed to insert embedding ({doc_id}, {model_id}, {chunk_type})")
         })?;
     }
+
+    Ok(())
+}
+
+/// Delete pending embeddings for one document/model pair.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc_id` - Persisted document identifier.
+/// * `model_id` - Embedding model identifier.
+///
+/// # Returns
+///
+/// `Ok(())` when all pending rows for the pair are removed.
+///
+/// # Errors
+///
+/// Returns an error if the delete query fails.
+pub fn delete_pending_embeddings_for_model(
+    conn: &Connection,
+    doc_id: i64,
+    model_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM document_embeddings
+         WHERE document_id = ?1 AND model_id = ?2 AND state = ?3",
+        params![doc_id, model_id, EmbedState::Pending],
+    )
+    .context("failed to delete pending embeddings")?;
 
     Ok(())
 }

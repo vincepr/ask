@@ -56,8 +56,8 @@ fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i
         file_size: metadata.len() as i64,
         updated_at: now,
     };
-    let conn = pool.get().unwrap();
-    repository::insert_document(&conn, &document).unwrap()
+    let mut conn = pool.get().unwrap();
+    repository::upsert_document(&mut conn, &document).unwrap().0
 }
 
 struct TempDb {
@@ -509,6 +509,156 @@ async fn ingest_folder_skips_unchanged_files() {
     assert_eq!(
         doc_count_2, 1,
         "unchanged files should not create duplicate documents"
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_updates_existing_document_when_file_changes() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    {
+        let conn = db.pool().get().unwrap();
+        let model = ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "test-model".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
+        };
+        repository::insert_model(&conn, &model).unwrap();
+    }
+
+    let ingest_dir = db.create_dir("changed");
+    let file_path = ingest_dir.join("changed.txt");
+    std::fs::write(&file_path, "alpha").unwrap();
+
+    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let pool = db.pool();
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&pool, &entry, 1).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let first_doc_id: i64 = conn
+        .query_row("SELECT id FROM documents", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "UPDATE document_embeddings
+         SET state = 'embedded', embedding = X'01'
+         WHERE document_id = ?1",
+        [first_doc_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::fs::write(&file_path, "alpha beta gamma").unwrap();
+
+    let later = current_time();
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, later).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, later + 1)
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    dispatch_job(&pool, &entry, 1).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 1, "changed files should update the existing row");
+
+    let (doc_id, file_size, updated_at): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT id, file_size, updated_at FROM documents WHERE filepath = ?1",
+            [file_path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(doc_id, first_doc_id, "the same document row must be reused");
+    assert_eq!(file_size, 16, "the updated file size must be stored");
+    assert!(
+        updated_at >= later,
+        "updated_at should move forward on change"
+    );
+
+    let pending_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings
+             WHERE document_id = ?1 AND state = 'pending'",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_count, 2,
+        "changed files should queue fresh embeddings"
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_path_variants_reuse_same_document_row() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    {
+        let conn = db.pool().get().unwrap();
+        let model = ask_core::models::EmbeddingModel {
+            id: 0,
+            name: "test-model".to_string(),
+            dimensions: 768,
+            chunk_size: 512,
+            chunk_overlap: 0,
+            created_at: now,
+        };
+        repository::insert_model(&conn, &model).unwrap();
+    }
+
+    let ingest_dir = db.create_dir("variant");
+    let file_path = ingest_dir.join("variant.txt");
+    std::fs::write(&file_path, "content").unwrap();
+
+    let first_payload = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let second_root = ingest_dir.join("..").join("variant");
+    let second_payload = format!(r#"{{"root_path":"{}"}}"#, second_root.display());
+    let pool = db.pool();
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &first_payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&pool, &entry, 1).unwrap();
+
+    let later = current_time();
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &second_payload, later).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, later + 1)
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    dispatch_job(&pool, &entry, 1).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "path variants should map to one canonical document"
     );
 }
 
