@@ -1,6 +1,7 @@
 /// The shared workspace name.
 pub const WORKSPACE_NAME: &str = "ask";
 
+pub mod migrations;
 pub mod models;
 pub mod repository;
 pub mod types;

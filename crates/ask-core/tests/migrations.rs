@@ -1,4 +1,4 @@
-use ask_server::migrations::apply_pending_migrations;
+use ask_core::migrations::apply_pending_migrations;
 use rusqlite::Connection;
 
 #[test]

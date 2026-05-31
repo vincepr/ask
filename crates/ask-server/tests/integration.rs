@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ask_core::migrations;
 use ask_core::models::{DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderPayload};
 use ask_core::repository;
 use ask_core::types::DocCategory;
@@ -10,7 +11,7 @@ use ask_core::types::JobType;
 use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
 use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
-use ask_server::{create_pool, http, migrations};
+use ask_server::{create_pool, http};
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;

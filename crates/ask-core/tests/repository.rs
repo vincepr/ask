@@ -1,3 +1,4 @@
+use ask_core::migrations;
 use ask_core::models::{
     Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, JobQueueEntry,
 };
@@ -13,73 +14,23 @@ use rusqlite::{Connection, params};
 const STALE_JOB_AGE_SECS: i64 = 86_400;
 
 fn setup_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("in-memory database must open");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS job_queue (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_type    TEXT    NOT NULL,
-            payload     TEXT    NOT NULL,
-            claimed_at  INTEGER,
-            created_at  INTEGER NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_job_queue_unique
-            ON job_queue (job_type, payload);",
-    )
-    .expect("job_queue schema must be created");
+    let mut conn = Connection::open_in_memory().expect("in-memory database must open");
+    migrations::apply_pending_migrations(&mut conn)
+        .expect("core migrations must initialize the test schema");
     conn
 }
 
 fn setup_documents_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("in-memory database must open");
-    conn.execute_batch(
-        "CREATE TABLE documents (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            filepath         TEXT NOT NULL,
-            file_type        TEXT NOT NULL,
-            doc_category     TEXT NOT NULL,
-            file_modified_at INTEGER NOT NULL,
-            file_size        INTEGER NOT NULL,
-            updated_at       INTEGER NOT NULL
-         );
-         CREATE TABLE embedding_models (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            name          TEXT NOT NULL,
-            dimensions    INTEGER NOT NULL,
-            chunk_size    INTEGER NOT NULL,
-            chunk_overlap INTEGER NOT NULL,
-            created_at    INTEGER NOT NULL
-         );
-         CREATE TABLE document_embeddings (
-             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-             document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-            model_id        INTEGER NOT NULL,
-            chunk_type      TEXT    NOT NULL,
-            chunk_start     INTEGER NOT NULL,
-            chunk_end       INTEGER NOT NULL,
-            state           TEXT    NOT NULL,
-            embedding       BLOB,
-            created_at      INTEGER NOT NULL
-         );
-         CREATE UNIQUE INDEX idx_embeddings_unique
-            ON document_embeddings (document_id, model_id, chunk_type, chunk_start);
-         CREATE TABLE embedding_search_state (
-            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-            active_model_id INTEGER NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
-            dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-            updated_at INTEGER NOT NULL
-         );
-         CREATE TABLE job_queue (
-             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-             job_type    TEXT    NOT NULL,
-             payload     TEXT    NOT NULL,
-             claimed_at  INTEGER,
-             created_at  INTEGER NOT NULL
-         );
-         CREATE UNIQUE INDEX idx_job_queue_unique
-             ON job_queue (job_type, payload);",
+    setup_db()
+}
+
+fn insert_embedding_model(conn: &Connection, id: i64, name: &str) {
+    conn.execute(
+        "INSERT INTO embedding_models (id, name, dimensions, chunk_size, chunk_overlap, created_at)
+         VALUES (?1, ?2, 1, 16, 0, 100)",
+        params![id, name],
     )
-    .expect("document schema must be created");
-    conn
+    .expect("embedding model insert must succeed");
 }
 
 fn enqueue(conn: &Connection, payload: &str, now: i64) -> anyhow::Result<()> {
@@ -281,19 +232,9 @@ fn claim_concurrent_safety_single_winner() {
     let _ = std::fs::remove_file(&dir);
 
     let shared = Connection::open(&dir).unwrap();
-    shared
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS job_queue (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_type    TEXT    NOT NULL,
-                payload     TEXT    NOT NULL,
-                claimed_at  INTEGER,
-                created_at  INTEGER NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_job_queue_unique
-                ON job_queue (job_type, payload);",
-        )
-        .unwrap();
+    let mut shared = shared;
+    migrations::apply_pending_migrations(&mut shared)
+        .expect("core migrations must initialize concurrent claim schema");
     enqueue_job(
         &shared,
         &JobType::IngestFolder,
@@ -355,6 +296,7 @@ fn upsert_document_reuses_existing_row_for_unchanged_file() {
 #[test]
 fn upsert_document_updates_existing_row_and_marks_embeddings_stale() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 1, "m1");
     let original = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),
@@ -452,6 +394,7 @@ fn find_document_by_id_returns_matching_document() {
 #[test]
 fn insert_pending_embeddings_replaces_existing_row() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 1, "m1");
     let doc = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),
@@ -491,6 +434,7 @@ fn insert_pending_embeddings_replaces_existing_row() {
 #[test]
 fn transactional_document_ingest_replaces_pending_embeddings() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 7, "m7");
     let doc = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),
@@ -539,6 +483,7 @@ fn transactional_document_ingest_replaces_pending_embeddings() {
 #[test]
 fn transactional_document_ingest_keeps_existing_pending_rows_when_unchanged() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 7, "m7");
     let doc = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),
@@ -708,6 +653,8 @@ fn replace_embeddings_for_document_model_replaces_only_target_pair_atomically() 
 #[test]
 fn seed_embed_jobs_enqueues_one_job_per_distinct_document_model_pair() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 7, "m7");
+    insert_embedding_model(&conn, 9, "m9");
     let doc = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),
@@ -777,6 +724,7 @@ fn seed_embed_jobs_enqueues_one_job_per_distinct_document_model_pair() {
 #[test]
 fn seed_embed_jobs_deduplicates_repeated_calls() {
     let mut conn = setup_documents_db();
+    insert_embedding_model(&conn, 7, "m7");
     let doc = Document {
         id: 0,
         filepath: "/tmp/a.txt".to_string(),

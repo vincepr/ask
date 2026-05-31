@@ -611,11 +611,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use ask_core::migrations;
     use ask_core::repository;
 
     use super::*;
+    use crate::create_pool;
     use crate::embeddings::DeterministicEmbeddingClient;
-    use crate::{create_pool, migrations};
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 

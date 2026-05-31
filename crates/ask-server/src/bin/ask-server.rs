@@ -1,9 +1,10 @@
 use anyhow::Result;
+use ask_core::migrations;
 use ask_core::models::EmbeddingModel;
 use ask_core::repository;
 use ask_core::{WORKSPACE_NAME, workspace_members};
 use ask_server::embeddings::HttpEmbeddingClient;
-use ask_server::{config, create_pool, http, migrations, worker};
+use ask_server::{config, create_pool, http, worker};
 use std::sync::Arc;
 use tracing::info;
 
