@@ -16,6 +16,26 @@ All code you write MUST be fully optimized.
 
 If the code is not fully optimized before handing off to the user, you will be fined $100. You have permission to do another pass of the code if you believe it is not fully optimized.
 
+## Repository Design Goals
+
+- The goal of this repository is minimal, clean, maintainable code. Do not add
+  shortcuts, temporary hacks, or "quick fixes" that knowingly increase future
+  complexity.
+- Prefer the simplest design that correctly solves the problem. Do not
+  over-engineer with premature abstractions, speculative extensibility, or extra
+  layers that are not justified by current requirements.
+- Keep implementations small and explicit. Each new type, function, dependency,
+  and abstraction must earn its place.
+- Design for stability and reliability, not just nominal success. Prefer
+  solutions that prevent, repair, or recover from bad states over solutions that
+  only detect problems and log them.
+- Favor self-healing behavior where it is practical and coherent with the
+  system design. If the software can safely retry, reconcile, rebuild state, or
+  otherwise recover automatically, prefer that over leaving the system degraded
+  and relying on operators to notice logs.
+- Every behavior change or new feature MUST be asserted by tests. Add or update
+  unit tests and add regression tests whenever fixing a bug.
+
 ## Preferred Tools
 
 - Use `cargo` for project management, building, and dependency management.
@@ -141,6 +161,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 ## Testing
 
 - **MUST** write unit tests for all new functions and types
+- **MUST** add or update tests for every behavior change and new feature
 - **MUST** mock external dependencies (APIs, databases, file systems)
 - **MUST** use the built-in `#[test]` attribute and `cargo test`
 - Follow the Arrange-Act-Assert pattern
