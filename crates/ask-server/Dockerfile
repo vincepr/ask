@@ -1,10 +1,11 @@
-FROM rust:1.85-alpine AS builder
+FROM rust:1.86-alpine AS builder
 
 RUN apk add --no-cache build-base musl-dev
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY crates/ask-core ./crates/ask-core
 COPY crates/ask-server ./crates/ask-server
 

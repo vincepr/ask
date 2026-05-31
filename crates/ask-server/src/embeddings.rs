@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use ask_core::models::EmbeddingModel;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 
 use crate::config::EmbeddingProvider;
 
@@ -81,16 +82,21 @@ impl EmbeddingClient for HttpEmbeddingClient {
             http_request = http_request.bearer_auth(auth_token);
         }
 
-        let response = http_request.send().with_context(|| {
-            format!(
-                "embedding provider request failed for model {} ({})",
-                model.name,
-                self.provider.mode_name()
-            )
-        })?;
+        // `embed` runs on a `spawn_blocking` worker thread. Re-entering the
+        // outer Tokio runtime avoids `reqwest::blocking`, which would create
+        // and later drop its own runtime from async startup/shutdown paths.
+        let response = Handle::current()
+            .block_on(async { http_request.send().await })
+            .with_context(|| {
+                format!(
+                    "embedding provider request failed for model {} ({})",
+                    model.name,
+                    self.provider.mode_name()
+                )
+            })?;
         let status = response.status();
-        let body = response
-            .text()
+        let body = Handle::current()
+            .block_on(async { response.text().await })
             .context("failed to read embedding provider response body")?;
 
         if !status.is_success() {
@@ -207,7 +213,11 @@ struct EmbeddingResponseItem {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use ask_core::models::EmbeddingModel;
+
+    use crate::config::EmbeddingProvider;
 
     use super::{DeterministicEmbeddingClient, EmbeddingClient};
 
@@ -246,5 +256,29 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("deterministic embedding failure"));
+    }
+
+    #[test]
+    fn http_client_can_be_constructed_inside_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime must build");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let provider = EmbeddingProvider::Tei {
+                    base_url: String::from("http://127.0.0.1:18080"),
+                };
+
+                super::HttpEmbeddingClient::new(provider)
+                    .expect("client construction inside Tokio must succeed");
+            });
+        }));
+
+        assert!(
+            result.is_ok(),
+            "constructing the HTTP embedding client inside Tokio must not panic"
+        );
     }
 }
