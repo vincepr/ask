@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ask_core::models::{DEFAULT_FILE_PATTERN, IngestFolderPayload};
 use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
@@ -120,6 +121,18 @@ fn json_body(text: &str) -> Body {
     Body::from(Bytes::from(text.to_owned()))
 }
 
+fn ingest_payload(root_path: &std::path::Path) -> String {
+    ingest_payload_with_pattern(root_path, DEFAULT_FILE_PATTERN)
+}
+
+fn ingest_payload_with_pattern(root_path: &std::path::Path, file_pattern: &str) -> String {
+    serde_json::to_string(&IngestFolderPayload {
+        root_path: root_path.to_string_lossy().into_owned(),
+        file_pattern: file_pattern.to_string(),
+    })
+    .unwrap()
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -221,6 +234,103 @@ async fn ingest_valid_dir_returns_200() {
     let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(body["status"], "queued");
     assert_eq!(body["job_type"], "ingest_folder");
+}
+
+#[tokio::test]
+async fn ingest_without_file_pattern_queues_default_pattern() {
+    let db = TempDb::new();
+    let dir = db.create_dir("default_pattern");
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let conn = db.pool().get().unwrap();
+    let queued_payload: String = conn
+        .query_row("SELECT payload FROM job_queue", [], |row| row.get(0))
+        .unwrap();
+    let queued_payload: IngestFolderPayload = serde_json::from_str(&queued_payload).unwrap();
+
+    assert_eq!(queued_payload.file_pattern, DEFAULT_FILE_PATTERN);
+    assert_eq!(
+        queued_payload.root_path,
+        dir.canonicalize().unwrap().display().to_string()
+    );
+}
+
+#[tokio::test]
+async fn ingest_with_custom_file_pattern_queues_resolved_pattern() {
+    let db = TempDb::new();
+    let dir = db.create_dir("custom_pattern");
+    let payload = format!(
+        r#"{{"root_path":"{}","file_pattern":"(?i)^src/.+\\.rs$"}}"#,
+        dir.display()
+    );
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let conn = db.pool().get().unwrap();
+    let queued_payload: String = conn
+        .query_row("SELECT payload FROM job_queue", [], |row| row.get(0))
+        .unwrap();
+    let queued_payload: IngestFolderPayload = serde_json::from_str(&queued_payload).unwrap();
+
+    assert_eq!(queued_payload.file_pattern, r"(?i)^src/.+\.rs$");
+}
+
+#[tokio::test]
+async fn ingest_invalid_file_pattern_returns_400() {
+    let db = TempDb::new();
+    let dir = db.create_dir("invalid_pattern");
+    let payload = format!(r#"{{"root_path":"{}","file_pattern":"["}}"#, dir.display());
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid file_pattern regex")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +496,7 @@ async fn ingest_folder_inserts_documents_and_pending_embeddings() {
     std::fs::write(&bin_path, [0x00, 0xFF, 0xFE, 0x7F]).unwrap();
 
     // Enqueue an IngestFolder job.
-    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let payload_json = ingest_payload(&ingest_dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
 
@@ -463,7 +573,7 @@ async fn ingest_folder_recursively_inserts_nested_documents() {
     std::fs::write(&root_file, "root content").unwrap();
     std::fs::write(&nested_file, "nested content").unwrap();
 
-    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let payload_json = ingest_payload(&ingest_dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -495,6 +605,98 @@ async fn ingest_folder_recursively_inserts_nested_documents() {
 }
 
 #[tokio::test]
+async fn ingest_folder_filters_files_by_normalized_relative_path() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "path_filter");
+
+    let ingest_dir = db.create_dir("path_filter");
+    let src_dir = ingest_dir.join("src");
+    let docs_dir = ingest_dir.join("docs");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&docs_dir).unwrap();
+
+    let keep_rs = src_dir.join("main.rs");
+    let skip_md = src_dir.join("notes.md");
+    let skip_txt = docs_dir.join("guide.txt");
+    std::fs::write(&keep_rs, "fn main() {}\n").unwrap();
+    std::fs::write(&skip_md, "# notes\n").unwrap();
+    std::fs::write(&skip_txt, "guide\n").unwrap();
+
+    let payload_json = ingest_payload_with_pattern(&ingest_dir, r"^src/.+\.rs$");
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![keep_rs.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_ignore_files_and_regex_filter_compose() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "ignore_compose");
+
+    let ingest_dir = db.create_dir("ignore_compose");
+    let included_dir = ingest_dir.join("docs");
+    std::fs::create_dir_all(&included_dir).unwrap();
+    std::fs::write(ingest_dir.join(".gitignore"), "ignored/\n*.tmp\n").unwrap();
+    std::fs::create_dir_all(ingest_dir.join("ignored")).unwrap();
+
+    let keep_file = included_dir.join("keep.txt");
+    let ignored_dir_file = ingest_dir.join("ignored").join("skip.txt");
+    let ignored_pattern_file = included_dir.join("skip.tmp");
+    let regex_excluded_file = ingest_dir.join("root.txt");
+    std::fs::write(&keep_file, "keep\n").unwrap();
+    std::fs::write(&ignored_dir_file, "skip\n").unwrap();
+    std::fs::write(&ignored_pattern_file, "skip\n").unwrap();
+    std::fs::write(&regex_excluded_file, "skip\n").unwrap();
+
+    let payload_json = ingest_payload_with_pattern(&ingest_dir, r"^docs/.+\.txt$");
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![keep_file.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
 async fn ingest_folder_skips_unchanged_files() {
     let db = TempDb::new();
     let now = SystemTime::now()
@@ -521,7 +723,7 @@ async fn ingest_folder_skips_unchanged_files() {
     std::fs::write(&file_path, "content").unwrap();
 
     // First ingest.
-    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let payload_json = ingest_payload(&ingest_dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -579,7 +781,7 @@ async fn ingest_folder_updates_existing_document_when_file_changes() {
     let file_path = ingest_dir.join("changed.txt");
     std::fs::write(&file_path, "alpha").unwrap();
 
-    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let payload_json = ingest_payload(&ingest_dir);
     let pool = db.pool();
 
     let conn = db.pool().get().unwrap();
@@ -675,9 +877,9 @@ async fn ingest_folder_path_variants_reuse_same_document_row() {
     let file_path = ingest_dir.join("variant.txt");
     std::fs::write(&file_path, "content").unwrap();
 
-    let first_payload = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let first_payload = ingest_payload(&ingest_dir);
     let second_root = ingest_dir.join("..").join("variant");
-    let second_payload = format!(r#"{{"root_path":"{}"}}"#, second_root.display());
+    let second_payload = ingest_payload(&second_root);
     let pool = db.pool();
 
     let conn = db.pool().get().unwrap();
@@ -730,7 +932,7 @@ async fn ingest_folder_empty_dir_completes_job() {
     }
 
     let empty_dir = db.create_dir("empty");
-    let payload_json = format!(r#"{{"root_path":"{}"}}"#, empty_dir.display());
+    let payload_json = ingest_payload(&empty_dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -760,7 +962,7 @@ async fn ingest_folder_nonexistent_path_completes_job() {
         .unwrap()
         .as_secs() as i64;
 
-    let payload_json = r#"{"root_path":"/tmp/ask-nonexistent-12345-unlikely"}"#;
+    let payload_json = r#"{"root_path":"/tmp/ask-nonexistent-12345-unlikely","file_pattern":".*"}"#;
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, payload_json, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -790,7 +992,7 @@ async fn dispatch_job_missing_model_returns_error_and_keeps_job_claimed() {
     let now = current_time();
     let dir = db.create_dir("missing_model");
     std::fs::write(dir.join("a.txt"), "content").unwrap();
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
@@ -834,8 +1036,8 @@ async fn multiple_ingest_jobs_sequentially_all_complete() {
     std::fs::write(dir1.join("b.txt"), "b").unwrap();
     std::fs::write(dir2.join("c.txt"), "c").unwrap();
 
-    let payload1 = format!(r#"{{"root_path":"{}"}}"#, dir1.display());
-    let payload2 = format!(r#"{{"root_path":"{}"}}"#, dir2.display());
+    let payload1 = ingest_payload(&dir1);
+    let payload2 = ingest_payload(&dir2);
 
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload1, now).unwrap();
@@ -880,7 +1082,7 @@ async fn ingest_files_with_special_characters_in_names() {
         std::fs::write(dir.join(name), b"content").unwrap();
     }
 
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -923,7 +1125,7 @@ async fn ingest_mixed_file_types() {
     let link = dir.join("link_to_readme.txt");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -1005,7 +1207,7 @@ async fn ingest_large_file_produces_many_chunks() {
     assert_eq!(content.len(), 100);
     std::fs::write(dir.join("big.txt"), &content).unwrap();
 
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
     let mut conn = db.pool().get().unwrap();
@@ -1032,7 +1234,7 @@ async fn ingest_non_utf8_file_only_gets_filename_embedding() {
 
     let dir = db.create_dir("nonutf8");
     std::fs::write(dir.join("data.bin"), [0xFF, 0xFE, 0x80, 0x00]).unwrap();
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
@@ -1131,7 +1333,7 @@ async fn job_lifecycle_claim_and_complete() {
         .unwrap()
         .as_secs() as i64;
 
-    let payload = r#"{"root_path":"/tmp"}"#;
+    let payload = r#"{"root_path":"/tmp","file_pattern":".*"}"#;
     repository::enqueue_job(&conn, &JobType::IngestFolder, payload, now).unwrap();
 
     let mut conn = db.pool().get().unwrap();

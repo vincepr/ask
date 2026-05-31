@@ -9,6 +9,7 @@ use ignore::WalkBuilder;
 use tracing::{error, info, warn};
 
 use crate::DbPool;
+use crate::ingest;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -174,6 +175,8 @@ impl JobHandler for IngestFolderHandler {
         let payload: IngestFolderPayload = serde_json::from_str(&ctx.entry.payload)
             .with_context(|| format!("failed to decode payload for job {}", ctx.entry.id))?;
         let root_path = Path::new(&payload.root_path);
+        let file_pattern = ingest::compile_file_pattern(&payload.file_pattern)
+            .with_context(|| format!("failed to compile file pattern for job {}", ctx.entry.id))?;
 
         if !root_path.is_dir() {
             warn!(
@@ -187,6 +190,7 @@ impl JobHandler for IngestFolderHandler {
         info!(
             job_id = ctx.entry.id,
             path = %payload.root_path,
+            file_pattern = %payload.file_pattern,
             "processing ingest_folder job"
         );
 
@@ -238,6 +242,22 @@ impl JobHandler for IngestFolderHandler {
             }
 
             let path = dir_entry.into_path();
+
+            let relative_path = match ingest::normalize_relative_path(root_path, &path) {
+                Some(relative_path) => relative_path,
+                None => {
+                    warn!(
+                        job_id = ctx.entry.id,
+                        path = ?path,
+                        "failed to normalize relative file path; continuing"
+                    );
+                    continue;
+                }
+            };
+
+            if !file_pattern.is_match(&relative_path) {
+                continue;
+            }
 
             let canonical_path = match std::fs::canonicalize(&path) {
                 Ok(path) => path,

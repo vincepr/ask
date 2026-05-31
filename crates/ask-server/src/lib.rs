@@ -1,5 +1,6 @@
 pub mod config;
 pub mod http;
+mod ingest;
 pub mod migrations;
 pub mod worker;
 

@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::DbPool;
+use crate::ingest;
 
 pub type AppState = DbPool;
 
@@ -35,15 +36,26 @@ enum IngestOutcome {
     Queued,
     NotFound(String),
     NotADirectory(String),
+    InvalidPattern(String),
     Conflict(String),
+}
+
+#[derive(Deserialize)]
+struct IngestRequest {
+    root_path: String,
+    file_pattern: Option<String>,
 }
 
 async fn ingest(
     State(pool): State<AppState>,
-    Json(body): Json<IngestFolderPayload>,
+    Json(body): Json<IngestRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let result = tokio::task::spawn_blocking(move || {
-        let root_path = body.root_path.clone();
+        let root_path = body.root_path;
+        let file_pattern = match ingest::resolve_file_pattern(body.file_pattern.as_deref()) {
+            Ok(file_pattern) => file_pattern,
+            Err(err) => return IngestOutcome::InvalidPattern(err.to_string()),
+        };
         let canonical_root = match std::fs::canonicalize(Path::new(&root_path)) {
             Ok(path) => path,
             Err(_) => {
@@ -58,6 +70,7 @@ async fn ingest(
         let canonical_root = canonical_root.to_string_lossy().into_owned();
         let payload = IngestFolderPayload {
             root_path: canonical_root,
+            file_pattern,
         };
 
         let payload_json =
@@ -99,6 +112,11 @@ async fn ingest(
             StatusCode::BAD_REQUEST,
             "bad_request",
             format!("path is not a directory: {p}"),
+        )),
+        IngestOutcome::InvalidPattern(msg) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("invalid file_pattern regex: {msg}"),
         )),
         IngestOutcome::Conflict(msg) => Err(error_response(StatusCode::CONFLICT, "conflict", msg)),
     }
