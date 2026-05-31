@@ -1,76 +1,75 @@
-# File Path Resolution in the Worker
+# Worker Path Resolution
 
-Document filepaths are stored in the `documents.filepath` column. The worker's
-`EmbedDocumentHandler` reads them back and passes them directly to
-`std::fs::read_to_string()` (`worker.rs:229`, `worker.rs:483`).
+## Goal
 
-Inside Docker:
-- The volume mount places files at `/resources`
-- The container WORKDIR is `/app` (from Dockerfile)
-- Stored paths like `./Cargo.toml` resolve against CWD, becoming
-  `/app/Cargo.toml` which does not exist
+Keep worker file access simple and deterministic.
 
-The `IngestFolderHandler` stores paths via `std::fs::canonicalize()` at
-`worker.rs:386-397`, producing absolute paths. Yet the DB contains relative
-paths (`./Cargo.toml`), suggesting they were inserted by a different code path
-or an earlier version.
+The worker should read the stored document path exactly as written in the
+ database, and its behavior must not depend on the process working directory,
+ Docker `WORKDIR`, or any separately configured resource root.
 
-The worker's `JobContext` has no `resource_dir` field, so there is no way to
-resolve a relative path against the configured resource root. The HTTP layer
-(`http.rs:42`) does canonicalize `resource_dir` into a `resource_root`, but
-that value is never passed to the worker.
+## Decision
 
-## Questions
+- This feature does not define path storage semantics. That is already defined by
+  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md).
+- The worker must treat `documents.filepath` as the exact absolute path to open.
+- The worker must not resolve relative paths, prepend resource roots, or attempt
+  path repair.
+- If the file cannot be opened or read, the worker should fail the job with clear
+  context about the path that failed.
 
-- Should stored filepaths always be absolute, or should they be relative to the
-  resource root and resolved at read time? Each has different implications for
-  portability, the ingest endpoint, and the data model.
-- If paths should be absolute, how do we handle existing relative-path entries
-  in the DB? A one-time migration? Ignore them and let re-ingest fix it?
-- If paths should remain relative, how does `resource_dir` get threaded into
-  the worker without adding complexity to `JobContext`, `spawn()`, `tick()`,
-  and every handler? Is there a simpler approach (e.g., changing the container
-  WORKDIR)?
-- Does the worker even need to read files at all, or could chunk content be
-  stored alongside the document embedding rows? That would trade storage for
-  simplicity (no file I/O, no path resolution).
-- What invariants should the `Document.filepath` field guarantee, and where
-  should they be enforced — the DB schema, the repository layer, or the
-  caller?
+## Why This Design
 
-## Recommended Direction
+This keeps responsibility boundaries clear.
 
-- Make this a compatibility and cleanup feature, not the primary place where
-  path semantics are defined.
-- After `documents.filepath` is defined as canonical absolute paths, the worker
-  should mostly just open the stored path directly.
+- Ingest owns path normalization.
+- The worker owns file reading and error reporting.
+- The runtime stays small because there is only one path interpretation model.
+- Docker-specific filesystem layout does not need special handling once stored
+  paths are canonical absolute paths.
+
+## Non-Goals
+
+- No resource-root field added to worker context.
+- No compatibility handling for legacy relative paths.
+- No fallback against current working directory.
+- No read-time path rewriting or database repair.
+- No container `WORKDIR` tricks as a substitute for a clean data contract.
+
+## Implementation Plan
+
+1. Review the worker read path and remove any logic that attempts to reinterpret
+   stored filepaths.
+2. Ensure the worker opens `documents.filepath` exactly as stored.
+3. Add or tighten error context so job failures report the document id and the
+   exact file path that could not be read.
+4. Keep all path-format assumptions out of worker configuration and job context.
+5. Update tests so worker behavior is validated against canonical absolute paths
+   only.
 
 ## Implementation Notes
 
-- If backward compatibility for existing relative rows is needed, thread the
-  configured resource root into the worker only as a migration aid, not as the
-  long-term steady-state contract.
-- A pragmatic recovery flow is:
-  - detect a relative stored path
-  - resolve it against the configured resource root
-  - if the resolved file exists, use it and repair the stored row
-  - if not, fail clearly instead of silently reading from CWD
-- Avoid changing container `WORKDIR` as the main fix. That hides the data-model
-  ambiguity instead of removing it.
+- The worker should rely on the invariant established by ingest rather than
+  duplicating normalization logic.
+- A missing file is an operational failure, not a prompt to guess alternate
+  locations.
+- If later features need a different storage contract, they should change the
+  ingest-time invariant rather than adding another worker resolution strategy.
 
-## Dependencies and Sequencing
+## Test Plan
 
-- Depends on
-  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md)
-  for the steady-state invariant.
-- Search endpoint work will benefit from the same read-path semantics.
+- Regression test that the worker reads a stored canonical absolute path without
+  consulting cwd or a resource root.
+- Integration test covering a Docker-style layout where process cwd differs from
+  the mounted resource location.
+- Regression test that a missing file produces a clear deterministic failure.
+- Regression test that worker behavior remains unchanged if cwd is moved to a
+  different directory before processing a job.
 
-## Test Expectations
+## Acceptance Criteria
 
-- Regression test for a legacy relative DB path resolved against the resource
-  root.
-- Test that successful fallback repairs the stored path.
-- Test that an unresolved relative path produces a deterministic error.
-
----
-_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
+- Worker file access does not depend on process working directory.
+- Worker code contains no alternate path resolution strategy.
+- Job failures include useful path context when file reads fail.
+- The worker remains a thin consumer of the filepath invariant defined by
+  feature 006.
