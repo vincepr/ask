@@ -1,8 +1,11 @@
-use ask_core::models::{Document, EmbedDocumentPayload, EmbeddedChunk, JobQueueEntry};
+use ask_core::models::{
+    Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, JobQueueEntry,
+};
 use ask_core::repository::{
     claim_job, complete_job, enqueue_job, find_document_by_id, find_document_by_path,
-    insert_pending_embeddings, replace_embeddings_for_document_model, seed_embed_jobs,
-    upsert_document, upsert_document_and_replace_pending_embeddings,
+    insert_pending_embeddings, replace_embeddings_for_document_model,
+    search_documents_by_embedding, seed_embed_jobs, upsert_document,
+    upsert_document_and_replace_pending_embeddings,
 };
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use rusqlite::{Connection, params};
@@ -59,6 +62,12 @@ fn setup_documents_db() -> Connection {
          );
          CREATE UNIQUE INDEX idx_embeddings_unique
             ON document_embeddings (document_id, model_id, chunk_type, chunk_start);
+         CREATE TABLE embedding_search_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            active_model_id INTEGER NOT NULL REFERENCES embedding_models(id) ON DELETE CASCADE,
+            dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+            updated_at INTEGER NOT NULL
+         );
          CREATE TABLE job_queue (
              id          INTEGER PRIMARY KEY AUTOINCREMENT,
              job_type    TEXT    NOT NULL,
@@ -818,5 +827,71 @@ fn find_document_by_path_rejects_unknown_doc_category() {
     assert!(
         err_text.contains("invalid DocCategory value"),
         "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn search_documents_by_embedding_limit_zero_returns_empty() {
+    let conn = setup_documents_db();
+    let model = EmbeddingModel {
+        id: 1,
+        name: "m1".to_string(),
+        dimensions: 2,
+        chunk_size: 16,
+        chunk_overlap: 0,
+        created_at: 1,
+    };
+
+    let hits = search_documents_by_embedding(&conn, &model, &[], 0).unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn search_documents_by_embedding_rejects_dimension_mismatch() {
+    let conn = setup_documents_db();
+    let model = EmbeddingModel {
+        id: 1,
+        name: "m1".to_string(),
+        dimensions: 2,
+        chunk_size: 16,
+        chunk_overlap: 0,
+        created_at: 1,
+    };
+
+    let err = search_documents_by_embedding(&conn, &model, &[1.0], 3).unwrap_err();
+    let err_text = format!("{err:#}");
+    assert!(err_text.contains("query embedding length 1 does not match model m1 dimensions 2"));
+}
+
+#[test]
+fn search_documents_by_embedding_rejects_active_model_mismatch() {
+    let conn = setup_documents_db();
+    conn.execute(
+        "INSERT INTO embedding_models (id, name, dimensions, chunk_size, chunk_overlap, created_at)
+         VALUES (1, 'm1', 2, 16, 0, 1), (9, 'm9', 2, 16, 0, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO embedding_search_state (singleton_id, active_model_id, dimensions, updated_at)
+         VALUES (1, 9, 2, 1)",
+        [],
+    )
+    .unwrap();
+
+    let model = EmbeddingModel {
+        id: 1,
+        name: "m1".to_string(),
+        dimensions: 2,
+        chunk_size: 16,
+        chunk_overlap: 0,
+        created_at: 1,
+    };
+
+    let err = search_documents_by_embedding(&conn, &model, &[1.0, 0.0], 3).unwrap_err();
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text
+            .contains("vector search index is configured for model id 9 but search requested 1")
     );
 }

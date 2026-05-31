@@ -7,7 +7,7 @@ use ask_core::models::{DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderP
 use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
-use ask_server::embeddings::DeterministicEmbeddingClient;
+use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
 use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http, migrations};
@@ -99,6 +99,10 @@ impl TempDb {
 
     fn router(&self) -> axum::Router {
         http::router(self.pool())
+    }
+
+    fn router_with_embedding_client(&self, client: Arc<dyn EmbeddingClient>) -> axum::Router {
+        http::router(self.pool().with_embedding_client(client))
     }
 
     fn create_dir(&self, name: &str) -> PathBuf {
@@ -2069,4 +2073,326 @@ async fn sqlite_vec_search_removes_rows_when_documents_become_stale() {
         )
         .unwrap();
     assert_eq!(state, "stale");
+}
+
+// ---------------------------------------------------------------------------
+// POST /search
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_returns_unique_documents_with_match_score_only_by_default() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-model", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let doc_a_path = db.create_file("search-a.txt");
+    let doc_b_path = db.create_file("search-b.txt");
+    let doc_a = insert_document(&db.pool(), now, &doc_a_path);
+    let doc_b = insert_document(&db.pool(), now, &doc_b_path);
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let a_inputs = vec![
+        "query-doc-a".to_string(),
+        "query-doc-a-near-duplicate".to_string(),
+    ];
+    let b_inputs = vec!["query-doc-b".to_string()];
+    let a_vectors = client.embed(&model, &a_inputs).unwrap();
+    let b_vectors = client.embed(&model, &b_inputs).unwrap();
+
+    let mut conn = db.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_a,
+        model_id,
+        &[
+            ask_core::models::EmbeddedChunk {
+                chunk_type: ask_core::types::ChunkType::Content,
+                chunk_start: 0,
+                chunk_end: 8,
+                embedding: serialize_embedding(&a_vectors[0]),
+            },
+            ask_core::models::EmbeddedChunk {
+                chunk_type: ask_core::types::ChunkType::Content,
+                chunk_start: 8,
+                chunk_end: 16,
+                embedding: serialize_embedding(&a_vectors[1]),
+            },
+        ],
+        now,
+    )
+    .unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_b,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Content,
+            chunk_start: 0,
+            chunk_end: 12,
+            embedding: serialize_embedding(&b_vectors[0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"query-doc-a","limit":2}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let results = body.as_array().unwrap();
+    assert_eq!(results.len(), 2, "dedupe should still return 2 documents");
+
+    let filepath_a = doc_a_path.canonicalize().unwrap().display().to_string();
+    let filepath_b = doc_b_path.canonicalize().unwrap().display().to_string();
+    assert_eq!(results[0]["filepath"], filepath_a);
+    assert_eq!(results[1]["filepath"], filepath_b);
+
+    assert!(
+        results[0]["match_score"].as_f64().unwrap() >= results[1]["match_score"].as_f64().unwrap()
+    );
+    assert!(results[0].get("byte_start").is_none());
+    assert!(results[0].get("byte_end").is_none());
+}
+
+#[tokio::test]
+async fn search_include_location_returns_byte_offsets_for_best_hit() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-location", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let doc_path = db.create_file("search-location.txt");
+    let doc_id = insert_document(&db.pool(), now, &doc_path);
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let vectors = client
+        .embed(
+            &model,
+            &[
+                "query-location".to_string(),
+                "query-location-far".to_string(),
+            ],
+        )
+        .unwrap();
+    let mut conn = db.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[
+            ask_core::models::EmbeddedChunk {
+                chunk_type: ask_core::types::ChunkType::Content,
+                chunk_start: 10,
+                chunk_end: 25,
+                embedding: serialize_embedding(&vectors[1]),
+            },
+            ask_core::models::EmbeddedChunk {
+                chunk_type: ask_core::types::ChunkType::Content,
+                chunk_start: 100,
+                chunk_end: 120,
+                embedding: serialize_embedding(&vectors[0]),
+            },
+        ],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"query-location","limit":1,"include_location":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let result = &body.as_array().unwrap()[0];
+    assert_eq!(result["byte_start"], 100);
+    assert_eq!(result["byte_end"], 120);
+}
+
+#[tokio::test]
+async fn search_empty_query_returns_400() {
+    let db = TempDb::new();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"   "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn search_limit_zero_returns_400() {
+    let db = TempDb::new();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"anything","limit":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn search_limit_above_max_returns_400() {
+    let db = TempDb::new();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"anything","limit":101}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn search_provider_failure_returns_502() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-provider-fail", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::fail_on_input("fail-search"));
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"please fail-search now","limit":2}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["code"], "bad_gateway");
+}
+
+#[tokio::test]
+async fn search_without_active_model_state_returns_500() {
+    let db = TempDb::new();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"anything","limit":2}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["code"], "internal_error");
+}
+
+#[tokio::test]
+async fn search_empty_index_returns_200_with_empty_results() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-empty", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"nothing-here","limit":5}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body, serde_json::json!([]));
 }

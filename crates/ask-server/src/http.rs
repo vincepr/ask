@@ -1,6 +1,10 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use anyhow::{Context, anyhow};
 use ask_core::models::IngestFolderPayload;
+use ask_core::models::{DocumentSearchResult, EmbeddingModel};
 use ask_core::{repository, types::JobType};
 use axum::{
     Json, Router,
@@ -9,12 +13,14 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
-use serde::Deserialize;
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::DbPool;
+use crate::embeddings::{DeterministicEmbeddingClient, EmbeddingClient, SharedEmbeddingClient};
 use crate::ingest;
 
 /// Shared HTTP application state.
@@ -22,6 +28,7 @@ use crate::ingest;
 pub struct AppState {
     pool: DbPool,
     resource_root: PathBuf,
+    embedding_client: SharedEmbeddingClient,
 }
 
 impl AppState {
@@ -43,13 +50,27 @@ impl AppState {
         Ok(Self {
             pool,
             resource_root: std::fs::canonicalize(resource_dir)?,
+            embedding_client: Arc::new(DeterministicEmbeddingClient::new()),
         })
+    }
+
+    /// Returns a copy of this state with a custom query embedding client.
+    #[must_use]
+    pub fn with_embedding_client(mut self, embedding_client: SharedEmbeddingClient) -> Self {
+        self.embedding_client = embedding_client;
+        self
     }
 
     /// Returns the shared SQLite connection pool.
     #[must_use]
     pub fn pool(&self) -> &DbPool {
         &self.pool
+    }
+
+    /// Returns the shared embedding client used by `/search`.
+    #[must_use]
+    pub fn embedding_client(&self) -> SharedEmbeddingClient {
+        self.embedding_client.clone()
     }
 }
 
@@ -67,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(api_reference))
         .route("/health", get(health))
         .route("/api.html", get(api_reference))
+        .route("/search", post(search))
         .route("/ingest", post(ingest))
         .route("/documents/stale", post(mark_stale))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -75,21 +97,117 @@ pub fn router(state: AppState) -> Router {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, ingest, mark_stale),
-    components(schemas(IngestRequest, MarkStalePayload))
+    paths(health, search, ingest, mark_stale),
+    components(schemas(IngestRequest, MarkStalePayload, SearchRequest, SearchDocumentResult))
 )]
 struct ApiDoc;
 
-#[utoipa::path(
-    get,
-    path = "/health"
-)]
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const MAX_SEARCH_LIMIT: usize = 100;
+const SEARCH_RAW_LIMIT_MULTIPLIER: usize = 4;
+const SEARCH_RAW_LIMIT_CAP: usize = 400;
+
+#[utoipa::path(get, path = "/health")]
 async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
 async fn api_reference() -> Html<&'static str> {
     Html(include_str!("../static/api.html"))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+struct SearchRequest {
+    query: String,
+    limit: Option<usize>,
+    include_location: Option<bool>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct SearchDocumentResult {
+    filepath: String,
+    match_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_start: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_end: Option<i64>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/search",
+    request_body = SearchRequest,
+    responses(
+        (status = 200, description = "Search results", body = [SearchDocumentResult]),
+        (status = 400, description = "Invalid input"),
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "Embedding provider failure")
+    )
+)]
+async fn search(
+    State(state): State<AppState>,
+    Json(body): Json<SearchRequest>,
+) -> Result<Json<Vec<SearchDocumentResult>>, (StatusCode, Json<Value>)> {
+    let query = body.query.trim().to_string();
+    if query.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "query must not be empty".to_string(),
+        ));
+    }
+
+    let limit = body.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    if limit == 0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "limit must be greater than 0".to_string(),
+        ));
+    }
+    if limit > MAX_SEARCH_LIMIT {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("limit must be less than or equal to {MAX_SEARCH_LIMIT}"),
+        ));
+    }
+
+    let include_location = body.include_location.unwrap_or(false);
+    let pool = state.pool().clone();
+    let embedding_client = state.embedding_client();
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        search_documents(
+            &pool,
+            embedding_client.as_ref(),
+            query,
+            limit,
+            include_location,
+        )
+    })
+    .await
+    .map_err(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("request panicked: {err}"),
+        )
+    })?;
+
+    match outcome {
+        Ok(response) => Ok(Json(response)),
+        Err(SearchFailure::BadGateway(message)) => Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "bad_gateway",
+            message,
+        )),
+        Err(SearchFailure::Internal(message)) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            message,
+        )),
+    }
 }
 
 /// Discriminated outcome of the ingest validation + enqueue step, produced
@@ -249,4 +367,96 @@ fn error_response(status: StatusCode, code: &str, message: String) -> (StatusCod
         status,
         Json(json!({ "error": { "code": code, "message": message } })),
     )
+}
+
+enum SearchFailure {
+    BadGateway(String),
+    Internal(String),
+}
+
+fn search_documents(
+    pool: &DbPool,
+    embedding_client: &dyn EmbeddingClient,
+    query: String,
+    limit: usize,
+    include_location: bool,
+) -> Result<Vec<SearchDocumentResult>, SearchFailure> {
+    let conn = pool
+        .get()
+        .map_err(|err| SearchFailure::Internal(format!("database error: {err}")))?;
+    let model = load_active_model(&conn)
+        .map_err(|err| SearchFailure::Internal(format!("failed to load active model: {err:#}")))?;
+
+    let vectors = embedding_client
+        .embed(&model, std::slice::from_ref(&query))
+        .map_err(|err| SearchFailure::BadGateway(format!("failed to embed query: {err:#}")))?;
+    let query_embedding = vectors.first().ok_or_else(|| {
+        SearchFailure::BadGateway("embedding provider returned no vectors".into())
+    })?;
+
+    let raw_limit = expanded_raw_limit(limit);
+    let hits = repository::search_documents_by_embedding(&conn, &model, query_embedding, raw_limit)
+        .map_err(|err| SearchFailure::Internal(format!("failed to run vector search: {err:#}")))?;
+    Ok(collapse_to_documents(hits, limit, include_location))
+}
+
+fn load_active_model(conn: &rusqlite::Connection) -> anyhow::Result<EmbeddingModel> {
+    let active_model_id = conn
+        .query_row(
+            "SELECT active_model_id
+             FROM embedding_search_state
+             WHERE singleton_id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("active embedding_search_state row is missing")?
+        .ok_or_else(|| anyhow!("active embedding_search_state row is missing"))?;
+
+    repository::find_model_by_id(conn, active_model_id)?
+        .ok_or_else(|| anyhow!("active model {active_model_id} does not exist"))
+}
+
+fn collapse_to_documents(
+    hits: Vec<DocumentSearchResult>,
+    limit: usize,
+    include_location: bool,
+) -> Vec<SearchDocumentResult> {
+    let mut seen_documents = HashSet::with_capacity(limit);
+    let mut results = Vec::with_capacity(limit);
+
+    for hit in hits {
+        if !seen_documents.insert(hit.document_id) {
+            continue;
+        }
+
+        let (byte_start, byte_end) = if include_location {
+            (Some(hit.chunk_start), Some(hit.chunk_end))
+        } else {
+            (None, None)
+        };
+
+        results.push(SearchDocumentResult {
+            filepath: hit.filepath,
+            match_score: distance_to_score(hit.distance),
+            byte_start,
+            byte_end,
+        });
+
+        if results.len() == limit {
+            break;
+        }
+    }
+
+    results
+}
+
+fn distance_to_score(distance: f64) -> f64 {
+    ((2.0 - distance) / 2.0).clamp(0.0, 1.0)
+}
+
+fn expanded_raw_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(SEARCH_RAW_LIMIT_MULTIPLIER)
+        .min(SEARCH_RAW_LIMIT_CAP)
 }

@@ -80,7 +80,8 @@ async fn main() -> Result<()> {
         "starting ask-server"
     );
 
-    let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?;
+    let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?
+        .with_embedding_client(embedding_client.clone());
 
     worker::spawn(pool.clone(), model.id, embedding_client);
     axum::serve(listener, http::router(app_state)).await?;
