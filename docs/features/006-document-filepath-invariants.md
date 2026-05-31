@@ -1,67 +1,83 @@
 # Document Filepath Invariants
 
-Document filepaths stored in `documents.filepath` are read by the worker and
-passed directly to `std::fs::read_to_string()`. The current DB contains
-relative paths (`./Cargo.toml`). The `IngestFolderHandler` stores absolute
-paths via `canonicalize()` (`worker.rs:413`), but there is no enforcement of
-this convention anywhere.
+## Goal
 
-The `documents` table schema (`0002_create_domain_tables.sql`) declares
-`filepath TEXT NOT NULL` — no constraint, no guidance on format.
+Make document file access boring and deterministic.
 
-A relative path is ambiguous without knowing the process working directory.
-Inside Docker, where WORKDIR=/app but files live at /resources, `./Cargo.toml`
-fails to resolve.
+The system should store one canonical filepath format, use that exact path at read
+ time, and fail clearly if the file is gone. Do not add compatibility layers,
+ fallback path resolution, or migration logic for old database contents.
 
-## Questions
+## Decision
 
-- Should `filepath` be an absolute path (resolved against the resource root at
-  ingest time), or a path relative to the resource root (resolved at read time)?
-  What are the trade-offs for portability, debugging, and implementation
-  complexity?
-- If absolute, how do existing relative-path entries get fixed — migration,
-  on-read resolution fallback, or manual re-ingest?
-- If relative-to-resource-root, how does the worker discover the resource root
-  without threading it through the entire job dispatch pipeline?
-- Could the path format constraint be expressed in the schema (CHECK
-  constraint), or is runtime validation more appropriate?
-- Is storing filepaths at all necessary for the worker's job? Could the chunk
-  content be persisted so the worker never needs to re-read files from disk?
-  This would eliminate path resolution entirely at the cost of storage.
-- What is the simplest set of invariants that makes the system work correctly
-  without adding layers of path-normalization code?
+- `documents.filepath` must store a canonical absolute path.
+- Ingest is responsible for establishing that invariant.
+- The worker must use the stored path directly.
+- If the file no longer exists or cannot be read, the worker should return a
+  normal file I/O error for that document.
+- Existing databases with relative paths are out of scope. The database can be
+  recreated instead of repaired.
 
-## Recommended Direction
+## Why This Design
 
-- Store canonical absolute paths in `documents.filepath`.
-- Make the stored path be the exact path the worker will later open.
-- Do not optimize for cross-machine portability of the SQLite file if that
-  makes the runtime contract ambiguous. The current deployment model is a local
-  mounted directory and a local database file.
+This is the smallest correct design for the current repo.
+
+- It keeps path normalization in one place: ingest.
+- It keeps worker logic simple.
+- It avoids threading a resource-root concept through unrelated code.
+- It avoids temporary compatibility paths that tend to become permanent.
+- It matches the current deployment model: local files, local database, local or
+  Docker-mounted resources.
+
+## Non-Goals
+
+- No startup repair pass for old relative rows.
+- No worker fallback that resolves relative paths against a resource root.
+- No schema-level path-format constraint beyond the existing column type.
+- No persisted chunk text as a workaround for path handling.
+- No portability goal for copying the SQLite database between different machines
+  or filesystem layouts.
+
+## Implementation Plan
+
+1. Ingest canonicalizes every discovered file path before inserting or updating a
+   `documents` row.
+2. Any ingest path that cannot be canonicalized fails early and does not create a
+   document row with an ambiguous path.
+3. The worker reads `documents.filepath` exactly as stored.
+4. The worker does not rewrite, normalize, or reinterpret stored paths.
+5. File read failures are returned with clear context so the job failure explains
+   which stored path could not be read.
+6. Any tests or fixtures that still assume relative filepaths must be updated to
+   use canonical absolute paths.
 
 ## Implementation Notes
 
-- Enforce the invariant at ingest boundaries, not at random read sites.
-- Runtime validation is probably enough; a DB-level absolute-path constraint is
-  harder to keep portable and does not replace canonicalization.
-- Existing relative rows need a repair strategy. The least risky path is either:
-  - a one-time migration/repair pass on startup, or
-  - a backward-compatibility fallback in the worker that resolves and rewrites
-    old relative rows once they are encountered
-- Do not move to persisted chunk text yet just to avoid path handling. That is
-  a larger storage and synchronization design change.
+- `std::fs::canonicalize()` should be the source of truth for normalization.
+- Store the canonicalized absolute path string, not the originally supplied path.
+- Keep the invariant at the boundary. Do not scatter additional path checks
+  across downstream code.
+- A missing file at embed time is a normal operational failure, not a signal to
+  guess another path.
+- If the application later needs true cross-machine portability, that should be
+  designed as a new feature with a different storage contract rather than added
+  as an exception to this one.
 
-## Dependencies and Sequencing
+## Test Plan
 
-- This should be decided before worker path resolution changes.
-- Search result text extraction also depends on the same invariant.
+- Unit test that ingest stores canonical absolute paths.
+- Regression test that worker reads a stored absolute path without applying any
+  resource-root or cwd-based fallback.
+- Integration test covering the Docker-style case where the process working
+  directory differs from the mounted resource location.
+- Regression test that a deleted file produces a clear controlled failure rather
+  than alternate path resolution.
 
-## Test Expectations
+## Acceptance Criteria
 
-- Test that ingest stores canonical absolute paths.
-- Regression test for a previously relative path being repaired or rejected in a
-  controlled way.
-- Integration test for the Docker-like resource-root case.
-
----
-_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
+- New `documents.filepath` values are canonical absolute paths.
+- Worker behavior does not depend on process working directory.
+- The system does not contain dual path-resolution strategies.
+- Deleted or unreadable files fail clearly and predictably.
+- No migration or compatibility code is introduced for legacy relative-path
+  database rows.
