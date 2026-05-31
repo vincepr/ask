@@ -5,6 +5,17 @@ services:
       dockerfile: crates/ask-server/Dockerfile
     container_name: ask-server
     user: "1000:1000"
+    command:
+      - sh
+      - -ceu
+      - |
+          if [ "${ASK_SERVER_EMBEDDING_MODE:-tei}" = "tei" ]; then
+            until wget -qO- http://tei/health >/dev/null; do
+              sleep 1
+            done
+          fi
+          echo "http://localhost:${ASK_SERVER_EXPOSE_PORT:-13000}"
+          exec ask-server
     environment:
       ASK_SERVER_BIND_HOST: 0.0.0.0
       ASK_SERVER_BIND_PORT: "3000"
@@ -13,6 +24,7 @@ services:
       ASK_SERVER_RESOURCE_DIR: /resources
       ASK_SERVER_EMBEDDING_MODEL: ${ASK_SERVER_EMBEDDING_MODEL:-onnx-community/Qwen3-Embedding-0.6B-ONNX}
       ASK_SERVER_EMBEDDING_DIMENSIONS: ${ASK_SERVER_EMBEDDING_DIMENSIONS:-1024}
+      ASK_SERVER_EMBEDDING_MAX_BATCH_SIZE: ${ASK_SERVER_EMBEDDING_MAX_BATCH_SIZE:-8}
       ASK_SERVER_EMBEDDING_MODE: ${ASK_SERVER_EMBEDDING_MODE:-tei}
       ASK_SERVER_EMBEDDING_BASE_URL: http://tei:80
       ASK_SERVER_EMBEDDING_AUTH_TOKEN: ${ASK_SERVER_EMBEDDING_AUTH_TOKEN:-}

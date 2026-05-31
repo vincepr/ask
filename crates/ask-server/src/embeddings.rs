@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use ask_core::models::EmbeddingModel;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::config::EmbeddingProvider;
 
@@ -35,6 +36,7 @@ pub type SharedEmbeddingClient = Arc<dyn EmbeddingClient>;
 #[derive(Debug, Clone)]
 pub struct HttpEmbeddingClient {
     provider: EmbeddingProvider,
+    max_batch_size: usize,
 }
 
 impl HttpEmbeddingClient {
@@ -43,6 +45,7 @@ impl HttpEmbeddingClient {
     /// # Arguments
     ///
     /// * `provider` - Provider mode and connection details.
+    /// * `max_batch_size` - Maximum number of inputs in one provider request.
     ///
     /// # Returns
     ///
@@ -51,8 +54,12 @@ impl HttpEmbeddingClient {
     /// # Errors
     ///
     /// Returns an error if provider configuration is invalid.
-    pub fn new(provider: EmbeddingProvider) -> Result<Self> {
-        Ok(Self { provider })
+    pub fn new(provider: EmbeddingProvider, max_batch_size: usize) -> Result<Self> {
+        ensure!(max_batch_size > 0, "max_batch_size must be greater than 0");
+        Ok(Self {
+            provider,
+            max_batch_size,
+        })
     }
 }
 
@@ -62,6 +69,30 @@ impl EmbeddingClient for HttpEmbeddingClient {
             return Ok(Vec::new());
         }
 
+        let client = Client::builder()
+            .build()
+            .context("failed to build embedding HTTP client")?;
+        let limit = self.max_batch_size;
+        embed_inputs_in_batches(inputs, limit, |batch, batch_index, start, end| {
+            debug!(
+                batch_index = batch_index + 1,
+                input_start = start,
+                input_end = end,
+                limit,
+                "sending batched embedding request"
+            );
+            self.embed_http_batch(&client, model, batch)
+        })
+    }
+}
+
+impl HttpEmbeddingClient {
+    fn embed_http_batch(
+        &self,
+        client: &Client,
+        model: &EmbeddingModel,
+        inputs: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
         let url = format!(
             "{}/embeddings",
             self.provider.base_url().trim_end_matches('/')
@@ -71,9 +102,6 @@ impl EmbeddingClient for HttpEmbeddingClient {
             input: inputs,
         };
 
-        let client = Client::builder()
-            .build()
-            .context("failed to build embedding HTTP client")?;
         let mut http_request = client.post(url).json(&request);
         if let EmbeddingProvider::OpenAi { auth_token, .. } = &self.provider {
             http_request = http_request.bearer_auth(auth_token);
@@ -101,31 +129,80 @@ impl EmbeddingClient for HttpEmbeddingClient {
 
         let decoded: EmbeddingResponse =
             serde_json::from_str(&body).context("failed to decode embedding provider response")?;
+        parse_response_vectors(decoded, model, inputs.len())
+    }
+}
 
-        let mut items = decoded.data;
-        items.sort_by_key(|item| item.index);
+fn parse_response_vectors(
+    decoded: EmbeddingResponse,
+    model: &EmbeddingModel,
+    expected_vectors: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let mut items = decoded.data;
+    items.sort_by_key(|item| item.index);
+
+    ensure!(
+        items.len() == expected_vectors,
+        "embedding provider returned {} vectors for {} inputs",
+        items.len(),
+        expected_vectors
+    );
+
+    let mut vectors = Vec::with_capacity(items.len());
+    for item in items {
+        ensure!(
+            item.embedding.len() == model.dimensions as usize,
+            "embedding provider returned {} dimensions for model {} (expected {})",
+            item.embedding.len(),
+            model.name,
+            model.dimensions
+        );
+        vectors.push(item.embedding);
+    }
+
+    Ok(vectors)
+}
+
+fn embed_inputs_in_batches<F>(
+    inputs: &[String],
+    max_batch_size: usize,
+    mut embed_batch: F,
+) -> Result<Vec<Vec<f32>>>
+where
+    F: FnMut(&[String], usize, usize, usize) -> Result<Vec<Vec<f32>>>,
+{
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let batch_size = max_batch_size;
+    let mut vectors = Vec::with_capacity(inputs.len());
+
+    for (batch_index, batch_inputs) in inputs.chunks(batch_size).enumerate() {
+        let start = batch_index * batch_size;
+        let end = start + batch_inputs.len();
+        let mut batch_vectors =
+            embed_batch(batch_inputs, batch_index, start, end).with_context(|| {
+                format!(
+                    "embedding batch {} failed for input range [{}..{})",
+                    batch_index + 1,
+                    start,
+                    end
+                )
+            })?;
 
         ensure!(
-            items.len() == inputs.len(),
-            "embedding provider returned {} vectors for {} inputs",
-            items.len(),
-            inputs.len()
+            batch_vectors.len() == batch_inputs.len(),
+            "embedding batch {} returned {} vectors for {} inputs",
+            batch_index + 1,
+            batch_vectors.len(),
+            batch_inputs.len()
         );
 
-        let mut vectors = Vec::with_capacity(items.len());
-        for item in items {
-            ensure!(
-                item.embedding.len() == model.dimensions as usize,
-                "embedding provider returned {} dimensions for model {} (expected {})",
-                item.embedding.len(),
-                model.name,
-                model.dimensions
-            );
-            vectors.push(item.embedding);
-        }
-
-        Ok(vectors)
+        vectors.append(&mut batch_vectors);
     }
+
+    Ok(vectors)
 }
 
 /// Deterministic embedding client for tests.
@@ -205,9 +282,12 @@ struct EmbeddingResponseItem {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::anyhow;
     use ask_core::models::EmbeddingModel;
 
-    use super::{DeterministicEmbeddingClient, EmbeddingClient};
+    use super::{DeterministicEmbeddingClient, EmbeddingClient, embed_inputs_in_batches};
 
     fn model() -> EmbeddingModel {
         EmbeddingModel {
@@ -244,5 +324,89 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("deterministic embedding failure"));
+    }
+
+    #[test]
+    fn batch_helper_keeps_exact_limit_in_single_batch() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let inputs = (0..32).map(|i| format!("input-{i}")).collect::<Vec<_>>();
+        let calls_for_closure = Arc::clone(&calls);
+
+        let vectors = embed_inputs_in_batches(&inputs, 32, move |batch, _, start, end| {
+            calls_for_closure
+                .lock()
+                .unwrap()
+                .push((batch.len(), start, end));
+            Ok(batch
+                .iter()
+                .map(|value| {
+                    vec![
+                        value
+                            .strip_prefix("input-")
+                            .unwrap()
+                            .parse::<f32>()
+                            .unwrap(),
+                    ]
+                })
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec![(32, 0, 32)]);
+        assert_eq!(vectors.len(), 32);
+        assert_eq!(vectors[0], vec![0.0]);
+        assert_eq!(vectors[31], vec![31.0]);
+    }
+
+    #[test]
+    fn batch_helper_splits_over_limit_and_preserves_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let inputs = (0..53).map(|i| format!("input-{i}")).collect::<Vec<_>>();
+        let calls_for_closure = Arc::clone(&calls);
+
+        let vectors = embed_inputs_in_batches(&inputs, 32, move |batch, _, start, end| {
+            calls_for_closure
+                .lock()
+                .unwrap()
+                .push((batch.len(), start, end));
+            Ok(batch
+                .iter()
+                .map(|value| {
+                    vec![
+                        value
+                            .strip_prefix("input-")
+                            .unwrap()
+                            .parse::<f32>()
+                            .unwrap(),
+                    ]
+                })
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec![(32, 0, 32), (21, 32, 53)]);
+        assert_eq!(vectors.len(), 53);
+        assert_eq!(vectors[0], vec![0.0]);
+        assert_eq!(vectors[31], vec![31.0]);
+        assert_eq!(vectors[32], vec![32.0]);
+        assert_eq!(vectors[52], vec![52.0]);
+    }
+
+    #[test]
+    fn batch_helper_adds_context_on_subrequest_failure() {
+        let inputs = (0..33).map(|i| format!("input-{i}")).collect::<Vec<_>>();
+
+        let err = embed_inputs_in_batches(&inputs, 32, |batch, batch_index, _, _| {
+            if batch_index == 1 {
+                Err(anyhow!("synthetic provider failure"))
+            } else {
+                Ok(batch.iter().map(|_| vec![1.0]).collect())
+            }
+        })
+        .unwrap_err();
+
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("embedding batch 2 failed for input range [32..33)"));
+        assert!(err_text.contains("synthetic provider failure"));
     }
 }

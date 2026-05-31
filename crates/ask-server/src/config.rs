@@ -9,6 +9,7 @@ pub const EMBEDDING_MODEL_ENV: &str = "ASK_SERVER_EMBEDDING_MODEL";
 pub const EMBEDDING_DIMENSIONS_ENV: &str = "ASK_SERVER_EMBEDDING_DIMENSIONS";
 pub const EMBEDDING_CHUNK_SIZE_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_SIZE";
 pub const EMBEDDING_CHUNK_OVERLAP_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_OVERLAP";
+pub const EMBEDDING_MAX_BATCH_SIZE_ENV: &str = "ASK_SERVER_EMBEDDING_MAX_BATCH_SIZE";
 pub const EMBEDDING_MODE_ENV: &str = "ASK_SERVER_EMBEDDING_MODE";
 pub const EMBEDDING_BASE_URL_ENV: &str = "ASK_SERVER_EMBEDDING_BASE_URL";
 pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
@@ -20,6 +21,7 @@ pub const DEFAULT_BIND_PORT: u16 = 3000;
 pub const DEFAULT_EMBEDDING_DIMENSIONS: i64 = 768;
 pub const DEFAULT_EMBEDDING_CHUNK_SIZE: i64 = 512;
 pub const DEFAULT_EMBEDDING_CHUNK_OVERLAP: i64 = 0;
+pub const DEFAULT_EMBEDDING_MAX_BATCH_SIZE: usize = 32;
 pub const DEFAULT_TEI_BASE_URL: &str = "http://localhost:18080";
 
 /// Embedding backend configuration loaded from the environment.
@@ -77,6 +79,8 @@ pub struct Config {
     pub embedding_chunk_size: i64,
     /// Token overlap between consecutive chunks.
     pub embedding_chunk_overlap: i64,
+    /// Maximum number of inputs to send in one embedding HTTP request.
+    pub embedding_max_batch_size: usize,
     /// Embedding provider configuration.
     pub embedding_provider: EmbeddingProvider,
 }
@@ -162,11 +166,21 @@ pub fn load() -> Result<Config> {
         })?,
         Err(_) => DEFAULT_EMBEDDING_CHUNK_OVERLAP,
     };
+    let embedding_max_batch_size = match std::env::var(EMBEDDING_MAX_BATCH_SIZE_ENV) {
+        Ok(raw) => raw.parse::<usize>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                EMBEDDING_MAX_BATCH_SIZE_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
+    };
     let embedding_provider = load_embedding_provider()?;
     validate_embedding_settings(
         embedding_dimensions,
         embedding_chunk_size,
         embedding_chunk_overlap,
+        embedding_max_batch_size,
     )?;
 
     Ok(Config {
@@ -178,6 +192,7 @@ pub fn load() -> Result<Config> {
         embedding_dimensions,
         embedding_chunk_size,
         embedding_chunk_overlap,
+        embedding_max_batch_size,
         embedding_provider,
     })
 }
@@ -232,6 +247,7 @@ fn validate_embedding_settings(
     embedding_dimensions: i64,
     embedding_chunk_size: i64,
     embedding_chunk_overlap: i64,
+    embedding_max_batch_size: usize,
 ) -> Result<()> {
     ensure!(
         embedding_dimensions > 0,
@@ -258,6 +274,12 @@ fn validate_embedding_settings(
         EMBEDDING_CHUNK_SIZE_ENV,
         embedding_chunk_overlap,
         embedding_chunk_size
+    );
+    ensure!(
+        embedding_max_batch_size > 0,
+        "{} must be greater than 0, got {}",
+        EMBEDDING_MAX_BATCH_SIZE_ENV,
+        embedding_max_batch_size
     );
 
     Ok(())

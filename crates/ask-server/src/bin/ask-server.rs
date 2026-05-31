@@ -65,7 +65,10 @@ async fn main() -> Result<()> {
     }
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
-    let embedding_client = Arc::new(HttpEmbeddingClient::new(config.embedding_provider.clone())?);
+    let embedding_client = Arc::new(HttpEmbeddingClient::new(
+        config.embedding_provider.clone(),
+        config.embedding_max_batch_size,
+    )?);
 
     info!(
         workspace = WORKSPACE_NAME,

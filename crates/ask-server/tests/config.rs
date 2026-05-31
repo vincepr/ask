@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ask_server::{
     config::{
         BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
-        DEFAULT_DATA_DIR, DEFAULT_TEI_BASE_URL, EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV,
-        EMBEDDING_CHUNK_OVERLAP_ENV, EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV,
+        DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL,
+        EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV, EMBEDDING_CHUNK_OVERLAP_ENV,
+        EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV, EMBEDDING_MAX_BATCH_SIZE_ENV,
         EMBEDDING_MODE_ENV, EMBEDDING_MODEL_ENV, EmbeddingProvider, load,
     },
     open_database,
@@ -43,6 +44,10 @@ fn load_uses_defaults_when_optional_env_is_missing() {
         config.embedding_model,
         "onnx-community/Qwen3-Embedding-0.6B-ONNX"
     );
+    assert_eq!(
+        config.embedding_max_batch_size,
+        DEFAULT_EMBEDDING_MAX_BATCH_SIZE
+    );
 }
 
 #[test]
@@ -54,6 +59,7 @@ fn load_uses_env_overrides_when_present() {
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "tei");
     let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "http://127.0.0.1:18080");
     let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
+    let _batch_guard = EnvVarGuard::set(EMBEDDING_MAX_BATCH_SIZE_ENV, "64");
 
     let config = load().expect("config load must succeed");
 
@@ -69,6 +75,7 @@ fn load_uses_env_overrides_when_present() {
         }
     );
     assert_eq!(config.embedding_model, "custom-model");
+    assert_eq!(config.embedding_max_batch_size, 64);
 }
 
 #[test]
@@ -188,6 +195,17 @@ fn load_rejects_empty_embedding_model() {
     let error = load().expect_err("config load must fail for empty embedding model");
 
     assert!(error.to_string().contains(EMBEDDING_MODEL_ENV));
+}
+
+#[test]
+fn load_rejects_zero_embedding_max_batch_size() {
+    let _env_lock = env_lock();
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
+    let _batch_guard = EnvVarGuard::set(EMBEDDING_MAX_BATCH_SIZE_ENV, "0");
+
+    let error = load().expect_err("config load must fail for non-positive max batch size");
+
+    assert!(error.to_string().contains(EMBEDDING_MAX_BATCH_SIZE_ENV));
 }
 
 #[test]
