@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_core::migrations;
-use ask_core::models::{DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderPayload};
+use ask_core::models::{
+    DEFAULT_FILE_PATTERN, EmbedDocumentPayload, EmbeddingIdentity, IngestFolderPayload,
+};
 use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
@@ -46,6 +48,47 @@ fn register_model_with_dimensions(
         created_at: now,
     };
     repository::insert_model(&conn, &model).unwrap()
+}
+
+#[test]
+fn embedding_identity_changes_create_distinct_model_rows() {
+    let db = TempDb::new();
+    let conn = db.pool().pool().get().unwrap();
+    let now = current_time();
+
+    let first = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "shared-model".to_string(),
+        dimensions: 1024,
+        chunk_size: 512,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    let second = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "shared-model".to_string(),
+        dimensions: 1024,
+        chunk_size: 256,
+        chunk_overlap: 0,
+        created_at: now + 1,
+    };
+
+    repository::insert_model(&conn, &first).unwrap();
+    repository::insert_model(&conn, &second).unwrap();
+
+    let found = repository::find_model_by_identity(
+        &conn,
+        &EmbeddingIdentity {
+            name: "shared-model".to_string(),
+            dimensions: 1024,
+            chunk_size: 256,
+            chunk_overlap: 0,
+        },
+    )
+    .unwrap()
+    .expect("identity-specific model row must be found");
+
+    assert_eq!(found.chunk_size, 256);
 }
 
 fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i64 {

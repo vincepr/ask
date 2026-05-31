@@ -1,6 +1,6 @@
 use ask_core::migrations;
 use ask_core::models::{
-    Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, JobQueueEntry,
+    Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingIdentity, EmbeddingModel, JobQueueEntry,
 };
 use ask_core::repository::{
     claim_job, complete_job, enqueue_job, find_document_by_id, find_document_by_path,
@@ -31,6 +31,73 @@ fn insert_embedding_model(conn: &Connection, id: i64, name: &str) {
         params![id, name],
     )
     .expect("embedding model insert must succeed");
+}
+
+#[test]
+fn find_model_by_identity_reuses_exact_match() {
+    let conn = setup_db();
+    insert_embedding_model(&conn, 7, "m7");
+
+    let identity = EmbeddingIdentity {
+        name: "m7".to_string(),
+        dimensions: 1,
+        chunk_size: 16,
+        chunk_overlap: 0,
+    };
+
+    let model = ask_core::repository::find_model_by_identity(&conn, &identity)
+        .unwrap()
+        .expect("exact identity must match");
+
+    assert_eq!(model.id, 7);
+}
+
+#[test]
+fn find_model_by_identity_rejects_dimension_drift() {
+    let conn = setup_db();
+    insert_embedding_model(&conn, 7, "m7");
+
+    let identity = EmbeddingIdentity {
+        name: "m7".to_string(),
+        dimensions: 2,
+        chunk_size: 16,
+        chunk_overlap: 0,
+    };
+
+    let model = ask_core::repository::find_model_by_identity(&conn, &identity).unwrap();
+    assert!(model.is_none());
+}
+
+#[test]
+fn find_model_by_identity_rejects_chunk_size_drift() {
+    let conn = setup_db();
+    insert_embedding_model(&conn, 7, "m7");
+
+    let identity = EmbeddingIdentity {
+        name: "m7".to_string(),
+        dimensions: 1,
+        chunk_size: 32,
+        chunk_overlap: 0,
+    };
+
+    let model = ask_core::repository::find_model_by_identity(&conn, &identity).unwrap();
+    assert!(model.is_none());
+}
+
+#[test]
+fn find_model_by_identity_rejects_chunk_overlap_drift() {
+    let conn = setup_db();
+    insert_embedding_model(&conn, 7, "m7");
+
+    let identity = EmbeddingIdentity {
+        name: "m7".to_string(),
+        dimensions: 1,
+        chunk_size: 16,
+        chunk_overlap: 1,
+    };
+
+    let model = ask_core::repository::find_model_by_identity(&conn, &identity).unwrap();
+    assert!(model.is_none());
 }
 
 fn enqueue(conn: &Connection, payload: &str, now: i64) -> anyhow::Result<()> {

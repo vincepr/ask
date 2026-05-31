@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::models::{
-    Document, DocumentSearchResult, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel,
-    JobQueueEntry,
+    Document, DocumentSearchResult, EmbedDocumentPayload, EmbeddedChunk, EmbeddingIdentity,
+    EmbeddingModel, JobQueueEntry,
 };
 use crate::types::*;
 
@@ -313,16 +313,7 @@ pub fn find_model_by_id(conn: &Connection, id: i64) -> Result<Option<EmbeddingMo
         .context("failed to prepare find_model_by_id")?;
 
     let mut rows = stmt
-        .query_map(params![id], |row| {
-            Ok(EmbeddingModel {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                dimensions: row.get(2)?,
-                chunk_size: row.get(3)?,
-                chunk_overlap: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })
+        .query_map(params![id], map_embedding_model)
         .context("failed to query model by id")?;
 
     match rows.next() {
@@ -339,17 +330,56 @@ pub fn find_model_by_name(conn: &Connection, name: &str) -> Result<Option<Embedd
         .context("failed to prepare find_model_by_name")?;
 
     let mut rows = stmt
-        .query_map(params![name], |row| {
-            Ok(EmbeddingModel {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                dimensions: row.get(2)?,
-                chunk_size: row.get(3)?,
-                chunk_overlap: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })
+        .query_map(params![name], map_embedding_model)
         .context("failed to query model by name")?;
+
+    match rows.next() {
+        Some(Ok(model)) => Ok(Some(model)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Find a model by its full embedding identity.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `identity` - Immutable embedding identity to match exactly.
+///
+/// # Returns
+///
+/// The matching persisted model row when present.
+///
+/// # Errors
+///
+/// Returns an error if the lookup query fails.
+pub fn find_model_by_identity(
+    conn: &Connection,
+    identity: &EmbeddingIdentity,
+) -> Result<Option<EmbeddingModel>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, dimensions, chunk_size, chunk_overlap, created_at
+             FROM embedding_models
+             WHERE name = ?1
+               AND dimensions = ?2
+               AND chunk_size = ?3
+               AND chunk_overlap = ?4",
+        )
+        .context("failed to prepare find_model_by_identity")?;
+
+    let mut rows = stmt
+        .query_map(
+            params![
+                &identity.name,
+                identity.dimensions,
+                identity.chunk_size,
+                identity.chunk_overlap,
+            ],
+            map_embedding_model,
+        )
+        .context("failed to query model by identity")?;
 
     match rows.next() {
         Some(Ok(model)) => Ok(Some(model)),
@@ -373,6 +403,17 @@ pub fn insert_model(conn: &Connection, model: &EmbeddingModel) -> Result<i64> {
     )
     .context("failed to insert model row")?;
     Ok(conn.last_insert_rowid())
+}
+
+fn map_embedding_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddingModel> {
+    Ok(EmbeddingModel {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        dimensions: row.get(2)?,
+        chunk_size: row.get(3)?,
+        chunk_overlap: row.get(4)?,
+        created_at: row.get(5)?,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -35,15 +35,16 @@ async fn main() -> Result<()> {
 
     let model = {
         let conn = pool.get()?;
-        match repository::find_model_by_name(&conn, &config.embedding_model)? {
+        let identity = config.embedding_identity();
+        match repository::find_model_by_identity(&conn, &identity)? {
             Some(m) => m,
             None => {
                 let m = EmbeddingModel {
                     id: 0,
-                    name: config.embedding_model.clone(),
-                    dimensions: config.embedding_dimensions,
-                    chunk_size: config.embedding_chunk_size,
-                    chunk_overlap: config.embedding_chunk_overlap,
+                    name: identity.name,
+                    dimensions: identity.dimensions,
+                    chunk_size: identity.chunk_size,
+                    chunk_overlap: identity.chunk_overlap,
                     created_at: now,
                 };
                 let model = EmbeddingModel {

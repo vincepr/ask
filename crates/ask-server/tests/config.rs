@@ -7,13 +7,13 @@ use ask_server::{
         BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
         DEFAULT_DATA_DIR, DEFAULT_TEI_BASE_URL, EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV,
         EMBEDDING_CHUNK_OVERLAP_ENV, EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV,
-        EMBEDDING_MODE_ENV, EmbeddingProvider, load,
+        EMBEDDING_MODE_ENV, EMBEDDING_MODEL_ENV, EmbeddingProvider, load,
     },
     open_database,
 };
 
 #[test]
-fn load_uses_defaults_when_env_is_missing() {
+fn load_uses_defaults_when_optional_env_is_missing() {
     let _env_lock = env_lock();
     let _data_dir_guard = EnvVarGuard::unset(DATA_DIR_ENV);
     let _host_guard = EnvVarGuard::unset(BIND_HOST_ENV);
@@ -21,6 +21,10 @@ fn load_uses_defaults_when_env_is_missing() {
     let _mode_guard = EnvVarGuard::unset(EMBEDDING_MODE_ENV);
     let _base_url_guard = EnvVarGuard::unset(EMBEDDING_BASE_URL_ENV);
     let _token_guard = EnvVarGuard::unset(EMBEDDING_AUTH_TOKEN_ENV);
+    let _model_guard = EnvVarGuard::set(
+        EMBEDDING_MODEL_ENV,
+        "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+    );
 
     let config = load().expect("config load must succeed");
 
@@ -35,6 +39,10 @@ fn load_uses_defaults_when_env_is_missing() {
             base_url: String::from(DEFAULT_TEI_BASE_URL),
         }
     );
+    assert_eq!(
+        config.embedding_model,
+        "onnx-community/Qwen3-Embedding-0.6B-ONNX"
+    );
 }
 
 #[test]
@@ -45,6 +53,7 @@ fn load_uses_env_overrides_when_present() {
     let _port_guard = EnvVarGuard::set(BIND_PORT_ENV, "4123");
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "tei");
     let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "http://127.0.0.1:18080");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let config = load().expect("config load must succeed");
 
@@ -59,12 +68,14 @@ fn load_uses_env_overrides_when_present() {
             base_url: String::from("http://127.0.0.1:18080"),
         }
     );
+    assert_eq!(config.embedding_model, "custom-model");
 }
 
 #[test]
 fn load_rejects_invalid_bind_port() {
     let _env_lock = env_lock();
     let _port_guard = EnvVarGuard::set(BIND_PORT_ENV, "invalid-port");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail for invalid port");
 
@@ -77,6 +88,7 @@ fn load_requires_openai_credentials_in_openai_mode() {
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "openai");
     let _base_url_guard = EnvVarGuard::unset(EMBEDDING_BASE_URL_ENV);
     let _token_guard = EnvVarGuard::unset(EMBEDDING_AUTH_TOKEN_ENV);
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "text-embedding-3-small");
 
     let error = load().expect_err("config load must fail without openai credentials");
 
@@ -89,6 +101,7 @@ fn load_uses_openai_provider_when_fully_configured() {
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "openai");
     let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "https://api.openai.example/v1");
     let _token_guard = EnvVarGuard::set(EMBEDDING_AUTH_TOKEN_ENV, "secret-token");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "text-embedding-3-small");
 
     let config = load().expect("config load must succeed");
 
@@ -105,6 +118,7 @@ fn load_uses_openai_provider_when_fully_configured() {
 fn load_rejects_unknown_embedding_mode() {
     let _env_lock = env_lock();
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "unknown");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail for unknown embedding mode");
 
@@ -115,6 +129,7 @@ fn load_rejects_unknown_embedding_mode() {
 fn load_rejects_non_positive_embedding_dimensions() {
     let _env_lock = env_lock();
     let _dimensions_guard = EnvVarGuard::set(EMBEDDING_DIMENSIONS_ENV, "0");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail for non-positive dimensions");
 
@@ -125,6 +140,7 @@ fn load_rejects_non_positive_embedding_dimensions() {
 fn load_rejects_non_positive_embedding_chunk_size() {
     let _env_lock = env_lock();
     let _chunk_size_guard = EnvVarGuard::set(EMBEDDING_CHUNK_SIZE_ENV, "-1");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail for non-positive chunk size");
 
@@ -135,6 +151,7 @@ fn load_rejects_non_positive_embedding_chunk_size() {
 fn load_rejects_negative_embedding_chunk_overlap() {
     let _env_lock = env_lock();
     let _chunk_overlap_guard = EnvVarGuard::set(EMBEDDING_CHUNK_OVERLAP_ENV, "-1");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail for negative chunk overlap");
 
@@ -146,10 +163,31 @@ fn load_rejects_embedding_chunk_overlap_equal_to_chunk_size() {
     let _env_lock = env_lock();
     let _chunk_size_guard = EnvVarGuard::set(EMBEDDING_CHUNK_SIZE_ENV, "32");
     let _chunk_overlap_guard = EnvVarGuard::set(EMBEDDING_CHUNK_OVERLAP_ENV, "32");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
 
     let error = load().expect_err("config load must fail when overlap matches chunk size");
 
     assert!(error.to_string().contains(EMBEDDING_CHUNK_OVERLAP_ENV));
+}
+
+#[test]
+fn load_requires_embedding_model() {
+    let _env_lock = env_lock();
+    let _model_guard = EnvVarGuard::unset(EMBEDDING_MODEL_ENV);
+
+    let error = load().expect_err("config load must fail without embedding model");
+
+    assert!(error.to_string().contains(EMBEDDING_MODEL_ENV));
+}
+
+#[test]
+fn load_rejects_empty_embedding_model() {
+    let _env_lock = env_lock();
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "   ");
+
+    let error = load().expect_err("config load must fail for empty embedding model");
+
+    assert!(error.to_string().contains(EMBEDDING_MODEL_ENV));
 }
 
 #[test]

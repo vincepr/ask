@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         required_actions: None,
         sql: include_str!("../migrations/0005_create_embedding_search_state.sql"),
     },
+    Migration {
+        version: 6,
+        required_actions: None,
+        sql: include_str!("../migrations/0006_rebuild_embedding_model_identity.sql"),
+    },
 ];
 
 /// Applies every embedded migration that has not yet been recorded.

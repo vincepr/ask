@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use ask_core::models::EmbeddingIdentity;
 
 pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
 pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
@@ -16,7 +17,6 @@ pub const DEFAULT_DATA_DIR: &str = ".data";
 pub const DEFAULT_RESOURCE_DIR: &str = ".";
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_BIND_PORT: u16 = 3000;
-pub const DEFAULT_EMBEDDING_MODEL: &str = "default";
 pub const DEFAULT_EMBEDDING_DIMENSIONS: i64 = 768;
 pub const DEFAULT_EMBEDDING_CHUNK_SIZE: i64 = 512;
 pub const DEFAULT_EMBEDDING_CHUNK_OVERLAP: i64 = 0;
@@ -96,6 +96,17 @@ impl Config {
             self.data_dir.trim_end_matches(&['/', '\\'][..])
         )
     }
+
+    /// Returns the immutable embedding identity derived from configuration.
+    #[must_use]
+    pub fn embedding_identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            name: self.embedding_model.clone(),
+            dimensions: self.embedding_dimensions,
+            chunk_size: self.embedding_chunk_size,
+            chunk_overlap: self.embedding_chunk_overlap,
+        }
+    }
 }
 
 /// Loads server configuration from environment variables.
@@ -120,7 +131,10 @@ pub fn load() -> Result<Config> {
         Err(_) => DEFAULT_BIND_PORT,
     };
     let embedding_model = std::env::var(EMBEDDING_MODEL_ENV)
-        .unwrap_or_else(|_| String::from(DEFAULT_EMBEDDING_MODEL));
+        .map_err(|_| anyhow!("{} must be set", EMBEDDING_MODEL_ENV))?;
+    if embedding_model.trim().is_empty() {
+        bail!("{} must not be empty", EMBEDDING_MODEL_ENV);
+    }
     let embedding_dimensions = match std::env::var(EMBEDDING_DIMENSIONS_ENV) {
         Ok(raw) => raw.parse::<i64>().with_context(|| {
             format!(

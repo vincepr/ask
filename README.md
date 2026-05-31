@@ -35,6 +35,7 @@ SQLite database file and additional markdown knowledge files.
 `ask-server` now supports two embedding provider modes through environment configuration.
 
 - mode env var: `ASK_SERVER_EMBEDDING_MODE`
+- model env var: `ASK_SERVER_EMBEDDING_MODEL`
 - supported modes: `tei`, `openai`
 - TEI base URL env var: `ASK_SERVER_EMBEDDING_BASE_URL`
 - TEI default base URL: `http://tei:80`
