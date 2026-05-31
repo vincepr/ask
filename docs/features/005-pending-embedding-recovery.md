@@ -1,73 +1,90 @@
-# Orphaned Pending Embeddings on Restart
+# Pending Embedding Recovery
 
-When the embedding model already exists in the DB at startup,
-`backfill_pending_for_model()` (`worker.rs:94-116`) is not called — it only
-runs for newly inserted models (`ask-server.rs:35-57`).
+## Goal
 
-After a failed run (TEI offline, dimension mismatch, etc.), the
-`document_embeddings` table can have rows in `state=pending` with no
-corresponding jobs in `job_queue`. There is no mechanism to re-enqueue them
-automatically.
+Recover missing embedding work automatically after restart.
 
-Observed state after the dimension mismatch failure:
-- `document_embeddings state=pending`: 167 rows
-- `job_queue`: empty
+If `document_embeddings` contains rows in a recoverable non-complete state but
+ there is no runnable `embed_document` job for that document/model pair, startup
+ should recreate the missing work without operator intervention.
 
-The `POST /documents/stale` endpoint can re-trigger embedding, but it requires
-manual intervention and knowing which document IDs to pass.
+## Decision
 
-## Questions
+- Recovery runs on every startup.
+- Recovery is derived from persistent database state.
+- Recovery is idempotent.
+- Recovery only recreates missing `embed_document` jobs.
+- This feature does not redesign the queue model, retry policy, or failure
+  backoff behavior.
 
-- Is this an edge case that only happens during development when providers are
-  misconfigured, or is it a real failure mode that production deployments will
-  encounter?
-- If real, should the server detect orphaned pending embeddings on startup and
-  re-enqueue jobs automatically? What would that check look like without adding
-  expensive queries?
-- Should the worker track failure counts and re-queue after a backoff, or is a
-  simple stale-timeout mechanism sufficient?
-- Should the `backfill_pending_for_model` logic be idempotent and safe to call
-  even for existing models, eliminating the "only on insert" constraint?
-- Is there a design where pending state cannot exist without a corresponding
-  job (e.g., atomic enqueue + state change, or no pending state at all —
-  just jobs)?
-- Given that the user's `.data/` directory is persistent across restarts, what
-  recovery semantics should the system guarantee?
+## Why This Design
 
-## Recommended Direction
+This is the smallest self-healing fix for the current failure mode.
 
-- Make startup recovery idempotent and safe to run on every boot.
-- Treat "pending embeddings without runnable jobs" as recoverable state, not as
-  an operator problem.
-- Prefer deriving recovery work from persistent state instead of keeping more
-  bookkeeping in memory.
+- It repairs broken state caused by previous failed runs.
+- It does not require new background daemons, retry counters, or queue
+  abstractions.
+- It makes restart behavior predictable for a persistent local `.data/`
+  directory.
+- It keeps the recovery rule explicit: pending work without a runnable job gets a
+  job again.
+
+## Non-Goals
+
+- No queue architecture redesign.
+- No retry scheduling or exponential backoff.
+- No per-failure counters.
+- No attempt to make `pending` impossible as a state.
+- No special-case operator workflow through manual endpoints.
+
+## Recovery Rule
+
+At startup, for each distinct `(document_id, model_id)` pair with at least one
+ `document_embeddings` row in a recoverable state such as `pending` or `stale`:
+
+- if a runnable `embed_document` job already exists for that pair, do nothing
+- otherwise enqueue one `embed_document` job for that pair
+
+The recovery pass must be safe to run repeatedly.
+
+## Implementation Plan
+
+1. Extract a single repository query that finds distinct document/model pairs
+   with recoverable embedding rows.
+2. Extract or add a repository query that detects whether a runnable
+   `embed_document` job already exists for a given document/model pair.
+3. At startup, run one recovery pass that compares those two sets and enqueues
+   only the missing jobs.
+4. Reuse the same enqueue path already used for normal embedding work so the
+   system has one job creation mechanism.
+5. Keep the recovery call unconditional and idempotent so startup behavior does
+   not depend on whether the model row was newly created in this boot.
+6. Keep the scope at document/model granularity rather than trying to enqueue
+   work per embedding row.
 
 ## Implementation Notes
 
-- The simplest recovery path is likely:
-  - scan for distinct document/model pairs with `document_embeddings.state` in
-    `pending` or `stale`
-  - enqueue missing `embed_document` jobs only when no live claim already exists
-  - make the enqueue operation idempotent
-- If possible, unify "new model backfill" and "startup recovery" behind one
-  code path rather than maintaining separate partial mechanisms.
-- Long term, consider whether `pending` should exist independently from a job at
-  all. Short term, do not redesign the whole queue if an idempotent repair pass
-  solves the operational problem.
+- Prefer one shared code path over separate "new model backfill" and "restart
+  recovery" mechanisms if the existing code can be simplified that way.
+- Keep the recovery logic close to startup state reconciliation rather than
+  inside the worker loop.
+- Do not create duplicate jobs when one is already queued or claimed.
+- Treat `pending` and `stale` as recoverable states only if that matches current
+  worker semantics; do not invent new state meanings in this feature.
 
-## Dependencies and Sequencing
+## Test Plan
 
-- This becomes more predictable after transient-failure handling is defined in
-  [004-embedding-provider-readiness.md](/home/vince/ask/docs/features/004-embedding-provider-readiness.md).
-- Startup state flow in
-  [008-startup-ingest-state-flow.md](/home/vince/ask/docs/features/008-startup-ingest-state-flow.md)
-  should reuse the same recovery behavior instead of inventing a second one.
+- Regression test for startup with pending rows and no jobs: recovery enqueues
+  one job per affected document/model pair.
+- Regression test that running recovery twice does not create duplicate jobs.
+- Regression test that an existing queued or claimed job prevents duplicate job
+  creation.
+- Regression test that completed embeddings do not create recovery jobs.
 
-## Test Expectations
+## Acceptance Criteria
 
-- Regression test for pending rows with no jobs on startup.
-- Test that running recovery twice does not duplicate jobs.
-- Test that existing live jobs are not duplicated by the recovery pass.
-
----
-_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
+- Restarting the server repairs orphaned pending embedding work automatically.
+- Recovery can run on every startup without duplicate job creation.
+- Recovery does not require manual use of a stale-documents endpoint.
+- The implementation stays small and uses the existing queue model rather than
+  introducing a second scheduling system.
