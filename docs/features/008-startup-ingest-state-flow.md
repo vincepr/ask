@@ -90,5 +90,46 @@ index ... backfilled=0" — accurate, but silent on what the user should do next
 - The user expects the server to "just work" pointing at a directory of files,
   but nothing happens until they discover the API.
 
+## Recommended Direction
+
+- Keep the startup story explicit and simple.
+- Prefer a small amount of self-healing startup behavior over a silent healthy
+  but inert process.
+- Do not add continuous watchers or background orchestration unless the simpler
+  startup recovery path proves insufficient.
+
+## Implementation Notes
+
+- A good first step is not full auto-ingest. It is:
+  - detect and log actionable state on startup
+  - recover pending/backfill work automatically
+  - make "no documents indexed yet" visible through logs or status
+- If auto-ingest is added, keep it narrow and idempotent:
+  - operate on the configured resource root only
+  - avoid duplicate document rows
+  - avoid surprise destructive behavior
+- A reasonable decision boundary is:
+  - if there are zero documents, startup may enqueue an ingest for the resource
+    root
+  - if documents already exist, rely on normal ingest and recovery semantics
+- Reuse the same queueing/backfill code path as manual ingest where possible.
+  Startup should not invent a second ingestion mechanism.
+
+## Dependencies and Sequencing
+
+- Depends on pending-recovery behavior in
+  [005-pending-embedding-recovery.md](/home/vince/ask/docs/features/005-pending-embedding-recovery.md).
+- Path behavior from
+  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md)
+  matters if startup ever re-ingests automatically.
+
+## Test Expectations
+
+- Startup test for empty DB with no documents.
+- Startup test for empty DB with documents available under the configured
+  resource root.
+- Regression test that startup recovery does not duplicate previously ingested
+  documents.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

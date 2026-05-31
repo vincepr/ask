@@ -34,5 +34,40 @@ manual intervention and knowing which document IDs to pass.
 - Given that the user's `.data/` directory is persistent across restarts, what
   recovery semantics should the system guarantee?
 
+## Recommended Direction
+
+- Make startup recovery idempotent and safe to run on every boot.
+- Treat "pending embeddings without runnable jobs" as recoverable state, not as
+  an operator problem.
+- Prefer deriving recovery work from persistent state instead of keeping more
+  bookkeeping in memory.
+
+## Implementation Notes
+
+- The simplest recovery path is likely:
+  - scan for distinct document/model pairs with `document_embeddings.state` in
+    `pending` or `stale`
+  - enqueue missing `embed_document` jobs only when no live claim already exists
+  - make the enqueue operation idempotent
+- If possible, unify "new model backfill" and "startup recovery" behind one
+  code path rather than maintaining separate partial mechanisms.
+- Long term, consider whether `pending` should exist independently from a job at
+  all. Short term, do not redesign the whole queue if an idempotent repair pass
+  solves the operational problem.
+
+## Dependencies and Sequencing
+
+- This becomes more predictable after transient-failure handling is defined in
+  [004-embedding-provider-readiness.md](/home/vince/ask/docs/features/004-embedding-provider-readiness.md).
+- Startup state flow in
+  [008-startup-ingest-state-flow.md](/home/vince/ask/docs/features/008-startup-ingest-state-flow.md)
+  should reuse the same recovery behavior instead of inventing a second one.
+
+## Test Expectations
+
+- Regression test for pending rows with no jobs on startup.
+- Test that running recovery twice does not duplicate jobs.
+- Test that existing live jobs are not duplicated by the recovery pass.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

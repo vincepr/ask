@@ -38,5 +38,39 @@ that value is never passed to the worker.
   should they be enforced — the DB schema, the repository layer, or the
   caller?
 
+## Recommended Direction
+
+- Make this a compatibility and cleanup feature, not the primary place where
+  path semantics are defined.
+- After `documents.filepath` is defined as canonical absolute paths, the worker
+  should mostly just open the stored path directly.
+
+## Implementation Notes
+
+- If backward compatibility for existing relative rows is needed, thread the
+  configured resource root into the worker only as a migration aid, not as the
+  long-term steady-state contract.
+- A pragmatic recovery flow is:
+  - detect a relative stored path
+  - resolve it against the configured resource root
+  - if the resolved file exists, use it and repair the stored row
+  - if not, fail clearly instead of silently reading from CWD
+- Avoid changing container `WORKDIR` as the main fix. That hides the data-model
+  ambiguity instead of removing it.
+
+## Dependencies and Sequencing
+
+- Depends on
+  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md)
+  for the steady-state invariant.
+- Search endpoint work will benefit from the same read-path semantics.
+
+## Test Expectations
+
+- Regression test for a legacy relative DB path resolved against the resource
+  root.
+- Test that successful fallback repairs the stored path.
+- Test that an unresolved relative path produces a deterministic error.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

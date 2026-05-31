@@ -30,5 +30,33 @@ worked normally.
 - Is there a way to make the startup more resilient to this class of failure,
   or is the correct response always "clean up and retry"?
 
+## Recommended Direction
+
+- Treat this as an operational recovery/documentation feature, not an
+  application-code feature.
+- Favor a documented cleanup workflow over adding repo complexity to compensate
+  for stale local Docker state.
+
+## Implementation Notes
+
+- The most useful fix is likely documentation or a helper command that makes the
+  cleanup action explicit:
+  - `docker compose down --remove-orphans`
+  - targeted removal for known stale containers
+- Avoid static `container_name` settings as a general solution. They often make
+  parallel development and multiple project copies worse.
+- An explicit named network may improve debuggability but does not eliminate
+  orphan-container cleanup needs by itself.
+
+## Dependencies and Sequencing
+
+- Lowest implementation priority. It does not block core repo behavior once a
+  developer's local Docker state is clean.
+
+## Test Expectations
+
+- This is primarily a docs/ops feature. If implemented in code or scripts, add
+  tests for the helper behavior where practical.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

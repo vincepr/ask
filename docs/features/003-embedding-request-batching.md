@@ -1,4 +1,4 @@
-# TEI Provider Integration: Request Batch Limit and Model Name Mismatch
+# Embedding Request Batching and Provider Model ID Handling
 
 ## Logs
 
@@ -149,6 +149,46 @@ provider limits.
   model row or mutate the existing row and trigger re-embedding?
 - Should startup validate TEI metadata early and fail fast when the configured
   model id is not provider-valid?
+
+## Recommended Direction
+
+- Keep the worker oblivious to provider-specific request limits.
+- Put request splitting in the embedding client layer so:
+  - provider-specific limits stay close to provider-specific HTTP behavior
+  - callers keep a simple `embed(inputs) -> vectors` contract
+  - the same logic can later support both TEI and external OpenAI-compatible
+    providers
+- Preserve input order across batches and flatten results deterministically.
+
+## Implementation Notes
+
+- Split on provider request size first. Do not add token-aware batching yet
+  unless it is required by a real failing case. Count-based batching is the
+  smallest correct fix for the current TEI error.
+- The embedding client should return a single vector list whose order matches
+  the original input slice exactly.
+- If any sub-request fails, treat the whole embed call as failed and return the
+  provider error with enough context to identify which batch failed.
+- After the model-contract feature lands, use a provider model id for the HTTP
+  request instead of forwarding the internal registry key.
+- For TEI specifically, allowing an empty model field may be simpler and more
+  robust than forwarding a synthetic name.
+
+## Dependencies and Sequencing
+
+- Depends on [002-embedding-model-contract.md](/home/vince/ask/docs/features/002-embedding-model-contract.md)
+  for the provider model id and stable contract semantics.
+- Should land before readiness/retry work so permanent request-shape failures do
+  not get misclassified as transient.
+
+## Test Expectations
+
+- Unit test for empty input.
+- Unit test for exactly-limit input count.
+- Regression test for over-limit input count split into multiple requests.
+- Regression test that vector order matches input order after batching.
+- Integration test proving an `embed_document` job with more than 32 chunks
+  succeeds once batching is enabled.
 
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

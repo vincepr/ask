@@ -31,5 +31,39 @@ automatically set the corresponding container environment variable.
 - What is the minimum set of env vars needed in docker-compose.yml to make the
   stack work correctly without surprises?
 
+## Recommended Direction
+
+- Make `docker-compose.yml` the explicit source of truth for container
+  environment passed into `ask-server`.
+- Avoid relying on app defaults for values that are required for the Docker
+  deployment to function correctly.
+- Keep the number of configuration layers low. Extra env files add indirection
+  quickly.
+
+## Implementation Notes
+
+- Prefer explicitly listing the application env vars needed by the container,
+  even if some simply forward compose variables through.
+- Separate two concerns clearly:
+  - variables used by Compose for template substitution
+  - variables actually injected into the container process
+- Keep local non-Docker development simple by documenting the smaller `.env`
+  contract there, instead of making Docker behavior implicit.
+- If a value differs between local runs and Docker runs, that difference should
+  be visible in `docker-compose.yml`, not hidden in code defaults.
+
+## Dependencies and Sequencing
+
+- This is lower priority than the core embedding and recovery work because it is
+  mostly a deployment-surface cleanup.
+- It does, however, remove confusion around provider settings needed by the
+  earlier embedding features.
+
+## Test Expectations
+
+- Config-loading tests for Docker-specific environment combinations.
+- At minimum, a documented smoke path that proves the Compose environment
+  injects all required embedding settings.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

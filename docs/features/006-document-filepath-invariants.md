@@ -31,5 +31,37 @@ fails to resolve.
 - What is the simplest set of invariants that makes the system work correctly
   without adding layers of path-normalization code?
 
+## Recommended Direction
+
+- Store canonical absolute paths in `documents.filepath`.
+- Make the stored path be the exact path the worker will later open.
+- Do not optimize for cross-machine portability of the SQLite file if that
+  makes the runtime contract ambiguous. The current deployment model is a local
+  mounted directory and a local database file.
+
+## Implementation Notes
+
+- Enforce the invariant at ingest boundaries, not at random read sites.
+- Runtime validation is probably enough; a DB-level absolute-path constraint is
+  harder to keep portable and does not replace canonicalization.
+- Existing relative rows need a repair strategy. The least risky path is either:
+  - a one-time migration/repair pass on startup, or
+  - a backward-compatibility fallback in the worker that resolves and rewrites
+    old relative rows once they are encountered
+- Do not move to persisted chunk text yet just to avoid path handling. That is
+  a larger storage and synchronization design change.
+
+## Dependencies and Sequencing
+
+- This should be decided before worker path resolution changes.
+- Search result text extraction also depends on the same invariant.
+
+## Test Expectations
+
+- Test that ingest stores canonical absolute paths.
+- Regression test for a previously relative path being repaired or rejected in a
+  controlled way.
+- Integration test for the Docker-like resource-root case.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

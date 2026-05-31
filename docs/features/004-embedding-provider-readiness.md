@@ -78,5 +78,45 @@ not discoverable.
 - Does the docker-compose healthcheck ordering (`depends_on` + `condition`)
   solve enough to defer the code-level changes?
 
+## Recommended Direction
+
+- Fix this at two layers:
+  - compose/startup ordering to reduce the failure window
+  - code-level transient-failure recovery so the system self-heals if the
+    provider goes down later
+- Do not rely on logs plus manual restart as the recovery mechanism.
+
+## Implementation Notes
+
+- The smallest durable code fix is usually:
+  - classify connection errors and timeouts as transient
+  - avoid burning a 24-hour claim on transient failures
+  - apply a bounded retry cooldown to avoid hot loops
+- Prefer a persisted retry timestamp over purely in-memory backoff. Recovery
+  semantics should survive process restarts.
+- If a provider exposes a health endpoint, it is reasonable to skip claim
+  attempts while the provider is unhealthy. For providers without a health
+  endpoint, network/timeout classification still needs to work.
+- Keep permanent failures distinct from transient failures:
+  - malformed payload
+  - provider 4xx validation errors caused by request shape
+  - dimension mismatches after contract validation
+  should not be retried blindly.
+
+## Dependencies and Sequencing
+
+- This should follow request-shape fixes such as batching, otherwise permanent
+  TEI validation failures may look like transient provider instability.
+- This interacts directly with pending-embedding recovery in
+  [005-pending-embedding-recovery.md](/home/vince/ask/docs/features/005-pending-embedding-recovery.md).
+
+## Test Expectations
+
+- Regression test for provider-unavailable startup where jobs eventually
+  complete without manual restart.
+- Test that transient failures do not leave claims stuck for the full stale
+  timeout.
+- Test that permanent provider validation failures are not retried forever.
+
 ---
 _This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
