@@ -18,7 +18,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ask-core ./crates/ask-core
 COPY crates/ask-server ./crates/ask-server
 
-RUN cargo build --locked --release --quiet -p ask-server --bin ask-server
+RUN cargo build --locked --release -p ask-server --bin ask-server
 
 # NOTE: Runtime image stays on Debian/glibc for now because Alpine/musl builds
 # currently fail in `sqlite-vec` C compilation (`u_int8_t`/`uint8_t` errors).
