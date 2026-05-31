@@ -8,9 +8,9 @@ use ask_core::models::{
     DEFAULT_FILE_PATTERN, EmbedDocumentPayload, EmbeddingIdentity, IngestFolderPayload,
 };
 use ask_core::repository;
-use ask_core::types::DocCategory;
-use ask_core::types::JobType;
+use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
+use ask_server::startup::reconcile_embedding_startup;
 use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http};
@@ -223,6 +223,78 @@ fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn embedding_identity(name: &str, dimensions: i64) -> EmbeddingIdentity {
+    EmbeddingIdentity {
+        name: name.to_string(),
+        dimensions,
+        chunk_size: 512,
+        chunk_overlap: 0,
+    }
+}
+
+fn insert_embedding_row(
+    conn: &rusqlite::Connection,
+    document_id: i64,
+    model_id: i64,
+    chunk_type: ChunkType,
+    chunk_start: i64,
+    chunk_end: i64,
+    state: EmbedState,
+    now: i64,
+) {
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            document_id,
+            model_id,
+            chunk_type,
+            chunk_start,
+            chunk_end,
+            state,
+            now
+        ],
+    )
+    .unwrap();
+}
+
+fn enqueue_embed_document_job(
+    conn: &rusqlite::Connection,
+    document_id: i64,
+    model_id: i64,
+    now: i64,
+) {
+    repository::enqueue_job(
+        conn,
+        &JobType::EmbedDocument,
+        &serde_json::to_string(&EmbedDocumentPayload {
+            document_id,
+            model_id,
+        })
+        .unwrap(),
+        now,
+    )
+    .unwrap();
+}
+
+fn queued_embed_jobs(conn: &rusqlite::Connection) -> Vec<EmbedDocumentPayload> {
+    conn.prepare(
+        "SELECT payload
+         FROM job_queue
+         WHERE job_type = ?1
+         ORDER BY payload ASC",
+    )
+    .unwrap()
+    .query_map([JobType::EmbedDocument], |row| {
+        let payload: String = row.get(0)?;
+        Ok(serde_json::from_str(&payload).expect("embed payload must decode"))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,6 +1702,232 @@ async fn new_model_backfill_queues_filename_and_content_embeddings_for_existing_
         content_emb, 2,
         "text content should be backfilled with the normal chunk plan"
     );
+}
+
+#[test]
+fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_a = insert_document(&db.pool(), now, &db.create_file("pending-a.txt"));
+    let doc_b = insert_document(&db.pool(), now, &db.create_file("pending-b.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-pending");
+    let conn = db.pool().get().unwrap();
+
+    insert_embedding_row(
+        &conn,
+        doc_a,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Pending,
+        now,
+    );
+    insert_embedding_row(
+        &conn,
+        doc_a,
+        model_id,
+        ChunkType::Content,
+        0,
+        7,
+        EmbedState::Pending,
+        now,
+    );
+    insert_embedding_row(
+        &conn,
+        doc_b,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Pending,
+        now,
+    );
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-pending", 768), now)
+            .unwrap();
+
+    assert_eq!(startup.backfilled_documents, 0);
+    assert_eq!(startup.seeded_jobs, 2);
+    assert_eq!(
+        queued_embed_jobs(&conn),
+        vec![
+            EmbedDocumentPayload {
+                document_id: doc_a,
+                model_id,
+            },
+            EmbedDocumentPayload {
+                document_id: doc_b,
+                model_id,
+            },
+        ]
+    );
+}
+
+#[test]
+fn startup_recovery_seeds_jobs_for_existing_stale_rows() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_id = insert_document(&db.pool(), now, &db.create_file("stale.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-stale");
+    let conn = db.pool().get().unwrap();
+
+    insert_embedding_row(
+        &conn,
+        doc_id,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Stale,
+        now,
+    );
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-stale", 768), now).unwrap();
+
+    assert_eq!(startup.backfilled_documents, 0);
+    assert_eq!(startup.seeded_jobs, 1);
+    assert_eq!(
+        queued_embed_jobs(&conn),
+        vec![EmbedDocumentPayload {
+            document_id: doc_id,
+            model_id,
+        }]
+    );
+}
+
+#[test]
+fn startup_recovery_does_not_duplicate_existing_queued_or_claimed_jobs() {
+    let db = TempDb::new();
+    let now = current_time();
+    let queued_doc = insert_document(&db.pool(), now, &db.create_file("queued.txt"));
+    let claimed_doc = insert_document(&db.pool(), now, &db.create_file("claimed.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-dedup");
+    let mut conn = db.pool().get().unwrap();
+
+    insert_embedding_row(
+        &conn,
+        queued_doc,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Pending,
+        now,
+    );
+    insert_embedding_row(
+        &conn,
+        claimed_doc,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Stale,
+        now,
+    );
+
+    enqueue_embed_document_job(&conn, queued_doc, model_id, now);
+    enqueue_embed_document_job(&conn, claimed_doc, model_id, now);
+    let claimed = repository::claim_job(&mut conn, now + 1).unwrap();
+    assert!(claimed.is_some(), "one queued job should become claimed");
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-dedup", 768), now + 2)
+            .unwrap();
+
+    assert_eq!(startup.backfilled_documents, 0);
+    assert_eq!(startup.seeded_jobs, 0);
+    assert_eq!(
+        queued_embed_jobs(&conn),
+        vec![
+            EmbedDocumentPayload {
+                document_id: queued_doc,
+                model_id,
+            },
+            EmbedDocumentPayload {
+                document_id: claimed_doc,
+                model_id,
+            },
+        ]
+    );
+
+    let claimed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM job_queue WHERE job_type = ?1 AND claimed_at IS NOT NULL",
+            [JobType::EmbedDocument],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_count, 1);
+}
+
+#[test]
+fn startup_recovery_is_idempotent_across_repeated_boots() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_id = insert_document(&db.pool(), now, &db.create_file("repeat.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-repeat");
+    let conn = db.pool().get().unwrap();
+
+    insert_embedding_row(
+        &conn,
+        doc_id,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Pending,
+        now,
+    );
+
+    let first =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-repeat", 768), now).unwrap();
+    let first_jobs = count_jobs_by_type(&conn, JobType::EmbedDocument);
+    let second =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-repeat", 768), now + 1)
+            .unwrap();
+    let second_jobs = count_jobs_by_type(&conn, JobType::EmbedDocument);
+
+    assert_eq!(first.seeded_jobs, 1);
+    assert_eq!(second.seeded_jobs, 0);
+    assert_eq!(first_jobs, 1);
+    assert_eq!(second_jobs, 1);
+}
+
+#[test]
+fn startup_recovery_does_not_seed_jobs_for_embedded_only_rows() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_id = insert_document(&db.pool(), now, &db.create_file("embedded.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-embedded");
+    let conn = db.pool().get().unwrap();
+
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            doc_id,
+            model_id,
+            ChunkType::Filename,
+            0,
+            0,
+            EmbedState::Embedded,
+            serialize_embedding(&[1.0_f32; 768]),
+            now
+        ],
+    )
+    .unwrap();
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-embedded", 768), now)
+            .unwrap();
+
+    assert_eq!(startup.backfilled_documents, 0);
+    assert_eq!(startup.seeded_jobs, 0);
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 0);
 }
 
 // ---------------------------------------------------------------------------

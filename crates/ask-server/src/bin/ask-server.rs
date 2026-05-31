@@ -1,10 +1,8 @@
 use anyhow::Result;
 use ask_core::migrations;
-use ask_core::models::EmbeddingModel;
-use ask_core::repository;
 use ask_core::{WORKSPACE_NAME, workspace_members};
 use ask_server::embeddings::HttpEmbeddingClient;
-use ask_server::{config, create_pool, http, worker};
+use ask_server::{config, create_pool, http, startup, vector_index, worker};
 use std::sync::Arc;
 use tracing::info;
 
@@ -33,34 +31,21 @@ async fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
 
-    let model = {
+    let startup_state = {
         let conn = pool.get()?;
-        let identity = config.embedding_identity();
-        match repository::find_model_by_identity(&conn, &identity)? {
-            Some(m) => m,
-            None => {
-                let m = EmbeddingModel {
-                    id: 0,
-                    name: identity.name,
-                    dimensions: identity.dimensions,
-                    chunk_size: identity.chunk_size,
-                    chunk_overlap: identity.chunk_overlap,
-                    created_at: now,
-                };
-                let model = EmbeddingModel {
-                    id: repository::insert_model(&conn, &m)?,
-                    ..m
-                };
-                let seeded = worker::backfill_pending_for_model(&conn, &model, now)?;
-                info!(model = %model.name, seeded, "registered new embedding model");
-                model
-            }
-        }
+        startup::reconcile_embedding_startup(&conn, config.embedding_identity(), now)?
     };
+    let model = startup_state.model.clone();
+    info!(
+        model = %model.name,
+        backfilled_documents = startup_state.backfilled_documents,
+        seeded_jobs = startup_state.seeded_jobs,
+        "reconciled embedding startup state"
+    );
 
     {
         let conn = pool.get()?;
-        let backfilled = ask_server::vector_index::ensure_active_search_model(&conn, &model, now)?;
+        let backfilled = vector_index::ensure_active_search_model(&conn, &model, now)?;
         info!(model = %model.name, backfilled, "ensured sqlite-vec search index");
     }
 

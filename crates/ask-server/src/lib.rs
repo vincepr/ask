@@ -2,6 +2,7 @@ pub mod config;
 pub mod embeddings;
 pub mod http;
 mod ingest;
+pub mod startup;
 pub mod vector_index;
 pub mod worker;
 
