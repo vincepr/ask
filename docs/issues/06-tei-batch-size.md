@@ -45,6 +45,18 @@ This means:
 No startup validation exists: the server never queries TEI to confirm the
 actual model name, output dimensions, or supported features.
 
+**Live evidence**: At runtime, TEI logs this warning on every request:
+
+```
+WARN openai_embed: The provided `model=default` has not been found,
+the `model` parameter should be provided either empty or
+with `model=onnx-community/Qwen3-Embedding-0.6B-ONNX` instead.
+```
+
+TEI currently handles it gracefully (warns and proceeds), but this is
+implementation-specific. It would break under stricter providers or if TEI
+enforces model name validation in a future version.
+
 ## Questions
 
 **Batch / Concurrency:**
