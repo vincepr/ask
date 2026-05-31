@@ -37,10 +37,18 @@ fn setup_documents_db() -> Connection {
             file_modified_at INTEGER NOT NULL,
             file_size        INTEGER NOT NULL,
             updated_at       INTEGER NOT NULL
-        );
-        CREATE TABLE document_embeddings (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+         );
+         CREATE TABLE embedding_models (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL,
+            dimensions    INTEGER NOT NULL,
+            chunk_size    INTEGER NOT NULL,
+            chunk_overlap INTEGER NOT NULL,
+            created_at    INTEGER NOT NULL
+         );
+         CREATE TABLE document_embeddings (
+             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+             document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             model_id        INTEGER NOT NULL,
             chunk_type      TEXT    NOT NULL,
             chunk_start     INTEGER NOT NULL,
@@ -584,6 +592,13 @@ fn replace_embeddings_for_document_model_replaces_only_target_pair_atomically() 
 
     let (doc_id, _) = upsert_document(&mut conn, &doc).unwrap();
     let (other_doc_id, _) = upsert_document(&mut conn, &other_doc).unwrap();
+
+    conn.execute_batch(
+        "INSERT INTO embedding_models (id, name, dimensions, chunk_size, chunk_overlap, created_at)
+         VALUES (7, 'm7', 1, 16, 0, 100),
+                (8, 'm8', 1, 16, 0, 100)",
+    )
+    .unwrap();
 
     conn.execute_batch(
         "INSERT INTO document_embeddings

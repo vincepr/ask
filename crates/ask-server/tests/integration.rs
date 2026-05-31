@@ -8,6 +8,7 @@ use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
 use ask_server::embeddings::DeterministicEmbeddingClient;
+use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http, migrations};
 use axum::body::{Body, Bytes, to_bytes};
@@ -25,11 +26,20 @@ fn current_time() -> i64 {
 }
 
 fn register_model(pool: &http::AppState, now: i64, name: &str) -> i64 {
+    register_model_with_dimensions(pool, now, name, 768)
+}
+
+fn register_model_with_dimensions(
+    pool: &http::AppState,
+    now: i64,
+    name: &str,
+    dimensions: i64,
+) -> i64 {
     let conn = pool.pool().get().unwrap();
     let model = ask_core::models::EmbeddingModel {
         id: 0,
         name: name.to_string(),
-        dimensions: 768,
+        dimensions,
         chunk_size: 512,
         chunk_overlap: 0,
         created_at: now,
@@ -152,6 +162,14 @@ fn delete_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) {
 
 fn test_embedding_client() -> Arc<DeterministicEmbeddingClient> {
     Arc::new(DeterministicEmbeddingClient::new())
+}
+
+fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -1887,4 +1905,168 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
         .unwrap();
     assert_eq!(doc1_embedded, 0, "doc 1 has no remaining 'embedded' rows");
     assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 2);
+}
+
+// ---------------------------------------------------------------------------
+// sqlite-vec search
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqlite_vec_backfills_existing_embedded_rows_and_searches_without_rust_scan() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "vec-backfill", 2);
+    let path_a = db.create_file("vec-a.txt");
+    let path_b = db.create_file("vec-b.txt");
+    let doc_a = insert_document(&db.pool(), now, &path_a);
+    let doc_b = insert_document(&db.pool(), now, &path_b);
+
+    let conn = db.pool().get().unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, 'filename', 0, 0, 'embedded', ?3, ?4)",
+        rusqlite::params![doc_a, model_id, serialize_embedding(&[1.0_f32, 0.0_f32]), now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, 'filename', 0, 0, 'embedded', ?3, ?4)",
+        rusqlite::params![doc_b, model_id, serialize_embedding(&[0.0_f32, 1.0_f32]), now],
+    )
+    .unwrap();
+
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    let backfilled = vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    assert_eq!(backfilled, 2);
+
+    let hits = repository::search_documents_by_embedding(&conn, &model, &[1.0, 0.0], 2).unwrap();
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].document_id, doc_a);
+    assert_eq!(
+        hits[0].filepath,
+        path_a.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(hits[0].distance, 0.0);
+    assert_eq!(hits[1].document_id, doc_b);
+    assert!(hits[1].distance > hits[0].distance);
+}
+
+#[tokio::test]
+async fn sqlite_vec_search_updates_when_embeddings_are_replaced() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "vec-update", 2);
+    let path = db.create_file("vec-update.txt");
+    let doc_id = insert_document(&db.pool(), now, &path);
+
+    let mut conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&[1.0, 0.0]),
+        }],
+        now,
+    )
+    .unwrap();
+
+    let initial_hits =
+        repository::search_documents_by_embedding(&conn, &model, &[1.0, 0.0], 1).unwrap();
+    assert_eq!(initial_hits[0].document_id, doc_id);
+    let initial_embedding_id = initial_hits[0].embedding_id;
+
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&[0.0, 1.0]),
+        }],
+        now + 1,
+    )
+    .unwrap();
+
+    let old_query_hits =
+        repository::search_documents_by_embedding(&conn, &model, &[1.0, 0.0], 1).unwrap();
+    let new_query_hits =
+        repository::search_documents_by_embedding(&conn, &model, &[0.0, 1.0], 1).unwrap();
+
+    assert_eq!(old_query_hits[0].document_id, doc_id);
+    assert!(old_query_hits[0].distance > 0.0);
+    assert_eq!(new_query_hits[0].document_id, doc_id);
+    assert_eq!(new_query_hits[0].distance, 0.0);
+    assert_ne!(new_query_hits[0].embedding_id, initial_embedding_id);
+}
+
+#[tokio::test]
+async fn sqlite_vec_search_removes_rows_when_documents_become_stale() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "vec-stale", 2);
+    let path = db.create_file("vec-stale.txt");
+    let doc_id = insert_document(&db.pool(), now, &path);
+
+    let mut conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&[1.0, 0.0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/documents/stale")
+                .header("content-type", "application/json")
+                .body(json_body(&format!(r#"{{"document_ids":[{doc_id}]}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let conn = db.pool().get().unwrap();
+    let hits = repository::search_documents_by_embedding(&conn, &model, &[1.0, 0.0], 5).unwrap();
+    assert!(hits.is_empty());
+
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
+            [doc_id, model_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "stale");
 }

@@ -3,6 +3,7 @@ pub mod embeddings;
 pub mod http;
 mod ingest;
 pub mod migrations;
+pub mod vector_index;
 pub mod worker;
 
 use std::path::Path;
@@ -17,6 +18,7 @@ use r2d2::ManageConnection;
 /// Returns an error if the parent directory cannot be created or if the SQLite
 /// database cannot be opened.
 pub fn open_database(database_path: &str) -> Result<rusqlite::Connection> {
+    vector_index::register_sqlite_vec()?;
     let path = Path::new(database_path);
 
     if let Some(parent) = path
@@ -76,6 +78,7 @@ impl ManageConnection for SqliteConnectionManager {
 /// Returns an error if the parent directory cannot be created or the pool
 /// cannot be built.
 pub fn create_pool(database_path: &str) -> Result<DbPool> {
+    vector_index::register_sqlite_vec()?;
     let path = Path::new(database_path);
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {

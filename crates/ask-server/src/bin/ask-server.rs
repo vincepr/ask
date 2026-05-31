@@ -56,6 +56,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    {
+        let conn = pool.get()?;
+        let backfilled = ask_server::vector_index::ensure_active_search_model(&conn, &model, now)?;
+        info!(model = %model.name, backfilled, "ensured sqlite-vec search index");
+    }
+
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     let embedding_client = Arc::new(HttpEmbeddingClient::new(config.embedding_provider.clone())?);
 

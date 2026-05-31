@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::models::{Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, JobQueueEntry};
+use crate::models::{
+    Document, DocumentSearchResult, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel,
+    JobQueueEntry,
+};
 use crate::types::*;
 
 /// A job with a claim older than this (in seconds) is considered dead and can
 /// be reclaimed or replaced by a fresh enqueue.
 const STALE_JOB_AGE_SECS: i64 = 86400;
+const DOCUMENT_EMBEDDING_VEC_TABLE: &str = "document_embedding_vec";
 
 // ---------------------------------------------------------------------------
 // Document
@@ -267,6 +271,8 @@ fn mark_documents_stale_in_queue_time(conn: &Connection, doc_ids: &[i64], now: i
     stmt.execute(param_refs.as_slice())
         .context("failed to mark embeddings as stale")?;
 
+    delete_vec_rows_for_documents(conn, doc_ids)?;
+
     seed_embed_jobs(conn, now)?;
 
     Ok(())
@@ -409,6 +415,8 @@ pub fn insert_pending_embeddings(
         })?;
     }
 
+    delete_vec_rows_for_non_embedded_document_model(conn, doc_id, model_id)?;
+
     Ok(())
 }
 
@@ -467,9 +475,14 @@ pub fn replace_embeddings_for_document_model(
     chunks: &[EmbeddedChunk],
     now: i64,
 ) -> Result<()> {
+    let expected_embedding_bytes = load_expected_embedding_bytes(conn, model_id)?;
+    validate_chunk_embedding_lengths(chunks, expected_embedding_bytes)?;
+
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start replace_embeddings_for_document_model transaction")?;
+
+    delete_vec_rows_for_document_model(&tx, doc_id, model_id)?;
 
     tx.execute(
         "DELETE FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
@@ -505,9 +518,89 @@ pub fn replace_embeddings_for_document_model(
     }
 
     drop(stmt);
+    sync_vec_rows_for_document_model(&tx, doc_id, model_id)?;
     tx.commit()
         .context("failed to commit replace_embeddings_for_document_model")?;
     Ok(())
+}
+
+/// Search the active SQLite vec index for one embedding model.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `model` - Embedding model whose vec index should be queried.
+/// * `query_embedding` - Query vector with exactly `model.dimensions` float values.
+/// * `limit` - Maximum number of hits to return.
+///
+/// # Returns
+///
+/// Search hits ordered by ascending distance.
+///
+/// # Errors
+///
+/// Returns an error if the query vector length does not match the model, the
+/// active vec index is missing or configured for a different model, or the SQL
+/// query fails.
+pub fn search_documents_by_embedding(
+    conn: &Connection,
+    model: &EmbeddingModel,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<DocumentSearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    validate_query_embedding_dimensions(query_embedding, model)?;
+    ensure_active_vec_model(conn, model)?;
+
+    let query_blob = serialize_embedding(query_embedding);
+    let mut stmt = conn
+        .prepare(
+            "WITH nearest AS (
+                 SELECT rowid, distance
+                 FROM document_embedding_vec
+                 WHERE embedding MATCH ?1
+                 ORDER BY distance ASC
+                 LIMIT ?2
+             )
+             SELECT d.id, d.filepath, d.file_type, d.doc_category, d.file_modified_at,
+                    d.file_size, d.updated_at, de.id, de.model_id, de.chunk_type,
+                    de.chunk_start, de.chunk_end, nearest.distance
+             FROM nearest
+             JOIN document_embeddings de ON de.id = nearest.rowid
+             JOIN documents d ON d.id = de.document_id
+             WHERE de.model_id = ?3 AND de.state = ?4
+             ORDER BY nearest.distance ASC, de.id ASC",
+        )
+        .context("failed to prepare search_documents_by_embedding query")?;
+
+    let rows = stmt
+        .query_map(
+            params![query_blob, limit as i64, model.id, EmbedState::Embedded],
+            |row| {
+                Ok(DocumentSearchResult {
+                    document_id: row.get(0)?,
+                    filepath: row.get(1)?,
+                    file_type: row.get(2)?,
+                    doc_category: row.get(3)?,
+                    file_modified_at: row.get(4)?,
+                    file_size: row.get(5)?,
+                    document_updated_at: row.get(6)?,
+                    embedding_id: row.get(7)?,
+                    model_id: row.get(8)?,
+                    chunk_type: row.get(9)?,
+                    chunk_start: row.get(10)?,
+                    chunk_end: row.get(11)?,
+                    distance: row.get(12)?,
+                })
+            },
+        )
+        .context("failed to query vector search results")?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to collect vector search results")
 }
 
 /// Enqueue one `embed_document` job for each distinct queued document/model pair.
@@ -577,88 +670,195 @@ fn is_job_already_queued_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("already queued or in progress")
 }
 
+fn validate_query_embedding_dimensions(
+    query_embedding: &[f32],
+    model: &EmbeddingModel,
+) -> Result<()> {
+    let expected_dimensions =
+        usize::try_from(model.dimensions).context("embedding dimensions must fit into usize")?;
+    anyhow::ensure!(
+        query_embedding.len() == expected_dimensions,
+        "query embedding length {} does not match model {} dimensions {}",
+        query_embedding.len(),
+        model.name,
+        model.dimensions
+    );
+    Ok(())
+}
+
+fn ensure_active_vec_model(conn: &Connection, model: &EmbeddingModel) -> Result<()> {
+    let (active_model_id, dimensions): (i64, i64) = conn
+        .query_row(
+            "SELECT active_model_id, dimensions
+             FROM embedding_search_state
+             WHERE singleton_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .context("failed to load active vector search model")?;
+
+    anyhow::ensure!(
+        active_model_id == model.id,
+        "vector search index is configured for model id {} but search requested {}",
+        active_model_id,
+        model.id
+    );
+    anyhow::ensure!(
+        dimensions == model.dimensions,
+        "vector search index dimensions {} do not match model {} dimensions {}",
+        dimensions,
+        model.name,
+        model.dimensions
+    );
+    anyhow::ensure!(
+        sqlite_table_exists(conn, DOCUMENT_EMBEDDING_VEC_TABLE)?,
+        "vector search table {} is missing",
+        DOCUMENT_EMBEDDING_VEC_TABLE
+    );
+    Ok(())
+}
+
+fn load_expected_embedding_bytes(conn: &Connection, model_id: i64) -> Result<usize> {
+    let dimensions: i64 = conn
+        .query_row(
+            "SELECT dimensions FROM embedding_models WHERE id = ?1",
+            [model_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to load dimensions for model {}", model_id))?;
+    let dimensions =
+        usize::try_from(dimensions).context("embedding dimensions must fit into usize")?;
+    Ok(dimensions * std::mem::size_of::<f32>())
+}
+
+fn validate_chunk_embedding_lengths(
+    chunks: &[EmbeddedChunk],
+    expected_embedding_bytes: usize,
+) -> Result<()> {
+    for chunk in chunks {
+        anyhow::ensure!(
+            chunk.embedding.len() == expected_embedding_bytes,
+            "embedded chunk ({}, {}) stored {} bytes but expected {}",
+            chunk.chunk_type,
+            chunk.chunk_start,
+            chunk.embedding.len(),
+            expected_embedding_bytes
+        );
+    }
+    Ok(())
+}
+
+fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn sqlite_table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1)",
+        [table_name],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to query sqlite_master for table {table_name}"))
+}
+
+fn delete_vec_rows_for_documents(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
+    if doc_ids.is_empty() || !sqlite_table_exists(conn, DOCUMENT_EMBEDDING_VEC_TABLE)? {
+        return Ok(());
+    }
+
+    let placeholders: Vec<String> = (0..doc_ids.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect();
+    let sql = format!(
+        "DELETE FROM {DOCUMENT_EMBEDDING_VEC_TABLE}
+         WHERE rowid IN (
+             SELECT id
+             FROM document_embeddings
+             WHERE document_id IN ({})
+         )",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("failed to prepare vec delete for documents")?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = doc_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    stmt.execute(param_refs.as_slice())
+        .context("failed to delete vec rows for documents")?;
+    Ok(())
+}
+
+fn delete_vec_rows_for_document_model(conn: &Connection, doc_id: i64, model_id: i64) -> Result<()> {
+    if !sqlite_table_exists(conn, DOCUMENT_EMBEDDING_VEC_TABLE)? {
+        return Ok(());
+    }
+
+    conn.execute(
+        "DELETE FROM document_embedding_vec
+         WHERE rowid IN (
+             SELECT id FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2
+         )",
+        params![doc_id, model_id],
+    )
+    .context("failed to delete vec rows for document/model pair")?;
+    Ok(())
+}
+
+fn sync_vec_rows_for_document_model(conn: &Connection, doc_id: i64, model_id: i64) -> Result<()> {
+    if !sqlite_table_exists(conn, DOCUMENT_EMBEDDING_VEC_TABLE)? {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO document_embedding_vec(rowid, embedding)
+         SELECT id, embedding
+         FROM document_embeddings
+         WHERE document_id = ?1
+           AND model_id = ?2
+           AND state = ?3
+           AND embedding IS NOT NULL",
+        params![doc_id, model_id, EmbedState::Embedded],
+    )
+    .context("failed to sync vec rows for document/model pair")?;
+    Ok(())
+}
+
+fn delete_vec_rows_for_non_embedded_document_model(
+    conn: &Connection,
+    doc_id: i64,
+    model_id: i64,
+) -> Result<()> {
+    if !sqlite_table_exists(conn, DOCUMENT_EMBEDDING_VEC_TABLE)? {
+        return Ok(());
+    }
+
+    conn.execute(
+        "DELETE FROM document_embedding_vec
+         WHERE rowid IN (
+             SELECT id
+             FROM document_embeddings
+             WHERE document_id = ?1
+               AND model_id = ?2
+               AND state != ?3
+         )",
+        params![doc_id, model_id, EmbedState::Embedded],
+    )
+    .context("failed to delete vec rows for non-embedded document/model rows")?;
+    Ok(())
+}
+
 fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time before epoch")
         .as_secs() as i64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{ChunkType, DocCategory};
-
-    fn setup_documents_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("in-memory database must open");
-        conn.execute_batch(
-            "CREATE TABLE documents (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                filepath         TEXT NOT NULL,
-                file_type        TEXT NOT NULL,
-                doc_category     TEXT NOT NULL,
-                file_modified_at INTEGER NOT NULL,
-                file_size        INTEGER NOT NULL,
-                updated_at       INTEGER NOT NULL
-            );
-            CREATE TABLE document_embeddings (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                model_id        INTEGER NOT NULL,
-                chunk_type      TEXT    NOT NULL,
-                chunk_start     INTEGER NOT NULL,
-                chunk_end       INTEGER NOT NULL,
-                state           TEXT    NOT NULL,
-                embedding       BLOB,
-                created_at      INTEGER NOT NULL
-            );
-            CREATE UNIQUE INDEX idx_embeddings_unique
-                ON document_embeddings (document_id, model_id, chunk_type, chunk_start);",
-        )
-        .expect("document schema must be created");
-        conn
-    }
-
-    #[test]
-    fn transactional_document_ingest_rolls_back_when_queue_step_fails() {
-        let mut conn = setup_documents_db();
-        let doc = Document {
-            id: 0,
-            filepath: "/tmp/a.txt".to_string(),
-            file_type: "txt".to_string(),
-            doc_category: DocCategory::Resource,
-            file_modified_at: 100,
-            file_size: 10,
-            updated_at: 100,
-        };
-
-        let err = upsert_document_and_replace_pending_embeddings_with_hook(
-            &mut conn,
-            &doc,
-            1,
-            &[(ChunkType::Filename, 0, 0)],
-            100,
-            || anyhow::bail!("synthetic queue failure"),
-        )
-        .expect_err("synthetic queue failure must abort the transaction");
-
-        assert!(
-            err.to_string().contains("synthetic queue failure"),
-            "unexpected error: {err:#}"
-        );
-
-        let document_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
-            .expect("document count query must succeed");
-        let embedding_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
-                row.get(0)
-            })
-            .expect("embedding count query must succeed");
-
-        assert_eq!(document_count, 0);
-        assert_eq!(embedding_count, 0);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,4 +943,81 @@ pub fn complete_job(conn: &Connection, job_id: i64) -> Result<()> {
     conn.execute("DELETE FROM job_queue WHERE id = ?1", params![job_id])
         .context("failed to complete job")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChunkType, DocCategory};
+
+    fn setup_documents_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory database must open");
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                filepath         TEXT NOT NULL,
+                file_type        TEXT NOT NULL,
+                doc_category     TEXT NOT NULL,
+                file_modified_at INTEGER NOT NULL,
+                file_size        INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL
+            );
+            CREATE TABLE document_embeddings (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                model_id        INTEGER NOT NULL,
+                chunk_type      TEXT    NOT NULL,
+                chunk_start     INTEGER NOT NULL,
+                chunk_end       INTEGER NOT NULL,
+                state           TEXT    NOT NULL,
+                embedding       BLOB,
+                created_at      INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_embeddings_unique
+                ON document_embeddings (document_id, model_id, chunk_type, chunk_start);",
+        )
+        .expect("document schema must be created");
+        conn
+    }
+
+    #[test]
+    fn transactional_document_ingest_rolls_back_when_queue_step_fails() {
+        let mut conn = setup_documents_db();
+        let doc = Document {
+            id: 0,
+            filepath: "/tmp/a.txt".to_string(),
+            file_type: "txt".to_string(),
+            doc_category: DocCategory::Resource,
+            file_modified_at: 100,
+            file_size: 10,
+            updated_at: 100,
+        };
+
+        let err = upsert_document_and_replace_pending_embeddings_with_hook(
+            &mut conn,
+            &doc,
+            1,
+            &[(ChunkType::Filename, 0, 0)],
+            100,
+            || anyhow::bail!("synthetic queue failure"),
+        )
+        .expect_err("synthetic queue failure must abort the transaction");
+
+        assert!(
+            err.to_string().contains("synthetic queue failure"),
+            "unexpected error: {err:#}"
+        );
+
+        let document_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+            .expect("document count query must succeed");
+        let embedding_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .expect("embedding count query must succeed");
+
+        assert_eq!(document_count, 0);
+        assert_eq!(embedding_count, 0);
+    }
 }
