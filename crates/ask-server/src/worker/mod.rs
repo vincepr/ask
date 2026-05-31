@@ -86,10 +86,7 @@ pub fn backfill_pending_for_model(
 async fn tick(pool: DbPool, model_id: i64, embedding_client: SharedEmbeddingClient) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let now = unix_now();
-        let mut conn = pool.get()?;
-        let entry = repository::claim_job(&mut conn, now)?;
-
-        let entry = match entry {
+        let entry = match claim_pending_job(&pool, now)? {
             Some(entry) => entry,
             None => return Ok(()),
         };
@@ -101,6 +98,11 @@ async fn tick(pool: DbPool, model_id: i64, embedding_client: SharedEmbeddingClie
     .context("worker tick panicked")??;
 
     Ok(())
+}
+
+fn claim_pending_job(pool: &DbPool, now: i64) -> Result<Option<JobQueueEntry>> {
+    let mut conn = pool.get()?;
+    repository::claim_job(&mut conn, now)
 }
 
 struct JobContext<'a> {
@@ -287,6 +289,35 @@ mod tests {
         let conn = pool.get().unwrap();
         conn.query_row("SELECT COUNT(*) FROM job_queue", [], |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn claim_pending_job_releases_pool_slot_before_dispatch() {
+        let db = TempDb::new();
+        let payload = r#"{"root_path":"/tmp"}"#;
+        let queued_at = 10;
+        let claimed_at = 100;
+        let conn = db.pool().get().unwrap();
+        repository::enqueue_job(&conn, &JobType::IngestFolder, payload, queued_at).unwrap();
+        drop(conn);
+
+        let pool = db.pool();
+        let held_connections = vec![
+            pool.get().unwrap(),
+            pool.get().unwrap(),
+            pool.get().unwrap(),
+        ];
+
+        let claimed = claim_pending_job(&pool, claimed_at)
+            .unwrap()
+            .expect("job should be claimable");
+        assert_eq!(claimed.claimed_at, Some(claimed_at));
+
+        let extra_conn = pool
+            .get_timeout(Duration::from_millis(200))
+            .expect("claim helper must release its pool slot");
+        drop(extra_conn);
+        drop(held_connections);
     }
 
     #[test]

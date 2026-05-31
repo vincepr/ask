@@ -238,11 +238,47 @@ pub fn find_document_by_id(conn: &Connection, id: i64) -> Result<Option<Document
 /// Only `'embedded'` rows are affected — `'pending'` and already-`'stale'` rows are
 /// left as-is. Document IDs that do not exist in the `documents` table are silently
 /// filtered out by the subquery.
-pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
-    mark_documents_stale_in_queue_time(conn, doc_ids, current_unix_timestamp())
+pub fn mark_documents_stale(conn: &mut Connection, doc_ids: &[i64]) -> Result<()> {
+    mark_documents_stale_with_hook(conn, doc_ids, current_unix_timestamp(), || Ok(()))
+}
+
+fn mark_documents_stale_with_hook<F>(
+    conn: &mut Connection,
+    doc_ids: &[i64],
+    now: i64,
+    before_seed: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if doc_ids.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start mark_documents_stale transaction")?;
+
+    mark_documents_stale_in_queue_time_with_hook(&tx, doc_ids, now, before_seed)?;
+    tx.commit()
+        .context("failed to commit mark_documents_stale transaction")?;
+
+    Ok(())
 }
 
 fn mark_documents_stale_in_queue_time(conn: &Connection, doc_ids: &[i64], now: i64) -> Result<()> {
+    mark_documents_stale_in_queue_time_with_hook(conn, doc_ids, now, || Ok(()))
+}
+
+fn mark_documents_stale_in_queue_time_with_hook<F>(
+    conn: &Connection,
+    doc_ids: &[i64],
+    now: i64,
+    before_seed: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     if doc_ids.is_empty() {
         return Ok(());
     }
@@ -273,6 +309,7 @@ fn mark_documents_stale_in_queue_time(conn: &Connection, doc_ids: &[i64], now: i
 
     delete_vec_rows_for_documents(conn, doc_ids)?;
 
+    before_seed()?;
     seed_embed_jobs(conn, now)?;
 
     Ok(())
@@ -1044,5 +1081,55 @@ mod tests {
 
         assert_eq!(document_count, 0);
         assert_eq!(embedding_count, 0);
+    }
+
+    #[test]
+    fn mark_documents_stale_rolls_back_when_follow_up_step_fails() {
+        let mut conn = setup_documents_db();
+        conn.execute(
+            "INSERT INTO embedding_models (id, name, dimensions, chunk_size, chunk_overlap, created_at)
+             VALUES (1, 'test', 1, 16, 0, 100)",
+            [],
+        )
+        .expect("embedding model insert must succeed");
+        conn.execute(
+            "INSERT INTO documents
+                (id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
+             VALUES (1, '/tmp/a.txt', 'txt', 'resource', 100, 10, 100)",
+            [],
+        )
+        .expect("document insert must succeed");
+        conn.execute(
+            "INSERT INTO document_embeddings
+                (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+             VALUES (1, 1, 'filename', 0, 0, 'embedded', X'00000000', 100)",
+            [],
+        )
+        .expect("embedding insert must succeed");
+
+        let err = mark_documents_stale_with_hook(&mut conn, &[1], 200, || {
+            anyhow::bail!("synthetic mark_documents_stale failure")
+        })
+        .expect_err("synthetic hook failure must abort the transaction");
+
+        assert!(
+            err.to_string()
+                .contains("synthetic mark_documents_stale failure"),
+            "unexpected error: {err:#}"
+        );
+
+        let state: EmbedState = conn
+            .query_row(
+                "SELECT state FROM document_embeddings WHERE document_id = 1 AND model_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("state query must succeed");
+        assert_eq!(state, EmbedState::Embedded);
+
+        let job_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM job_queue", [], |row| row.get(0))
+            .expect("job count query must succeed");
+        assert_eq!(job_count, 0);
     }
 }

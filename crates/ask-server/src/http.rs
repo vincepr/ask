@@ -368,8 +368,8 @@ async fn mark_stale(
     let doc_ids = body.document_ids;
 
     tokio::task::spawn_blocking(move || {
-        let conn = pool.get().map_err(|e| format!("database error: {e}"))?;
-        repository::mark_documents_stale(&conn, &doc_ids).map_err(|e| e.to_string())
+        let mut conn = pool.get().map_err(|e| format!("database error: {e}"))?;
+        repository::mark_documents_stale(&mut conn, &doc_ids).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| {
@@ -391,6 +391,7 @@ fn error_response(status: StatusCode, code: &str, message: String) -> (StatusCod
     )
 }
 
+#[derive(Debug)]
 enum SearchFailure {
     BadGateway(String),
     Internal(String),
@@ -403,11 +404,14 @@ fn search_documents(
     limit: usize,
     include_location: bool,
 ) -> Result<Vec<SearchDocumentResult>, SearchFailure> {
-    let conn = pool
-        .get()
-        .map_err(|err| SearchFailure::Internal(format!("database error: {err}")))?;
-    let model = load_active_model(&conn)
-        .map_err(|err| SearchFailure::Internal(format!("failed to load active model: {err:#}")))?;
+    let model = {
+        let conn = pool
+            .get()
+            .map_err(|err| SearchFailure::Internal(format!("database error: {err}")))?;
+        load_active_model(&conn).map_err(|err| {
+            SearchFailure::Internal(format!("failed to load active model: {err:#}"))
+        })?
+    };
 
     let vectors = embedding_client
         .embed(&model, std::slice::from_ref(&query))
@@ -416,6 +420,9 @@ fn search_documents(
         SearchFailure::BadGateway("embedding provider returned no vectors".into())
     })?;
 
+    let conn = pool
+        .get()
+        .map_err(|err| SearchFailure::Internal(format!("database error: {err}")))?;
     let raw_limit = expanded_raw_limit(limit);
     let hits = repository::search_documents_by_embedding(&conn, &model, query_embedding, raw_limit)
         .map_err(|err| SearchFailure::Internal(format!("failed to run vector search: {err:#}")))?;
@@ -481,4 +488,126 @@ fn expanded_raw_limit(limit: usize) -> usize {
     limit
         .saturating_mul(SEARCH_RAW_LIMIT_MULTIPLIER)
         .min(SEARCH_RAW_LIMIT_CAP)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ask_core::migrations;
+    use ask_core::models::EmbeddingModel;
+    use ask_core::repository;
+
+    use super::*;
+    use crate::create_pool;
+    use crate::embeddings::EmbeddingClient;
+    use crate::vector_index;
+
+    struct BlockingEmbeddingClient {
+        entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+        release_rx: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BlockingEmbeddingClient {
+        fn new(entered_tx: mpsc::Sender<()>, release_rx: mpsc::Receiver<()>) -> Self {
+            Self {
+                entered_tx: Mutex::new(Some(entered_tx)),
+                release_rx: Mutex::new(release_rx),
+            }
+        }
+    }
+
+    impl EmbeddingClient for BlockingEmbeddingClient {
+        fn embed(
+            &self,
+            model: &EmbeddingModel,
+            inputs: &[String],
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                tx.send(()).unwrap();
+            }
+            self.release_rx.lock().unwrap().recv().unwrap();
+            Ok(inputs
+                .iter()
+                .map(|_| vec![0.0_f32; model.dimensions as usize])
+                .collect())
+        }
+    }
+
+    #[test]
+    fn search_releases_pool_connection_before_embedding_call() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ask-http-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("ask.sqlite3");
+        let pool = create_pool(&db_path.to_string_lossy()).unwrap();
+        let mut conn = pool.get().unwrap();
+        migrations::apply_pending_migrations(&mut conn).unwrap();
+
+        let now = 100_i64;
+        let model = EmbeddingModel {
+            id: 0,
+            name: "search-release".to_string(),
+            dimensions: 1,
+            chunk_size: 16,
+            chunk_overlap: 0,
+            created_at: now,
+        };
+        let model_id = repository::insert_model(&conn, &model).unwrap();
+        conn.execute(
+            "INSERT INTO embedding_search_state (singleton_id, active_model_id, dimensions, updated_at)
+             VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![model_id, 1_i64, now],
+        )
+        .unwrap();
+        let model = EmbeddingModel {
+            id: model_id,
+            ..model
+        };
+        vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+        drop(conn);
+
+        let held_connections = vec![
+            pool.get().unwrap(),
+            pool.get().unwrap(),
+            pool.get().unwrap(),
+        ];
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let client = Arc::new(BlockingEmbeddingClient::new(entered_tx, release_rx));
+        let pool_for_thread = pool.clone();
+        let client_for_thread = client.clone();
+        let handle = std::thread::spawn(move || {
+            search_documents(
+                &pool_for_thread,
+                client_for_thread.as_ref(),
+                "query".to_string(),
+                10,
+                false,
+            )
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("search should reach embedding call");
+
+        let extra_conn = pool
+            .get_timeout(Duration::from_millis(200))
+            .expect("search should release its DB slot before embedding waits");
+        drop(extra_conn);
+
+        release_tx.send(()).unwrap();
+        let results = handle.join().unwrap().unwrap();
+        assert!(results.is_empty());
+        drop(held_connections);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }
