@@ -122,6 +122,31 @@ fn load_uses_openai_provider_when_fully_configured() {
 }
 
 #[test]
+fn load_rejects_empty_tei_base_url() {
+    let _env_lock = env_lock();
+    let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "tei");
+    let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "   ");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
+
+    let error = load().expect_err("config load must fail for empty tei base url");
+
+    assert!(error.to_string().contains(EMBEDDING_BASE_URL_ENV));
+}
+
+#[test]
+fn load_rejects_empty_openai_base_url() {
+    let _env_lock = env_lock();
+    let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "openai");
+    let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "   ");
+    let _token_guard = EnvVarGuard::set(EMBEDDING_AUTH_TOKEN_ENV, "secret-token");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "text-embedding-3-small");
+
+    let error = load().expect_err("config load must fail for empty openai base url");
+
+    assert!(error.to_string().contains(EMBEDDING_BASE_URL_ENV));
+}
+
+#[test]
 fn load_rejects_unknown_embedding_mode() {
     let _env_lock = env_lock();
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "unknown");

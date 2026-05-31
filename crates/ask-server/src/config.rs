@@ -204,6 +204,13 @@ fn load_embedding_provider() -> Result<EmbeddingProvider> {
         "tei" => {
             let base_url = std::env::var(EMBEDDING_BASE_URL_ENV)
                 .unwrap_or_else(|_| String::from(DEFAULT_TEI_BASE_URL));
+            if base_url.trim().is_empty() {
+                bail!(
+                    "{} must not be empty when {}=tei",
+                    EMBEDDING_BASE_URL_ENV,
+                    EMBEDDING_MODE_ENV
+                );
+            }
             Ok(EmbeddingProvider::Tei { base_url })
         }
         "openai" => {
@@ -214,6 +221,13 @@ fn load_embedding_provider() -> Result<EmbeddingProvider> {
                     EMBEDDING_MODE_ENV
                 )
             })?;
+            if base_url.trim().is_empty() {
+                bail!(
+                    "{} must not be empty when {}=openai",
+                    EMBEDDING_BASE_URL_ENV,
+                    EMBEDDING_MODE_ENV
+                );
+            }
             let auth_token = std::env::var(EMBEDDING_AUTH_TOKEN_ENV).map_err(|_| {
                 anyhow!(
                     "{} must be set when {}=openai",
