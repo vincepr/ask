@@ -450,6 +450,51 @@ async fn ingest_folder_inserts_documents_and_pending_embeddings() {
 }
 
 #[tokio::test]
+async fn ingest_folder_recursively_inserts_nested_documents() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "recursive");
+
+    let ingest_dir = db.create_dir("recursive");
+    let nested_dir = ingest_dir.join("src").join("deeper");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    let root_file = ingest_dir.join("root.txt");
+    let nested_file = nested_dir.join("nested.txt");
+    std::fs::write(&root_file, "root content").unwrap();
+    std::fs::write(&nested_file, "nested content").unwrap();
+
+    let payload_json = format!(r#"{{"root_path":"{}"}}"#, ingest_dir.display());
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let doc_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        doc_count, 2,
+        "root and nested files should both be ingested"
+    );
+
+    for path in [&root_file, &nested_file] {
+        let canonical_path = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
+                [canonical_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "document should exist for {}", path.display());
+    }
+}
+
+#[tokio::test]
 async fn ingest_folder_skips_unchanged_files() {
     let db = TempDb::new();
     let now = SystemTime::now()
@@ -890,9 +935,21 @@ async fn ingest_mixed_file_types() {
     let doc_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
         .unwrap();
-    assert!(
-        doc_count >= 4,
-        "symlink aliases should collapse onto the canonical target path"
+    assert_eq!(
+        doc_count, 4,
+        "symlinks should not be traversed as ingest candidates"
+    );
+
+    let symlink_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
+            [link.to_string_lossy().into_owned()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        symlink_count, 0,
+        "symlink paths should not be stored as documents"
     );
 
     let content_emb: i64 = conn

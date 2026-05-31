@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use ask_core::models::{Document, EmbeddingModel, IngestFolderPayload, JobQueueEntry};
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, JobType};
+use ignore::WalkBuilder;
 use tracing::{error, info, warn};
 
 use crate::DbPool;
@@ -205,26 +206,38 @@ impl JobHandler for IngestFolderHandler {
             })?
         };
 
-        let entries = std::fs::read_dir(root_path)
-            .with_context(|| format!("failed to read ingest root {}", payload.root_path))?;
+        let walker = WalkBuilder::new(root_path).follow_links(false).build();
 
-        for entry_result in entries {
+        for entry_result in walker {
             let dir_entry = match entry_result {
                 Ok(dir_entry) => dir_entry,
                 Err(err) => {
                     warn!(
                         job_id = ctx.entry.id,
                         error = %err,
-                        "failed to read directory entry; continuing"
+                        "failed to walk directory entry; continuing"
                     );
                     continue;
                 }
             };
 
-            let path = dir_entry.path();
-            if !path.is_file() {
+            let file_type = match dir_entry.file_type() {
+                Some(file_type) => file_type,
+                None => {
+                    warn!(
+                        job_id = ctx.entry.id,
+                        path = ?dir_entry.path(),
+                        "failed to read directory entry type; continuing"
+                    );
+                    continue;
+                }
+            };
+
+            if !file_type.is_file() {
                 continue;
             }
+
+            let path = dir_entry.into_path();
 
             let canonical_path = match std::fs::canonicalize(&path) {
                 Ok(path) => path,

@@ -49,3 +49,14 @@ Do not follow symlinks by default.
 2. Nested files are discovered without additional API calls.
 3. Symlink traversal is disabled by default.
 4. The worker still behaves predictably on partial filesystem failure.
+
+## Report
+
+Completed:
+- Replaced the shallow `read_dir` loop with recursive `ignore::WalkBuilder` traversal in the existing `IngestFolder` job handler.
+- Kept best-effort warning-and-continue behavior for walk, canonicalization, and metadata failures.
+- Preserved canonicalization before document writes and limited ingest candidates to regular files.
+- Added integration coverage for nested file ingestion and for the default no-symlink-traversal behavior.
+
+Remaining:
+- The ignored-directory test coverage stays open until feature 003 adds path-filter behavior. This feature intentionally does not implement those filters yet, so the dependent test from this doc cannot be completed honestly now.
