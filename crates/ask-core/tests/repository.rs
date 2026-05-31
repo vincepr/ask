@@ -5,8 +5,8 @@ use ask_core::models::{
 use ask_core::repository::{
     claim_job, complete_job, enqueue_job, find_document_by_id, find_document_by_path,
     insert_pending_embeddings, replace_embeddings_for_document_model,
-    search_documents_by_embedding, seed_embed_jobs, upsert_document,
-    upsert_document_and_replace_pending_embeddings,
+    search_documents_by_embedding, search_documents_by_filepath_fuzzy, seed_embed_jobs,
+    upsert_document, upsert_document_and_replace_pending_embeddings,
 };
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use rusqlite::{Connection, params};
@@ -909,4 +909,87 @@ fn search_documents_by_embedding_rejects_active_model_mismatch() {
         err_text
             .contains("vector search index is configured for model id 9 but search requested 1")
     );
+}
+
+#[test]
+fn filepath_fuzzy_search_returns_empty_when_limit_zero() {
+    let conn = setup_documents_db();
+    let hits = search_documents_by_filepath_fuzzy(&conn, "anything", 0).unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn filepath_fuzzy_search_prefers_exact_basename_over_longer_near_match() {
+    let mut conn = setup_documents_db();
+    let exact = Document {
+        id: 0,
+        filepath: "/tmp/src/MyImplementation.cs".to_string(),
+        file_type: "cs".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+    let longer = Document {
+        filepath: "/tmp/tests/MyImplementationTests.cs".to_string(),
+        ..exact.clone()
+    };
+
+    upsert_document(&mut conn, &exact).unwrap();
+    upsert_document(&mut conn, &longer).unwrap();
+
+    let hits = search_documents_by_filepath_fuzzy(&conn, "MyImplementation", 2).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].filepath, exact.filepath);
+    assert_eq!(hits[1].filepath, longer.filepath);
+    assert!(hits[0].match_score >= hits[1].match_score);
+}
+
+#[test]
+fn filepath_fuzzy_search_syncs_rows_on_document_insert() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "C:\\Repo\\src\\SearchThing.cs".to_string(),
+        file_type: "cs".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    upsert_document(&mut conn, &doc).unwrap();
+
+    let row: (String, String) = conn
+        .query_row(
+            "SELECT normalized_filepath, normalized_basename
+             FROM document_filepath_search
+             WHERE document_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(row.0, "c:/repo/src/searchthing.cs");
+    assert_eq!(row.1, "searchthing.cs");
+}
+
+#[test]
+fn filepath_fuzzy_search_short_queries_fall_back_to_like_matching() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/ui.rs".to_string(),
+        file_type: "rs".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    upsert_document(&mut conn, &doc).unwrap();
+
+    let hits = search_documents_by_filepath_fuzzy(&conn, "ui", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].filepath, doc.filepath);
 }

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::models::{
-    Document, DocumentSearchResult, EmbedDocumentPayload, EmbeddedChunk, EmbeddingIdentity,
-    EmbeddingModel, JobQueueEntry,
+    Document, DocumentFilepathSearchResult, DocumentSearchResult, EmbedDocumentPayload,
+    EmbeddedChunk, EmbeddingIdentity, EmbeddingModel, JobQueueEntry,
 };
 use crate::types::*;
 
@@ -11,6 +11,8 @@ use crate::types::*;
 /// be reclaimed or replaced by a fresh enqueue.
 const STALE_JOB_AGE_SECS: i64 = 86400;
 const DOCUMENT_EMBEDDING_VEC_TABLE: &str = "document_embedding_vec";
+const DOCUMENT_FILEPATH_SEARCH_TABLE: &str = "document_filepath_search";
+const DOCUMENT_FILEPATH_SEARCH_FTS_TABLE: &str = "document_filepath_search_fts";
 
 // ---------------------------------------------------------------------------
 // Document
@@ -99,6 +101,7 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
                 ],
             )
             .context("failed to update document row")?;
+            sync_document_filepath_search_row(conn, existing.id, &doc.filepath)?;
             mark_documents_stale_in_queue_time(conn, &[existing.id], doc.updated_at)?;
             (existing.id, true)
         }
@@ -116,7 +119,9 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
                 ],
             )
             .context("failed to insert document row")?;
-            (conn.last_insert_rowid(), true)
+            let doc_id = conn.last_insert_rowid();
+            sync_document_filepath_search_row(conn, doc_id, &doc.filepath)?;
+            (doc_id, true)
         }
     };
 
@@ -644,6 +649,111 @@ pub fn search_documents_by_embedding(
         .context("failed to collect vector search results")
 }
 
+/// Search document filepaths using the SQLite FTS5 trigram index when possible.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `query` - Raw filepath search query.
+/// * `limit` - Maximum number of document hits to return.
+///
+/// # Returns
+///
+/// Matching documents ordered from best to worst filepath match.
+///
+/// # Errors
+///
+/// Returns an error if the SQLite query fails.
+pub fn search_documents_by_filepath_fuzzy(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DocumentFilepathSearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let normalized_query = normalize_filepath_search_value(query);
+    if normalized_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if normalized_query.chars().count() < 3 {
+        return search_documents_by_filepath_like(conn, &normalized_query, limit);
+    }
+
+    let match_query = fts5_quote(&normalized_query);
+    let candidate_limit = expanded_filepath_candidate_limit(limit);
+
+    // Motivation: keep the SQL structure close to quick Postgres trigram
+    // search ideas so this can be ported later if the repo ever switches
+    // away from SQLite.
+    // https://rdegges.com/2013/easy-fuzzy-text-searching-with-postgresql/
+    let mut stmt = conn
+        .prepare(&format!(
+            "WITH ranked AS (
+                 SELECT rowid AS document_id,
+                        bm25({fts_table}, 1.0, 5.0) AS fts_score
+                 FROM {fts_table}
+                 WHERE {fts_table} MATCH ?1
+                 ORDER BY fts_score ASC
+                 LIMIT ?2
+             )
+             SELECT d.id,
+                    d.filepath,
+                    CASE
+                        WHEN s.normalized_basename = ?3 OR s.normalized_filepath = ?3 THEN 1.0
+                        WHEN s.normalized_basename LIKE '%' || ?3 || '%' THEN 0.9
+                        WHEN s.normalized_filepath LIKE '%' || ?3 || '%' THEN 0.75
+                        WHEN ranked.fts_score < 0.0 THEN 0.5
+                        ELSE 0.5 / (1.0 + ranked.fts_score)
+                    END AS match_score
+             FROM ranked
+             JOIN {search_table} s ON s.document_id = ranked.document_id
+             JOIN documents d ON d.id = ranked.document_id
+             ORDER BY
+                 CASE
+                     WHEN s.normalized_basename = ?3 OR s.normalized_filepath = ?3 THEN 0
+                     WHEN s.normalized_basename LIKE '%' || ?3 || '%' THEN 1
+                     WHEN s.normalized_filepath LIKE '%' || ?3 || '%' THEN 2
+                     ELSE 3
+                 END ASC,
+                 CASE
+                     WHEN s.normalized_basename = ?3 OR s.normalized_basename LIKE '%' || ?3 || '%'
+                         THEN length(s.normalized_basename)
+                     ELSE length(s.normalized_filepath)
+                 END ASC,
+                 ranked.fts_score ASC,
+                 length(s.normalized_filepath) ASC,
+                 d.id ASC
+             LIMIT ?4",
+            fts_table = DOCUMENT_FILEPATH_SEARCH_FTS_TABLE,
+            search_table = DOCUMENT_FILEPATH_SEARCH_TABLE,
+        ))
+        .context("failed to prepare search_documents_by_filepath_fuzzy query")?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                match_query,
+                candidate_limit as i64,
+                normalized_query,
+                limit as i64
+            ],
+            |row| {
+                Ok(DocumentFilepathSearchResult {
+                    document_id: row.get(0)?,
+                    filepath: row.get(1)?,
+                    match_score: row.get(2)?,
+                })
+            },
+        )
+        .context("failed to query filepath fuzzy search results")?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to collect filepath fuzzy search results")
+}
+
 /// Enqueue one `embed_document` job for each distinct queued document/model pair.
 ///
 /// Rows in either `pending` or `stale` state are considered work that still needs
@@ -709,6 +819,106 @@ pub fn seed_embed_jobs(conn: &Connection, now: i64) -> Result<usize> {
 
 fn is_job_already_queued_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("already queued or in progress")
+}
+
+fn search_documents_by_filepath_like(
+    conn: &Connection,
+    normalized_query: &str,
+    limit: usize,
+) -> Result<Vec<DocumentFilepathSearchResult>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT d.id,
+                    d.filepath,
+                    CASE
+                        WHEN s.normalized_basename = ?1 OR s.normalized_filepath = ?1 THEN 1.0
+                        WHEN s.normalized_basename LIKE '%' || ?1 || '%' THEN 0.9
+                        ELSE 0.75
+                    END AS match_score
+             FROM {search_table} s
+             JOIN documents d ON d.id = s.document_id
+             WHERE s.normalized_basename LIKE '%' || ?1 || '%'
+                OR s.normalized_filepath LIKE '%' || ?1 || '%'
+             ORDER BY
+                 CASE
+                     WHEN s.normalized_basename = ?1 OR s.normalized_filepath = ?1 THEN 0
+                     WHEN s.normalized_basename LIKE '%' || ?1 || '%' THEN 1
+                     ELSE 2
+                 END ASC,
+                 CASE
+                     WHEN s.normalized_basename = ?1 OR s.normalized_basename LIKE '%' || ?1 || '%'
+                         THEN length(s.normalized_basename)
+                     ELSE length(s.normalized_filepath)
+                 END ASC,
+                 length(s.normalized_filepath) ASC,
+                 d.id ASC
+             LIMIT ?2",
+            search_table = DOCUMENT_FILEPATH_SEARCH_TABLE,
+        ))
+        .context("failed to prepare short-query filepath search")?;
+
+    let rows = stmt
+        .query_map(params![normalized_query, limit as i64], |row| {
+            Ok(DocumentFilepathSearchResult {
+                document_id: row.get(0)?,
+                filepath: row.get(1)?,
+                match_score: row.get(2)?,
+            })
+        })
+        .context("failed to query short-query filepath search results")?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to collect short-query filepath search results")
+}
+
+fn normalize_filepath_search_value(value: &str) -> String {
+    value.trim().replace('\\', "/").to_lowercase()
+}
+
+fn basename_from_normalized_filepath(normalized_filepath: &str) -> String {
+    normalized_filepath
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(normalized_filepath)
+        .to_string()
+}
+
+fn fts5_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn expanded_filepath_candidate_limit(limit: usize) -> usize {
+    limit.saturating_mul(8).min(200).max(limit)
+}
+
+fn sync_document_filepath_search_row(conn: &Connection, doc_id: i64, filepath: &str) -> Result<()> {
+    let normalized_filepath = normalize_filepath_search_value(filepath);
+    let normalized_basename = basename_from_normalized_filepath(&normalized_filepath);
+
+    conn.execute(
+        &format!(
+            "INSERT INTO {search_table} (document_id, normalized_filepath, normalized_basename)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(document_id) DO UPDATE SET
+                 normalized_filepath = excluded.normalized_filepath,
+                 normalized_basename = excluded.normalized_basename",
+            search_table = DOCUMENT_FILEPATH_SEARCH_TABLE,
+        ),
+        params![doc_id, normalized_filepath, normalized_basename],
+    )
+    .with_context(|| format!("failed to sync filepath search row for document {doc_id}"))?;
+
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {fts_table}(rowid, normalized_filepath, normalized_basename)
+             VALUES (?1, ?2, ?3)",
+            fts_table = DOCUMENT_FILEPATH_SEARCH_FTS_TABLE,
+        ),
+        params![doc_id, normalized_filepath, normalized_basename],
+    )
+    .with_context(|| format!("failed to sync filepath search fts row for document {doc_id}"))?;
+
+    Ok(())
 }
 
 fn validate_query_embedding_dimensions(

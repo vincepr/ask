@@ -2897,6 +2897,12 @@ async fn search_provider_failure_returns_502() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
     assert_eq!(body["error"]["code"], "bad_gateway");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(r#""mode":"filepath_fuzzy""#)
+    );
 }
 
 #[tokio::test]
@@ -2919,6 +2925,129 @@ async fn search_without_active_model_state_returns_500() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
     assert_eq!(body["error"]["code"], "internal_error");
+}
+
+#[tokio::test]
+async fn filepath_fuzzy_search_returns_results_without_embedding_provider() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_path = db.create_file("MyImplementation.cs");
+    let other_path = db.create_file("MyImplementationTests.cs");
+    insert_document(&db.pool(), now, &doc_path);
+    insert_document(&db.pool(), now, &other_path);
+
+    let response = db
+        .router_with_embedding_client(Arc::new(DeterministicEmbeddingClient::fail_on_input("any")))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"MyImplementation","limit":2,"mode":"filepath_fuzzy"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let results = body.as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]["filepath"],
+        doc_path.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(
+        results[1]["filepath"],
+        other_path.canonicalize().unwrap().display().to_string()
+    );
+}
+
+#[tokio::test]
+async fn filepath_fuzzy_search_works_without_active_model_state() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_path = db.create_file("search-no-model.txt");
+    insert_document(&db.pool(), now, &doc_path);
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"search-no-model","limit":1,"mode":"filepath_fuzzy"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let results = body.as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["filepath"],
+        doc_path.canonicalize().unwrap().display().to_string()
+    );
+}
+
+#[tokio::test]
+async fn filepath_fuzzy_search_ignores_include_location() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_path = db.create_file("search-location-ignore.txt");
+    insert_document(&db.pool(), now, &doc_path);
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"location-ignore","limit":1,"mode":"filepath_fuzzy","include_location":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let result = &body.as_array().unwrap()[0];
+    assert!(result.get("byte_start").is_none());
+    assert!(result.get("byte_end").is_none());
+}
+
+#[tokio::test]
+async fn filepath_fuzzy_search_empty_index_returns_200_with_empty_results() {
+    let db = TempDb::new();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"nothing-here","limit":5,"mode":"filepath_fuzzy"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body, serde_json::json!([]));
 }
 
 #[tokio::test]
