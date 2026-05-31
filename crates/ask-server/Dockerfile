@@ -1,3 +1,12 @@
+# NOTE: Use Debian/glibc for now.
+# Verification path for future reevaluation:
+# - `sqlite-vec` currently fails to compile on Alpine/musl with fixed-width type
+#   errors (`u_int8_t`/`uint8_t`) in its C source.
+# - Re-check by running:
+#   `docker compose --profile tei build ask-server` with the former musl target
+#   (`rust:*-alpine` + `--target x86_64-unknown-linux-musl`).
+# - If that upstream issue is fixed (or if sqlite-vec is removed/migrated away),
+#   we can reconsider Alpine to reduce image size.
 FROM rust:1.86-bookworm AS builder
 
 RUN apt-get update \
