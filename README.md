@@ -62,3 +62,33 @@ Use an external OpenAI-compatible embeddings backend:
 ```bash
 docker compose up --build
 ```
+
+## Ingesting documents
+
+After the server is running, tell it what to index by POSTing to `/ingest`:
+
+```bash
+# Ingest the entire resource directory (the project root, mounted at /resources).
+curl -X POST http://localhost:13000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"root_path": "/resources"}'
+
+# Ingest the entire resource directory (the project root, mounted at /data). For now only the sqlite db lives here. But in the future might become a ai-managed folder for knowledge
+curl -X POST http://localhost:13000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"root_path": "/data"}'
+
+# Ingest only a subdirectory.
+curl -X POST http://localhost:13000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"root_path": "/resources/crates"}'
+
+# Ingest only markdown files.
+curl -X POST http://localhost:13000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"root_path": "/resources", "file_pattern": "**/*.md"}'
+```
+
+The `file_pattern` is an optional glob pattern. When omitted, all files under
+`root_path` are indexed. The `root_path` must be a subdirectory of
+`ASK_SERVER_RESOURCE_DIR` (`/resources` in Docker, `.` in local dev).
