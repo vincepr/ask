@@ -1,69 +1,40 @@
-# Docker Environment Config Surface
+# Docker Config Surface
 
-The docker-compose.yml and `.env` file share responsibility for configuration,
-but some variables are wired inconsistently between the two.
+## Goal
 
-| Variable | `.env` (local) | docker-compose.yml | Effective in Docker |
-|---|---|---|---|
-| `ASK_SERVER_EMBEDDING_BASE_URL` | `http://localhost:18080` | `http://tei:80` | correct override |
-| `ASK_SERVER_EMBEDDING_DIMENSIONS` | absent | absent | default `768` (should be `1024`) |
-| `ASK_SERVER_RESOURCE_DIR` | `.` | `/resources` | correct override |
-| `ASK_SERVER_EMBEDDING_MODE` | `tei` | `tei` (fallback) | correct |
-| `ASK_SERVER_EMBEDDING_AUTH_TOKEN` | absent | `${...:-}` | correct |
+Keep the Docker configuration explicit and unsurprising.
 
-Variables not explicitly set in docker-compose fall through to defaults defined
-in `config.rs`, not to `.env` values. Docker Compose loads `.env` for compose
-variable substitution (`${ASK_SERVER_EXPOSE_PORT:-13000}`), but this does not
-automatically set the corresponding container environment variable.
+## Decision
 
-## Questions
+- `docker-compose.yml` is the source of truth for environment variables injected
+  into containers.
+- Docker-only overrides must stay visible in `docker-compose.yml`.
+- `.env.example` remains focused on local non-Docker runs.
+- Do not add extra Docker-specific env files or config layers.
 
-- Should docker-compose explicitly list every configurable env var (becoming a
-  source of truth), or should it only override the values that differ between
-  local and Docker (minimal diff)?
-- If the latter, how does a user discover that `ASK_SERVER_EMBEDDING_DIMENSIONS`
-  needs to be set for Docker but is not mentioned in docker-compose.yml?
-- Should there be a Docker-specific env file (e.g., `.env.docker`) that is
-  loaded only by docker-compose, keeping `.env` clean for local runs?
-- Is the current split between compose-level variables (for compose
-  substitution) and container env vars (for the application) documented clearly
-  enough for someone new to the project?
-- What is the minimum set of env vars needed in docker-compose.yml to make the
-  stack work correctly without surprises?
+## Scope
 
-## Recommended Direction
+Most of the original problem is already fixed.
 
-- Make `docker-compose.yml` the explicit source of truth for container
-  environment passed into `ask-server`.
-- Avoid relying on app defaults for values that are required for the Docker
-  deployment to function correctly.
-- Keep the number of configuration layers low. Extra env files add indirection
-  quickly.
+The remaining work is only to keep the Compose env contract small, explicit, and
+ verified when Docker-specific settings change.
 
-## Implementation Notes
+## Implementation Plan
 
-- Prefer explicitly listing the application env vars needed by the container,
-  even if some simply forward compose variables through.
-- Separate two concerns clearly:
-  - variables used by Compose for template substitution
-  - variables actually injected into the container process
-- Keep local non-Docker development simple by documenting the smaller `.env`
-  contract there, instead of making Docker behavior implicit.
-- If a value differs between local runs and Docker runs, that difference should
-  be visible in `docker-compose.yml`, not hidden in code defaults.
+1. Keep required container env vars explicit in `docker-compose.yml`.
+2. Keep Docker-only overrides there when they differ from local defaults.
+3. Avoid moving Docker-required behavior back into implicit code defaults.
+4. Add or keep a minimal smoke-path for validating the Compose config surface
+   when Docker settings are changed.
 
-## Dependencies and Sequencing
+## Non-Goals
 
-- This is lower priority than the core embedding and recovery work because it is
-  mostly a deployment-surface cleanup.
-- It does, however, remove confusion around provider settings needed by the
-  earlier embedding features.
+- No config-system redesign.
+- No `.env.docker` file.
+- No new abstraction around Docker vs local config.
 
-## Test Expectations
+## Acceptance Criteria
 
-- Config-loading tests for Docker-specific environment combinations.
-- At minimum, a documented smoke path that proves the Compose environment
-  injects all required embedding settings.
-
----
-_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
+- A developer can read `docker-compose.yml` and see the effective container env.
+- Docker-specific required settings are not hidden in app defaults.
+- Local `.env.example` stays small and separate from container wiring.
