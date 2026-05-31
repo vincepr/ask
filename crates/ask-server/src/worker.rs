@@ -467,12 +467,12 @@ struct PreparedChunk {
 }
 
 fn prepare_embedded_chunks(path: &Path, model: &EmbeddingModel) -> Result<Vec<PreparedChunk>> {
-    let filepath = path.to_string_lossy();
+    let filepath = path.to_string_lossy().into_owned();
     let filename = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| filepath.into_owned());
+        .unwrap_or_else(|| filepath.clone());
     let mut chunks = vec![PreparedChunk {
         chunk_type: ChunkType::Filename,
         chunk_start: 0,
@@ -484,10 +484,15 @@ fn prepare_embedded_chunks(path: &Path, model: &EmbeddingModel) -> Result<Vec<Pr
         Ok(content) if !content.is_empty() => content,
         Ok(_) => return Ok(chunks),
         Err(err) => {
+            if err.kind() != std::io::ErrorKind::InvalidData {
+                return Err(err)
+                    .with_context(|| format!("failed to read document content from {filepath}"));
+            }
+
             warn!(
-                path = %path.to_string_lossy(),
+                path = %filepath,
                 error = %err,
-                "skipping content embedding for unreadable file"
+                "skipping content embedding for non-utf8 file"
             );
             return Ok(chunks);
         }

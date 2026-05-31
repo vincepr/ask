@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_core::migrations;
@@ -20,6 +21,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+static WORKING_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn current_time() -> i64 {
     SystemTime::now()
@@ -92,21 +94,22 @@ fn embedding_identity_changes_create_distinct_model_rows() {
 }
 
 fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i64 {
-    let metadata = std::fs::metadata(path).unwrap();
+    let canonical_path = path.canonicalize().unwrap();
+    let metadata = std::fs::metadata(&canonical_path).unwrap();
     let file_modified_at = metadata
         .modified()
         .unwrap()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let file_type = path
+    let file_type = canonical_path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_string();
     let document = ask_core::models::Document {
         id: 0,
-        filepath: path.to_string_lossy().into_owned(),
+        filepath: canonical_path.to_string_lossy().into_owned(),
         file_type,
         doc_category: DocCategory::Resource,
         file_modified_at,
@@ -1557,6 +1560,133 @@ async fn embed_document_provider_failure_keeps_job_claimed_and_rows_unchanged() 
         )
         .unwrap();
     assert_eq!(claimed_at, Some(now + 2));
+}
+
+#[tokio::test]
+async fn embed_document_job_uses_stored_absolute_path_independent_of_working_directory() {
+    let _working_directory_guard = WORKING_DIRECTORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let original_cwd = std::env::current_dir().unwrap();
+
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "embed-cwd");
+    let other_dir = db.create_dir("other-cwd");
+
+    let file_path = db.create_file("cwd-independent.txt");
+    std::fs::write(&file_path, "abcdefghij").unwrap();
+    let document_id = insert_document(&db.pool(), now, &file_path);
+
+    let conn = db.pool().get().unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
+        rusqlite::params![
+            document_id,
+            model_id,
+            ChunkType::Filename,
+            EmbedState::Pending,
+            now
+        ],
+    )
+    .unwrap();
+
+    let payload = serde_json::to_string(&EmbedDocumentPayload {
+        document_id,
+        model_id,
+    })
+    .unwrap();
+    repository::enqueue_job(&conn, &JobType::EmbedDocument, &payload, now + 1).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
+    drop(conn);
+
+    std::env::set_current_dir(&other_dir).unwrap();
+    let dispatch_result = dispatch_job(&db.pool(), &entry, model_id, test_embedding_client());
+    std::env::set_current_dir(&original_cwd).unwrap();
+
+    dispatch_result.unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let content_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2 AND chunk_type = 'content' AND state = 'embedded'",
+            rusqlite::params![document_id, model_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(content_count, 1);
+}
+
+#[tokio::test]
+async fn embed_document_missing_file_returns_error_for_stored_path() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "embed-missing-file");
+
+    let file_path = db.create_file("gone.txt");
+    std::fs::write(&file_path, "abcdefghij").unwrap();
+    let document_id = insert_document(&db.pool(), now, &file_path);
+    let stored_path = file_path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::remove_file(&file_path).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
+        rusqlite::params![
+            document_id,
+            model_id,
+            ChunkType::Filename,
+            EmbedState::Pending,
+            now
+        ],
+    )
+    .unwrap();
+
+    let payload = serde_json::to_string(&EmbedDocumentPayload {
+        document_id,
+        model_id,
+    })
+    .unwrap();
+    repository::enqueue_job(&conn, &JobType::EmbedDocument, &payload, now + 1).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
+    drop(conn);
+
+    let err = dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap_err();
+    let err_text = format!("{err:#}");
+    assert!(err_text.contains("failed to read document content from"));
+    assert!(err_text.contains(&stored_path));
+
+    let conn = db.pool().get().unwrap();
+    let claimed_at: Option<i64> = conn
+        .query_row(
+            "SELECT claimed_at FROM job_queue WHERE id = ?1",
+            [entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_at, Some(now + 2));
+
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2 AND chunk_type = 'filename'",
+            rusqlite::params![document_id, model_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
 }
 
 #[tokio::test]

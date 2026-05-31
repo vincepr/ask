@@ -10,8 +10,8 @@ The worker should read the stored document path exactly as written in the
 
 ## Decision
 
-- This feature does not define path storage semantics. That is already defined by
-  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md).
+- This feature does not define path storage semantics. It assumes the existing
+  ingest contract that `documents.filepath` is a canonical absolute path.
 - The worker must treat `documents.filepath` as the exact absolute path to open.
 - The worker must not resolve relative paths, prepend resource roots, or attempt
   path repair.
@@ -71,5 +71,5 @@ This keeps responsibility boundaries clear.
 - Worker file access does not depend on process working directory.
 - Worker code contains no alternate path resolution strategy.
 - Job failures include useful path context when file reads fail.
-- The worker remains a thin consumer of the filepath invariant defined by
-  feature 006.
+- The worker remains a thin consumer of the ingest-established filepath
+  invariant.
