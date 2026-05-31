@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use ask_core::models::{Document, EmbeddingModel, IngestFolderPayload, JobQueueEntry};
+use ask_core::models::{
+    Document, EmbedDocumentPayload, EmbeddingModel, IngestFolderPayload, JobQueueEntry,
+};
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, JobType};
 use ignore::WalkBuilder;
@@ -99,6 +101,8 @@ pub fn backfill_pending_for_model(
         count += 1;
     }
 
+    repository::seed_embed_jobs(conn, now)?;
+
     Ok(count)
 }
 
@@ -147,6 +151,7 @@ where
 
 fn resolve_handler(job_type: JobType) -> Box<dyn JobHandler> {
     match job_type {
+        JobType::EmbedDocument => Box::new(EmbedDocumentHandler),
         JobType::IngestFolder => Box::new(IngestFolderHandler),
     }
 }
@@ -165,6 +170,25 @@ fn complete_job(pool: &DbPool, job_id: i64) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct IngestFolderHandler;
+
+struct EmbedDocumentHandler;
+
+impl JobHandler for EmbedDocumentHandler {
+    fn job_type(&self) -> JobType {
+        JobType::EmbedDocument
+    }
+
+    fn process(&self, ctx: JobContext<'_>) -> Result<()> {
+        let payload: EmbedDocumentPayload = serde_json::from_str(&ctx.entry.payload)
+            .with_context(|| format!("failed to decode payload for job {}", ctx.entry.id))?;
+
+        Err(anyhow!(
+            "embed_document execution is not implemented yet for document {} and model {}",
+            payload.document_id,
+            payload.model_id
+        ))
+    }
+}
 
 impl JobHandler for IngestFolderHandler {
     fn job_type(&self) -> JobType {

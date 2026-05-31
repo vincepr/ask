@@ -180,20 +180,24 @@ impl ToSql for ChunkType {
 /// Discriminant for every async job variant stored in the job_queue table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobType {
+    EmbedDocument,
     IngestFolder,
 }
 
 impl JobType {
+    pub const EMBED_DOCUMENT: &'static str = "embed_document";
     pub const INGEST_FOLDER: &'static str = "ingest_folder";
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::EmbedDocument => Self::EMBED_DOCUMENT,
             Self::IngestFolder => Self::INGEST_FOLDER,
         }
     }
 
     pub fn try_from_str(s: &str) -> Option<Self> {
         match s {
+            Self::EMBED_DOCUMENT => Some(Self::EmbedDocument),
             Self::INGEST_FOLDER => Some(Self::IngestFolder),
             _ => None,
         }

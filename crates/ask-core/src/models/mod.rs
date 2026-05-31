@@ -6,4 +6,6 @@ pub mod job_queue;
 pub use document::Document;
 pub use document_embedding::DocumentEmbedding;
 pub use embedding_model::EmbeddingModel;
-pub use job_queue::{DEFAULT_FILE_PATTERN, IngestFolderPayload, JobQueueEntry};
+pub use job_queue::{
+    DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderPayload, JobQueueEntry,
+};

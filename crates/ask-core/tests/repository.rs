@@ -1,7 +1,7 @@
-use ask_core::models::{Document, JobQueueEntry};
+use ask_core::models::{Document, EmbedDocumentPayload, JobQueueEntry};
 use ask_core::repository::{
     claim_job, complete_job, enqueue_job, find_document_by_path, insert_pending_embeddings,
-    upsert_document, upsert_document_and_replace_pending_embeddings,
+    seed_embed_jobs, upsert_document, upsert_document_and_replace_pending_embeddings,
 };
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use rusqlite::{Connection, params};
@@ -47,9 +47,18 @@ fn setup_documents_db() -> Connection {
             state           TEXT    NOT NULL,
             embedding       BLOB,
             created_at      INTEGER NOT NULL
-        );
-        CREATE UNIQUE INDEX idx_embeddings_unique
-            ON document_embeddings (document_id, model_id, chunk_type, chunk_start);",
+         );
+         CREATE UNIQUE INDEX idx_embeddings_unique
+            ON document_embeddings (document_id, model_id, chunk_type, chunk_start);
+         CREATE TABLE job_queue (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             job_type    TEXT    NOT NULL,
+             payload     TEXT    NOT NULL,
+             claimed_at  INTEGER,
+             created_at  INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX idx_job_queue_unique
+             ON job_queue (job_type, payload);",
     )
     .expect("document schema must be created");
     conn
@@ -533,6 +542,110 @@ fn transactional_document_ingest_keeps_existing_pending_rows_when_unchanged() {
         )
         .unwrap();
     assert_eq!(embedding_count, 1);
+}
+
+#[test]
+fn seed_embed_jobs_enqueues_one_job_per_distinct_document_model_pair() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    let (doc_id, _) = upsert_document(&mut conn, &doc).unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES
+            (?1, 7, ?2, 0, 0, ?3, 100),
+            (?1, 7, ?4, 0, 8, ?3, 100),
+            (?1, 9, ?2, 0, 0, ?5, 100)",
+        params![
+            doc_id,
+            ChunkType::Filename,
+            EmbedState::Pending,
+            ChunkType::Content,
+            EmbedState::Stale,
+        ],
+    )
+    .unwrap();
+
+    let seeded = seed_embed_jobs(&conn, 200).unwrap();
+    assert_eq!(seeded, 2);
+
+    let queued: Vec<(JobType, EmbedDocumentPayload)> = conn
+        .prepare("SELECT job_type, payload FROM job_queue ORDER BY payload")
+        .unwrap()
+        .query_map([], |row| {
+            let job_type = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let payload = serde_json::from_str(&payload)
+                .expect("EmbedDocumentPayload JSON must decode in tests");
+            Ok((job_type, payload))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(
+        queued,
+        vec![
+            (
+                JobType::EmbedDocument,
+                EmbedDocumentPayload {
+                    document_id: doc_id,
+                    model_id: 7,
+                },
+            ),
+            (
+                JobType::EmbedDocument,
+                EmbedDocumentPayload {
+                    document_id: doc_id,
+                    model_id: 9,
+                },
+            ),
+        ]
+    );
+}
+
+#[test]
+fn seed_embed_jobs_deduplicates_repeated_calls() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    let (doc_id, _) = upsert_document(&mut conn, &doc).unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, 100)",
+        params![doc_id, 7, ChunkType::Filename, EmbedState::Pending],
+    )
+    .unwrap();
+
+    assert_eq!(seed_embed_jobs(&conn, 200).unwrap(), 1);
+    assert_eq!(seed_embed_jobs(&conn, 201).unwrap(), 0);
+
+    let job_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM job_queue WHERE job_type = ?1",
+            [JobType::EmbedDocument],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(job_count, 1);
 }
 
 #[test]

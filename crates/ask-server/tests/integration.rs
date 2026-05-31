@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ask_core::models::{DEFAULT_FILE_PATTERN, IngestFolderPayload};
+use ask_core::models::{DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderPayload};
 use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
@@ -132,6 +132,20 @@ fn ingest_payload_with_pattern(root_path: &std::path::Path, file_pattern: &str) 
         file_pattern: file_pattern.to_string(),
     })
     .unwrap()
+}
+
+fn count_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM job_queue WHERE job_type = ?1",
+        [job_type],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn delete_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) {
+    conn.execute("DELETE FROM job_queue WHERE job_type = ?1", [job_type])
+        .unwrap();
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -586,11 +600,8 @@ async fn ingest_folder_inserts_documents_and_pending_embeddings() {
         "expected 6 content chunks (hello.txt:2 + main.rs:4)"
     );
 
-    // Verify: the job was completed (removed from queue).
-    let job_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(job_count, 0, "job should be removed from queue");
+    assert_eq!(count_jobs_by_type(&conn, JobType::IngestFolder), 0);
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 3);
 }
 
 #[tokio::test]
@@ -774,6 +785,7 @@ async fn ingest_folder_skips_unchanged_files() {
         .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
         .unwrap();
     assert_eq!(doc_count_1, 1);
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
 
     // Second ingest — same files, unchanged.
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now + 10).unwrap();
@@ -836,6 +848,7 @@ async fn ingest_folder_updates_existing_document_when_file_changes() {
         [first_doc_id],
     )
     .unwrap();
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
     drop(conn);
 
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -925,6 +938,7 @@ async fn ingest_folder_path_variants_reuse_same_document_row() {
 
     let later = current_time();
     let conn = db.pool().get().unwrap();
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
     repository::enqueue_job(&conn, &JobType::IngestFolder, &second_payload, later).unwrap();
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, later + 1)
@@ -1081,6 +1095,7 @@ async fn multiple_ingest_jobs_sequentially_all_complete() {
     dispatch_job(&db.pool(), &entry1, model_id).unwrap();
 
     let conn = db.pool().get().unwrap();
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload2, now + 10).unwrap();
     let mut conn = db.pool().get().unwrap();
     let entry2 = repository::claim_job(&mut conn, now + 11).unwrap().unwrap();
@@ -1092,10 +1107,8 @@ async fn multiple_ingest_jobs_sequentially_all_complete() {
         .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
         .unwrap();
     assert_eq!(doc_count, 3, "all files from both dirs ingested");
-    let job_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM job_queue", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(job_count, 0, "both jobs completed");
+    assert_eq!(count_jobs_by_type(&conn, JobType::IngestFolder), 0);
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 3);
 }
 
 #[tokio::test]
@@ -1328,6 +1341,30 @@ async fn new_model_backfill_queues_filename_and_content_embeddings_for_existing_
     let seeded = backfill_pending_for_model(&conn, &model, now + 1).unwrap();
     assert_eq!(seeded, 2, "both existing documents should be backfilled");
 
+    let queued_jobs: Vec<EmbedDocumentPayload> = conn
+        .prepare("SELECT payload FROM job_queue WHERE job_type = ?1 ORDER BY payload")
+        .unwrap()
+        .query_map([JobType::EmbedDocument], |row| {
+            let payload: String = row.get(0)?;
+            Ok(serde_json::from_str(&payload).expect("embed payload must decode"))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        queued_jobs,
+        vec![
+            EmbedDocumentPayload {
+                document_id: 1,
+                model_id: model.id,
+            },
+            EmbedDocumentPayload {
+                document_id: 2,
+                model_id: model.id,
+            },
+        ]
+    );
+
     let filename_emb: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM document_embeddings WHERE model_id = ?1 AND chunk_type = 'filename'",
@@ -1461,6 +1498,7 @@ async fn mark_stale_batch_updates_embeddings() {
         )
         .unwrap();
     assert_eq!(embedded_count, 1, "doc 2 still has 1 embedded embedding");
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 1);
 }
 
 #[tokio::test]
@@ -1548,6 +1586,7 @@ async fn mark_stale_nonexistent_ids_is_noop() {
         )
         .unwrap();
     assert_eq!(stale_count, 0, "no rows were marked stale");
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 0);
 }
 
 #[tokio::test]
@@ -1668,4 +1707,5 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
         )
         .unwrap();
     assert_eq!(doc1_embedded, 0, "doc 1 has no remaining 'embedded' rows");
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 2);
 }

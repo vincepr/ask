@@ -27,6 +27,13 @@ pub struct IngestFolderPayload {
     pub file_pattern: String,
 }
 
+/// Payload for an EmbedDocument job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedDocumentPayload {
+    pub document_id: i64,
+    pub model_id: i64,
+}
+
 fn default_file_pattern() -> String {
     DEFAULT_FILE_PATTERN.to_string()
 }

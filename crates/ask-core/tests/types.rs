@@ -15,13 +15,13 @@ fn sql_round_trip_decodes_every_persisted_enum() {
         .query_row("SELECT ?1", [ChunkType::Filename], |row| row.get(0))
         .expect("chunk type round-trip must succeed");
     let job_type: JobType = conn
-        .query_row("SELECT ?1", [JobType::IngestFolder], |row| row.get(0))
+        .query_row("SELECT ?1", [JobType::EmbedDocument], |row| row.get(0))
         .expect("job type round-trip must succeed");
 
     assert_eq!(doc_category, DocCategory::KnowledgeFile);
     assert_eq!(embed_state, EmbedState::Embedded);
     assert_eq!(chunk_type, ChunkType::Filename);
-    assert_eq!(job_type, JobType::IngestFolder);
+    assert_eq!(job_type, JobType::EmbedDocument);
 }
 
 #[test]

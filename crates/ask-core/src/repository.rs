@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::models::{Document, EmbeddingModel, JobQueueEntry};
+use crate::models::{Document, EmbedDocumentPayload, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
 /// A job with a claim older than this (in seconds) is considered dead and can
@@ -95,7 +95,7 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
                 ],
             )
             .context("failed to update document row")?;
-            mark_documents_stale(conn, &[existing.id])?;
+            mark_documents_stale_in_queue_time(conn, &[existing.id], doc.updated_at)?;
             (existing.id, true)
         }
         None => {
@@ -181,6 +181,7 @@ where
     before_queue()?;
     delete_pending_embeddings_for_model(&tx, doc_id, model_id)?;
     insert_pending_embeddings(&tx, doc_id, model_id, chunks, now)?;
+    seed_embed_jobs(&tx, now)?;
 
     tx.commit()
         .context("failed to commit transactional document ingest")?;
@@ -198,6 +199,10 @@ pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option
 /// left as-is. Document IDs that do not exist in the `documents` table are silently
 /// filtered out by the subquery.
 pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
+    mark_documents_stale_in_queue_time(conn, doc_ids, current_unix_timestamp())
+}
+
+fn mark_documents_stale_in_queue_time(conn: &Connection, doc_ids: &[i64], now: i64) -> Result<()> {
     if doc_ids.is_empty() {
         return Ok(());
     }
@@ -225,6 +230,8 @@ pub fn mark_documents_stale(conn: &Connection, doc_ids: &[i64]) -> Result<()> {
 
     stmt.execute(param_refs.as_slice())
         .context("failed to mark embeddings as stale")?;
+
+    seed_embed_jobs(conn, now)?;
 
     Ok(())
 }
@@ -397,6 +404,80 @@ pub fn delete_pending_embeddings_for_model(
     .context("failed to delete pending embeddings")?;
 
     Ok(())
+}
+
+/// Enqueue one `embed_document` job for each distinct queued document/model pair.
+///
+/// Rows in either `pending` or `stale` state are considered work that still needs
+/// an embedding pass. Existing queue uniqueness on `(job_type, payload)` is used to
+/// deduplicate repeated seeding calls.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `now` - Unix timestamp stored on newly queued jobs.
+///
+/// # Returns
+///
+/// The number of jobs newly enqueued or refreshed from a stale claim.
+///
+/// # Errors
+///
+/// Returns an error if the distinct pair query fails, payload serialization fails,
+/// or queue insertion fails for reasons other than a duplicate active job.
+pub fn seed_embed_jobs(conn: &Connection, now: i64) -> Result<usize> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT document_id, model_id
+             FROM document_embeddings
+             WHERE state IN (?1, ?2)
+             ORDER BY document_id ASC, model_id ASC",
+        )
+        .context("failed to prepare seed_embed_jobs query")?;
+
+    let pairs = stmt
+        .query_map(params![EmbedState::Pending, EmbedState::Stale], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .context("failed to query distinct embedding jobs to seed")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to collect distinct embedding jobs to seed")?;
+
+    let mut seeded = 0usize;
+
+    for (document_id, model_id) in pairs {
+        let payload = serde_json::to_string(&EmbedDocumentPayload {
+            document_id,
+            model_id,
+        })
+        .expect("EmbedDocumentPayload is always serializable");
+
+        match enqueue_job(conn, &JobType::EmbedDocument, &payload, now) {
+            Ok(()) => seeded += 1,
+            Err(err) if is_job_already_queued_error(&err) => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to enqueue embed_document job for document {} and model {}",
+                        document_id, model_id
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(seeded)
+}
+
+fn is_job_already_queued_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("already queued or in progress")
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs() as i64
 }
 
 #[cfg(test)]
