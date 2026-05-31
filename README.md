@@ -86,9 +86,17 @@ curl -X POST http://localhost:13000/ingest \
 # Ingest only markdown files.
 curl -X POST http://localhost:13000/ingest \
   -H "Content-Type: application/json" \
-  -d '{"root_path": "/resources", "file_pattern": "**/*.md"}'
+  -d '{"root_path": "/resources", "file_pattern": "(?i)^.+\\.md$"}'
+
+# Ingest using git-tracked file selection when the target contains repos.
+curl -X POST http://localhost:13000/ingest/git \
+  -H "Content-Type: application/json" \
+  -d '{"root_path": "/resources"}'
 ```
 
-The `file_pattern` is an optional glob pattern. When omitted, all files under
-`root_path` are indexed. The `root_path` must be a subdirectory of
+The `file_pattern` is an optional regex applied to normalized relative paths.
+When omitted, all files under `root_path` are indexed. `POST /ingest/git`
+uses git-tracked files for detected repos and falls back to normal directory
+walking for plain directories under the requested root. The `root_path` must be
+a subdirectory of
 `ASK_SERVER_RESOURCE_DIR` (`/resources` in Docker, `.` in local dev).

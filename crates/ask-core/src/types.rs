@@ -182,16 +182,19 @@ impl ToSql for ChunkType {
 pub enum JobType {
     EmbedDocument,
     IngestFolder,
+    IngestFolderGit,
 }
 
 impl JobType {
     pub const EMBED_DOCUMENT: &'static str = "embed_document";
     pub const INGEST_FOLDER: &'static str = "ingest_folder";
+    pub const INGEST_FOLDER_GIT: &'static str = "ingest_folder_git";
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::EmbedDocument => Self::EMBED_DOCUMENT,
             Self::IngestFolder => Self::INGEST_FOLDER,
+            Self::IngestFolderGit => Self::INGEST_FOLDER_GIT,
         }
     }
 
@@ -199,6 +202,7 @@ impl JobType {
         match s {
             Self::EMBED_DOCUMENT => Some(Self::EmbedDocument),
             Self::INGEST_FOLDER => Some(Self::IngestFolder),
+            Self::INGEST_FOLDER_GIT => Some(Self::IngestFolderGit),
             _ => None,
         }
     }

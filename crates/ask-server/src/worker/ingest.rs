@@ -1,0 +1,617 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, anyhow};
+use ask_core::models::{Document, EmbeddingModel, IngestFolderPayload};
+use ask_core::repository;
+use ask_core::types::{ChunkType, DocCategory, JobType};
+use ignore::WalkBuilder;
+use regex::Regex;
+use tracing::{info, warn};
+
+use super::{JobContext, JobHandler, unix_now};
+use crate::ingest;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
+const GIT_IGNORED_FILE_EXTENSIONS: &[&str] = &[
+    "7z", "bin", "bz2", "db", "dll", "dylib", "exe", "gif", "gz", "ico", "jpeg", "jpg", "pdf",
+    "png", "rar", "so", "sqlite", "tar", "webp", "xz", "zip",
+];
+
+pub(super) struct IngestFolderHandler;
+pub(super) struct IngestFolderGitHandler;
+
+impl JobHandler for IngestFolderHandler {
+    fn job_type(&self) -> JobType {
+        JobType::IngestFolder
+    }
+
+    fn process(&self, ctx: JobContext<'_>) -> Result<()> {
+        let payload: IngestFolderPayload = serde_json::from_str(&ctx.entry.payload)
+            .with_context(|| format!("failed to decode payload for job {}", ctx.entry.id))?;
+        let root_path = Path::new(&payload.root_path);
+        let file_pattern = ingest::compile_file_pattern(&payload.file_pattern)
+            .with_context(|| format!("failed to compile file pattern for job {}", ctx.entry.id))?;
+
+        if !root_path.is_dir() {
+            warn!(
+                job_id = ctx.entry.id,
+                path = %payload.root_path,
+                "ingest_folder path is missing or not a directory; completing job"
+            );
+            return Ok(());
+        }
+
+        info!(
+            job_id = ctx.entry.id,
+            path = %payload.root_path,
+            file_pattern = %payload.file_pattern,
+            "processing ingest_folder job"
+        );
+
+        let model = load_ingest_model(&ctx)?;
+        ingest_walk_root(
+            &ctx,
+            root_path,
+            root_path,
+            &file_pattern,
+            &model,
+            &[],
+            false,
+        )
+    }
+}
+
+impl JobHandler for IngestFolderGitHandler {
+    fn job_type(&self) -> JobType {
+        JobType::IngestFolderGit
+    }
+
+    fn process(&self, ctx: JobContext<'_>) -> Result<()> {
+        let payload: IngestFolderPayload = serde_json::from_str(&ctx.entry.payload)
+            .with_context(|| format!("failed to decode payload for job {}", ctx.entry.id))?;
+        let root_path = Path::new(&payload.root_path);
+        let file_pattern = ingest::compile_file_pattern(&payload.file_pattern)
+            .with_context(|| format!("failed to compile file pattern for job {}", ctx.entry.id))?;
+
+        if !root_path.is_dir() {
+            warn!(
+                job_id = ctx.entry.id,
+                path = %payload.root_path,
+                "ingest_folder_git path is missing or not a directory; completing job"
+            );
+            return Ok(());
+        }
+
+        info!(
+            job_id = ctx.entry.id,
+            path = %payload.root_path,
+            file_pattern = %payload.file_pattern,
+            "processing ingest_folder_git job"
+        );
+
+        let model = load_ingest_model(&ctx)?;
+        let plan = build_git_ingest_plan(root_path)
+            .with_context(|| format!("failed to discover git roots under {}", payload.root_path))?;
+
+        for repo_root in &plan.repo_roots {
+            ingest_git_repo(&ctx, root_path, repo_root, &file_pattern, &model)?;
+        }
+
+        if let Some(fallback_root) = plan.fallback_root.as_deref() {
+            ingest_walk_root(
+                &ctx,
+                root_path,
+                fallback_root,
+                &file_pattern,
+                &model,
+                &plan.skipped_walk_roots,
+                false,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn load_ingest_model(ctx: &JobContext<'_>) -> Result<EmbeddingModel> {
+    let conn = ctx.pool.get().with_context(|| {
+        format!(
+            "failed to acquire connection to load model {} for job {}",
+            ctx.ingest_model_id, ctx.entry.id
+        )
+    })?;
+
+    repository::find_model_by_id(&conn, ctx.ingest_model_id)?.with_context(|| {
+        format!(
+            "embedding model {} not found for job {}",
+            ctx.ingest_model_id, ctx.entry.id
+        )
+    })
+}
+
+fn ingest_git_repo(
+    ctx: &JobContext<'_>,
+    request_root: &Path,
+    repo_root: &Path,
+    file_pattern: &Regex,
+    model: &EmbeddingModel,
+) -> Result<()> {
+    let tracked_paths = git_list_tracked_files(repo_root)
+        .with_context(|| format!("failed to list tracked files for {}", repo_root.display()))?;
+
+    for tracked_path in tracked_paths {
+        let candidate_path = repo_root.join(tracked_path);
+        ingest_candidate_file(
+            ctx,
+            request_root,
+            &candidate_path,
+            file_pattern,
+            model,
+            true,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ingest_walk_root(
+    ctx: &JobContext<'_>,
+    request_root: &Path,
+    walk_root: &Path,
+    file_pattern: &Regex,
+    model: &EmbeddingModel,
+    skipped_roots: &[PathBuf],
+    apply_git_filters: bool,
+) -> Result<()> {
+    let walk_root = walk_root.to_path_buf();
+    let skipped_roots = skipped_roots.to_vec();
+    let walker = WalkBuilder::new(&walk_root)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            should_visit_walk_entry(entry.path(), &walk_root, &skipped_roots)
+        })
+        .build();
+
+    for entry_result in walker {
+        let dir_entry = match entry_result {
+            Ok(dir_entry) => dir_entry,
+            Err(err) => {
+                warn!(
+                    job_id = ctx.entry.id,
+                    error = %err,
+                    "failed to walk directory entry; continuing"
+                );
+                continue;
+            }
+        };
+
+        let file_type = match dir_entry.file_type() {
+            Some(file_type) => file_type,
+            None => {
+                warn!(
+                    job_id = ctx.entry.id,
+                    path = ?dir_entry.path(),
+                    "failed to read directory entry type; continuing"
+                );
+                continue;
+            }
+        };
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        ingest_candidate_file(
+            ctx,
+            request_root,
+            &dir_entry.into_path(),
+            file_pattern,
+            model,
+            apply_git_filters,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ingest_candidate_file(
+    ctx: &JobContext<'_>,
+    request_root: &Path,
+    candidate_path: &Path,
+    file_pattern: &Regex,
+    model: &EmbeddingModel,
+    apply_git_filters: bool,
+) -> Result<()> {
+    let relative_path = match ingest::normalize_relative_path(request_root, candidate_path) {
+        Some(relative_path) => relative_path,
+        None => return Ok(()),
+    };
+
+    if !file_pattern.is_match(&relative_path) {
+        return Ok(());
+    }
+
+    if apply_git_filters && should_skip_git_candidate(candidate_path) {
+        return Ok(());
+    }
+
+    let canonical_path = match std::fs::canonicalize(candidate_path) {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(
+                job_id = ctx.entry.id,
+                path = ?candidate_path,
+                error = %err,
+                "failed to canonicalize file path; continuing"
+            );
+            return Ok(());
+        }
+    };
+
+    let metadata = match std::fs::metadata(&canonical_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warn!(
+                job_id = ctx.entry.id,
+                path = ?canonical_path,
+                error = %err,
+                "failed to read file metadata; continuing"
+            );
+            return Ok(());
+        }
+    };
+
+    if !metadata.is_file() {
+        return Ok(());
+    }
+
+    let now = unix_now();
+    let filepath = canonical_path.to_string_lossy().into_owned();
+    let file_type = canonical_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_string();
+    let file_modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(now);
+    let file_size = metadata.len() as i64;
+
+    let mut conn = ctx
+        .pool
+        .get()
+        .with_context(|| format!("failed to acquire connection while ingesting {filepath}"))?;
+
+    let doc = Document {
+        id: 0,
+        filepath: filepath.clone(),
+        file_type,
+        doc_category: DocCategory::Resource,
+        file_modified_at,
+        file_size,
+        updated_at: now,
+    };
+
+    let chunk_refs = plan_pending_embeddings_for_document(&canonical_path, model)
+        .with_context(|| format!("failed to plan pending embeddings for {filepath}"))?;
+
+    repository::upsert_document_and_replace_pending_embeddings(
+        &mut conn,
+        &doc,
+        model.id,
+        &chunk_refs,
+        now,
+    )
+    .with_context(|| format!("failed to ingest document for {filepath}"))?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitIngestPlan {
+    repo_roots: Vec<PathBuf>,
+    fallback_root: Option<PathBuf>,
+    skipped_walk_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoMarker {
+    Repo,
+    Submodule,
+}
+
+fn build_git_ingest_plan(root_path: &Path) -> Result<GitIngestPlan> {
+    if let Some(repo_root) = discover_enclosing_repo_root(root_path)? {
+        return Ok(GitIngestPlan {
+            repo_roots: vec![repo_root],
+            fallback_root: None,
+            skipped_walk_roots: Vec::new(),
+        });
+    }
+
+    let mut repo_roots = Vec::new();
+    let mut skipped_walk_roots = Vec::new();
+    let mut stack = vec![root_path.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        match detect_repo_marker(&dir)? {
+            Some(RepoMarker::Repo) => {
+                repo_roots.push(dir);
+                continue;
+            }
+            Some(RepoMarker::Submodule) => {
+                skipped_walk_roots.push(dir);
+                continue;
+            }
+            None => {}
+        }
+
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory {}", dir.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("failed to inspect directory entry under {}", dir.display())
+            })?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to read entry type under {}", dir.display()))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            stack.push(entry.path());
+        }
+    }
+
+    skipped_walk_roots.extend(repo_roots.iter().cloned());
+
+    Ok(GitIngestPlan {
+        repo_roots,
+        fallback_root: Some(root_path.to_path_buf()),
+        skipped_walk_roots,
+    })
+}
+
+fn discover_enclosing_repo_root(root_path: &Path) -> Result<Option<PathBuf>> {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(root_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to invoke git for {}", root_path.display()));
+        }
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let repo_root = String::from_utf8(output.stdout)
+        .context("git rev-parse returned non-utf8 path")?
+        .trim()
+        .to_string();
+    if repo_root.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PathBuf::from(repo_root)))
+}
+
+fn detect_repo_marker(dir: &Path) -> Result<Option<RepoMarker>> {
+    let git_path = dir.join(".git");
+    let metadata = match std::fs::symlink_metadata(&git_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to inspect git metadata at {}", git_path.display())
+            });
+        }
+    };
+
+    if metadata.is_dir() {
+        if !git_path.join("HEAD").is_file() {
+            return Ok(None);
+        }
+        return Ok(Some(RepoMarker::Repo));
+    }
+
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let gitdir = parse_gitdir_pointer(dir, &git_path)?;
+    if gitdir_points_to_submodule(&gitdir) {
+        return Ok(Some(RepoMarker::Submodule));
+    }
+
+    Ok(Some(RepoMarker::Repo))
+}
+
+fn parse_gitdir_pointer(dir: &Path, git_file: &Path) -> Result<PathBuf> {
+    let raw = std::fs::read_to_string(git_file)
+        .with_context(|| format!("failed to read {}", git_file.display()))?;
+    let gitdir = raw
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("invalid gitdir pointer in {}", git_file.display()))?;
+
+    let gitdir = Path::new(gitdir);
+    if gitdir.is_absolute() {
+        return Ok(gitdir.to_path_buf());
+    }
+
+    Ok(dir.join(gitdir))
+}
+
+fn gitdir_points_to_submodule(gitdir: &Path) -> bool {
+    let mut saw_dot_git = false;
+
+    for component in gitdir.components() {
+        let std::path::Component::Normal(part) = component else {
+            continue;
+        };
+
+        if saw_dot_git && part == "modules" {
+            return true;
+        }
+
+        saw_dot_git = part == ".git";
+    }
+
+    false
+}
+
+fn git_list_tracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--cached", "-z"])
+        .output()
+        .with_context(|| format!("failed to invoke git for {}", repo_root.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "git ls-files failed for {}: {}",
+            repo_root.display(),
+            stderr.trim()
+        ));
+    }
+
+    Ok(parse_git_path_list(&output.stdout))
+}
+
+fn parse_git_path_list(stdout: &[u8]) -> Vec<PathBuf> {
+    stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|path| !path.is_empty())
+        .map(path_from_git_output)
+        .collect()
+}
+
+fn path_from_git_output(raw: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(raw).into_owned())
+    }
+}
+
+fn should_visit_walk_entry(path: &Path, walk_root: &Path, skipped_roots: &[PathBuf]) -> bool {
+    if path == walk_root {
+        return true;
+    }
+
+    !skipped_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn should_skip_git_candidate(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+
+    match extension.as_deref() {
+        Some(extension) => GIT_IGNORED_FILE_EXTENSIONS.contains(&extension),
+        None => false,
+    }
+}
+
+pub(super) fn queue_pending_embeddings_for_document(
+    conn: &rusqlite::Connection,
+    path: &Path,
+    doc_id: i64,
+    model: &EmbeddingModel,
+    now: i64,
+) -> Result<()> {
+    let filepath = path.to_string_lossy();
+
+    let chunk_refs = plan_pending_embeddings_for_document(path, model)?;
+
+    repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
+        .with_context(|| format!("failed to queue embeddings for {filepath}"))?;
+
+    Ok(())
+}
+
+fn plan_pending_embeddings_for_document(
+    path: &Path,
+    model: &EmbeddingModel,
+) -> Result<Vec<(ChunkType, i64, i64)>> {
+    let filepath = path.to_string_lossy();
+    let mut chunk_refs = vec![(ChunkType::Filename, 0, 0)];
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) if !content.is_empty() => content,
+        Ok(_) => return Ok(chunk_refs),
+        Err(err) => {
+            warn!(
+                path = %filepath,
+                error = %err,
+                "skipping content chunking for unreadable file"
+            );
+            return Ok(chunk_refs);
+        }
+    };
+
+    chunk_refs.extend(
+        chunk_content(
+            &content,
+            model.chunk_size as usize,
+            model.chunk_overlap as usize,
+        )
+        .into_iter()
+        .map(|(start, end)| (ChunkType::Content, start as i64, end as i64)),
+    );
+
+    Ok(chunk_refs)
+}
+
+/// Split `content` into overlapping chunks by byte offset.
+/// Each chunk covers at most `chunk_size` bytes; consecutive chunks overlap
+/// by `overlap` bytes.
+pub(super) fn chunk_content(
+    content: &str,
+    chunk_size: usize,
+    overlap: usize,
+) -> Vec<(usize, usize)> {
+    if content.is_empty() || chunk_size == 0 {
+        return Vec::new();
+    }
+
+    let len = content.len();
+    let step = chunk_size.saturating_sub(overlap);
+    if step == 0 {
+        return vec![(0, len)];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < len {
+        let end = std::cmp::min(start + chunk_size, len);
+        chunks.push((start, end));
+        if end >= len {
+            break;
+        }
+        start += step;
+    }
+
+    chunks
+}

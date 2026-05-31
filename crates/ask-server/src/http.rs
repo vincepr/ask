@@ -90,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api.html", get(api_reference))
         .route("/search", post(search))
         .route("/ingest", post(ingest))
+        .route("/ingest/git", post(ingest_git))
         .route("/documents/stale", post(mark_stale))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)
@@ -97,7 +98,7 @@ pub fn router(state: AppState) -> Router {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, search, ingest, mark_stale),
+    paths(health, search, ingest, ingest_git, mark_stale),
     components(schemas(IngestRequest, MarkStalePayload, SearchRequest, SearchDocumentResult))
 )]
 struct ApiDoc;
@@ -214,7 +215,7 @@ async fn search(
 /// inside a single `spawn_blocking` call so that no async-runtime thread is
 /// ever blocked by a filesystem syscall or a `pool.get()` wait.
 enum IngestOutcome {
-    Queued,
+    Queued(JobType),
     NotFound(String),
     NotADirectory(String),
     OutsideAllowedRoot(String),
@@ -224,6 +225,7 @@ enum IngestOutcome {
 
 #[derive(Debug, Deserialize, ToSchema)]
 struct IngestRequest {
+    #[schema(example = "/resources")]
     root_path: String,
     file_pattern: Option<String>,
 }
@@ -236,6 +238,26 @@ struct IngestRequest {
 async fn ingest(
     State(state): State<AppState>,
     Json(body): Json<IngestRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    queue_ingest_request(state, body, JobType::IngestFolder).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/ingest/git",
+    request_body = IngestRequest
+)]
+async fn ingest_git(
+    State(state): State<AppState>,
+    Json(body): Json<IngestRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    queue_ingest_request(state, body, JobType::IngestFolderGit).await
+}
+
+async fn queue_ingest_request(
+    state: AppState,
+    body: IngestRequest,
+    job_type: JobType,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = state.pool().clone();
     let resource_root = state.resource_root.clone();
@@ -279,8 +301,8 @@ async fn ingest(
             Err(e) => return IngestOutcome::Conflict(format!("database error: {e}")),
         };
 
-        match ask_core::repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now) {
-            Ok(()) => IngestOutcome::Queued,
+        match ask_core::repository::enqueue_job(&conn, &job_type, &payload_json, now) {
+            Ok(()) => IngestOutcome::Queued(job_type),
             Err(e) => IngestOutcome::Conflict(e.to_string()),
         }
     })
@@ -294,8 +316,8 @@ async fn ingest(
     })?;
 
     match result {
-        IngestOutcome::Queued => Ok(Json(
-            json!({ "status": "queued", "job_type": "ingest_folder" }),
+        IngestOutcome::Queued(job_type) => Ok(Json(
+            json!({ "status": "queued", "job_type": job_type.as_str() }),
         )),
         IngestOutcome::NotFound(p) => Err(error_response(
             StatusCode::NOT_FOUND,

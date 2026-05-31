@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -206,6 +207,42 @@ fn count_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) -> i64 {
     .unwrap()
 }
 
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git command failed: git -C {} {}\nstderr: {}",
+        dir.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_repo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    run_git(dir, &["init", "-q"]);
+}
+
+fn stage_git_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).arg("add").arg("--");
+    for path in paths {
+        command.arg(path);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "git add failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn delete_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) {
     conn.execute("DELETE FROM job_queue WHERE job_type = ?1", [job_type])
         .unwrap();
@@ -399,6 +436,31 @@ async fn ingest_valid_dir_returns_200() {
 }
 
 #[tokio::test]
+async fn ingest_git_valid_dir_returns_200() {
+    let db = TempDb::new();
+    let dir = db.create_dir("git_resources");
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest/git")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["status"], "queued");
+    assert_eq!(body["job_type"], "ingest_folder_git");
+}
+
+#[tokio::test]
 async fn ingest_path_outside_resource_root_returns_403() {
     let db = TempDb::new();
     let outside_dir = unique_temp_dir();
@@ -574,6 +636,81 @@ async fn ingest_duplicate_path_returns_409() {
             .unwrap()
             .contains("already queued or in progress")
     );
+}
+
+#[tokio::test]
+async fn ingest_git_duplicate_path_returns_409() {
+    let db = TempDb::new();
+    let dir = db.create_dir("git_docs");
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let res1 = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest/git")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    let res2 = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest/git")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res2.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn ingest_and_ingest_git_same_payload_queue_independently() {
+    let db = TempDb::new();
+    let dir = db.create_dir("split_strategy");
+    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+
+    let ingest_res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ingest_res.status(), StatusCode::OK);
+
+    let git_res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest/git")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(git_res.status(), StatusCode::OK);
+
+    let conn = db.pool().get().unwrap();
+    assert_eq!(count_jobs_by_type(&conn, JobType::IngestFolder), 1);
+    assert_eq!(count_jobs_by_type(&conn, JobType::IngestFolderGit), 1);
 }
 
 #[tokio::test]
@@ -865,6 +1002,281 @@ async fn ingest_folder_ignore_files_and_regex_filter_compose() {
     let payload_json = ingest_payload_with_pattern(&ingest_dir, r"^docs/.+\.txt$");
     let conn = db.pool().get().unwrap();
     repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![keep_file.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_git_only_ingests_tracked_files() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_tracked");
+
+    let ingest_dir = db.create_dir("git_tracked");
+    init_git_repo(&ingest_dir);
+
+    let tracked_file = ingest_dir.join("src").join("tracked.rs");
+    let untracked_file = ingest_dir.join("notes.txt");
+    std::fs::create_dir_all(tracked_file.parent().unwrap()).unwrap();
+    std::fs::write(&tracked_file, "fn tracked() {}\n").unwrap();
+    std::fs::write(&untracked_file, "local notes\n").unwrap();
+    stage_git_paths(&ingest_dir, &[tracked_file.as_path()]);
+
+    let payload_json = ingest_payload(&ingest_dir);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![tracked_file.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_git_uses_enclosing_repo_for_subdirectory_roots() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_subdir");
+
+    let repo_root = db.create_dir("git_subdir_repo");
+    init_git_repo(&repo_root);
+
+    let request_root = repo_root.join("services").join("pricing");
+    let tracked_inside = request_root.join("tracked.rs");
+    let tracked_outside = repo_root.join("README.md");
+    let untracked_inside = request_root.join("notes.txt");
+    std::fs::create_dir_all(&request_root).unwrap();
+    std::fs::write(&tracked_inside, "fn tracked() {}\n").unwrap();
+    std::fs::write(&tracked_outside, "root readme\n").unwrap();
+    std::fs::write(&untracked_inside, "draft\n").unwrap();
+    stage_git_paths(
+        &repo_root,
+        &[tracked_inside.as_path(), tracked_outside.as_path()],
+    );
+
+    let payload_json = ingest_payload(&request_root);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![tracked_inside.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_git_discovers_nested_repos_and_falls_back_for_plain_dirs() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_nested");
+
+    let root = db.create_dir("company_name");
+    let repo_one = root.join("library_name").join("domain").join("prices");
+    let repo_two = root
+        .join("libaray_name")
+        .join("non-production")
+        .join("somedeploymentrepo");
+    let plain_dir = root.join("notes");
+    init_git_repo(&repo_one);
+    init_git_repo(&repo_two);
+    std::fs::create_dir_all(&plain_dir).unwrap();
+
+    let repo_one_file = repo_one.join("src").join("main.rs");
+    let repo_two_file = repo_two.join("deploy.yaml");
+    let plain_file = plain_dir.join("todo.txt");
+    std::fs::create_dir_all(repo_one_file.parent().unwrap()).unwrap();
+    std::fs::write(&repo_one_file, "fn main() {}\n").unwrap();
+    std::fs::write(&repo_two_file, "service: deploy\n").unwrap();
+    std::fs::write(&plain_file, "plain fallback\n").unwrap();
+    stage_git_paths(&repo_one, &[repo_one_file.as_path()]);
+    stage_git_paths(&repo_two, &[repo_two_file.as_path()]);
+
+    let payload_json = ingest_payload(&root);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![
+            repo_two_file.canonicalize().unwrap().display().to_string(),
+            repo_one_file.canonicalize().unwrap().display().to_string(),
+            plain_file.canonicalize().unwrap().display().to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_git_git_command_failure_keeps_job_claimed() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_failure");
+
+    let broken_repo = db.create_dir("broken_git_repo");
+    let fake_git_dir = broken_repo.join(".git");
+    std::fs::create_dir_all(&fake_git_dir).unwrap();
+    std::fs::write(fake_git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(broken_repo.join("tracked.txt"), "content\n").unwrap();
+
+    let payload_json = ingest_payload(&broken_repo);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    let err = dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap_err();
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text.contains("git ls-files failed"),
+        "unexpected error: {err:#}"
+    );
+
+    let conn = db.pool().get().unwrap();
+    let claimed_at: Option<i64> = conn
+        .query_row(
+            "SELECT claimed_at FROM job_queue WHERE id = ?1",
+            [entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_at, Some(now + 1));
+
+    let document_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(document_count, 0);
+}
+
+#[tokio::test]
+async fn ingest_folder_git_skips_submodule_directories() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_submodule");
+
+    let root = db.create_dir("git_submodule");
+    let plain_file = root.join("README.md");
+    let submodule_dir = root.join("vendor").join("child");
+    std::fs::create_dir_all(&submodule_dir).unwrap();
+    std::fs::create_dir_all(root.join(".git").join("modules").join("child")).unwrap();
+    std::fs::write(&plain_file, "hello\n").unwrap();
+    std::fs::write(
+        submodule_dir.join(".git"),
+        "gitdir: ../../.git/modules/child\n",
+    )
+    .unwrap();
+    std::fs::write(submodule_dir.join("secret.txt"), "should stay skipped\n").unwrap();
+
+    let payload_json = ingest_payload(&root);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let ingested_paths: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT filepath FROM documents ORDER BY filepath")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ingested_paths,
+        vec![plain_file.canonicalize().unwrap().display().to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ingest_folder_git_applies_builtin_extension_denylist() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "git_denylist");
+
+    let ingest_dir = db.create_dir("git_denylist");
+    init_git_repo(&ingest_dir);
+
+    let keep_file = ingest_dir.join("notes.txt");
+    let skip_file = ingest_dir.join("image.png");
+    std::fs::write(&keep_file, "hello\n").unwrap();
+    std::fs::write(&skip_file, [0x89, b'P', b'N', b'G']).unwrap();
+    stage_git_paths(&ingest_dir, &[keep_file.as_path(), skip_file.as_path()]);
+
+    let payload_json = ingest_payload(&ingest_dir);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolderGit, &payload_json, now).unwrap();
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
