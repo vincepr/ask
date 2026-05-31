@@ -21,6 +21,8 @@ ignore = "0.4.24"
 regex = "1.12.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sqlite-vec = "0.1.9"
+utoipa = "5.4.0"
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }

@@ -6,10 +6,13 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
+    response::Html,
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::DbPool;
 use crate::ingest;
@@ -61,14 +64,32 @@ impl std::ops::Deref for AppState {
 /// Returns the HTTP router with all routes registered.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(api_reference))
         .route("/health", get(health))
+        .route("/api.html", get(api_reference))
         .route("/ingest", post(ingest))
         .route("/documents/stale", post(mark_stale))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(health, ingest, mark_stale),
+    components(schemas(IngestRequest, MarkStalePayload))
+)]
+struct ApiDoc;
+
+#[utoipa::path(
+    get,
+    path = "/health"
+)]
 async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
+}
+
+async fn api_reference() -> Html<&'static str> {
+    Html(include_str!("../static/api.html"))
 }
 
 /// Discriminated outcome of the ingest validation + enqueue step, produced
@@ -83,12 +104,17 @@ enum IngestOutcome {
     Conflict(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct IngestRequest {
     root_path: String,
     file_pattern: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/ingest",
+    request_body = IngestRequest
+)]
 async fn ingest(
     State(state): State<AppState>,
     Json(body): Json<IngestRequest>,
@@ -177,11 +203,16 @@ async fn ingest(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct MarkStalePayload {
     document_ids: Vec<i64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/documents/stale",
+    request_body = MarkStalePayload
+)]
 async fn mark_stale(
     State(pool): State<AppState>,
     Json(body): Json<MarkStalePayload>,

@@ -35,7 +35,6 @@ pub type SharedEmbeddingClient = Arc<dyn EmbeddingClient>;
 #[derive(Debug, Clone)]
 pub struct HttpEmbeddingClient {
     provider: EmbeddingProvider,
-    client: Client,
 }
 
 impl HttpEmbeddingClient {
@@ -51,13 +50,9 @@ impl HttpEmbeddingClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying HTTP client cannot be created.
+    /// Returns an error if provider configuration is invalid.
     pub fn new(provider: EmbeddingProvider) -> Result<Self> {
-        let client = Client::builder()
-            .build()
-            .context("failed to build embedding HTTP client")?;
-
-        Ok(Self { provider, client })
+        Ok(Self { provider })
     }
 }
 
@@ -76,7 +71,10 @@ impl EmbeddingClient for HttpEmbeddingClient {
             input: inputs,
         };
 
-        let mut http_request = self.client.post(url).json(&request);
+        let client = Client::builder()
+            .build()
+            .context("failed to build embedding HTTP client")?;
+        let mut http_request = client.post(url).json(&request);
         if let EmbeddingProvider::OpenAi { auth_token, .. } = &self.provider {
             http_request = http_request.bearer_auth(auth_token);
         }
