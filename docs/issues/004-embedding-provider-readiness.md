@@ -1,5 +1,9 @@
 # Embedding Provider Readiness and Transient Failures
 
+# Human analysis
+- to keep the implementation we do not want any health checking etc...
+- there is another feature/improvment targeting a better queue-job model that should solve these problems in it's own way. keep the ticket untill that is done then re-iterate.
+
 ## Problem
 
 The worker does not account for the embedding provider being temporarily
