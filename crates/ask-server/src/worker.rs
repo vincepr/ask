@@ -314,18 +314,21 @@ impl JobHandler for IngestFolderHandler {
                 updated_at: now,
             };
 
-            let (doc_id, changed) = repository::upsert_document(&mut conn, &doc)
-                .with_context(|| format!("failed to upsert document for {filepath}"))?;
+            let chunk_refs = plan_pending_embeddings_for_document(&canonical_path, &model)
+                .with_context(|| format!("failed to plan pending embeddings for {filepath}"))?;
+
+            let (_doc_id, changed) = repository::upsert_document_and_replace_pending_embeddings(
+                &mut conn,
+                &doc,
+                model.id,
+                &chunk_refs,
+                now,
+            )
+            .with_context(|| format!("failed to ingest document for {filepath}"))?;
 
             if !changed {
                 continue;
             }
-
-            repository::delete_pending_embeddings_for_model(&conn, doc_id, model.id)
-                .with_context(|| format!("failed to clear pending embeddings for {filepath}"))?;
-
-            queue_pending_embeddings_for_document(&conn, &canonical_path, doc_id, &model, now)
-                .with_context(|| format!("failed to queue pending embeddings for {filepath}"))?;
         }
 
         Ok(())
@@ -341,45 +344,45 @@ fn queue_pending_embeddings_for_document(
 ) -> Result<()> {
     let filepath = path.to_string_lossy();
 
-    repository::insert_pending_embeddings(
-        conn,
-        doc_id,
-        model.id,
-        &[(ChunkType::Filename, 0, 0)],
-        now,
-    )
-    .with_context(|| format!("failed to queue filename embedding for {filepath}"))?;
+    let chunk_refs = plan_pending_embeddings_for_document(path, model)?;
+
+    repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
+        .with_context(|| format!("failed to queue embeddings for {filepath}"))?;
+
+    Ok(())
+}
+
+fn plan_pending_embeddings_for_document(
+    path: &Path,
+    model: &EmbeddingModel,
+) -> Result<Vec<(ChunkType, i64, i64)>> {
+    let filepath = path.to_string_lossy();
+    let mut chunk_refs = vec![(ChunkType::Filename, 0, 0)];
 
     let content = match std::fs::read_to_string(path) {
         Ok(content) if !content.is_empty() => content,
-        Ok(_) => return Ok(()),
+        Ok(_) => return Ok(chunk_refs),
         Err(err) => {
             warn!(
                 path = %filepath,
                 error = %err,
                 "skipping content chunking for unreadable file"
             );
-            return Ok(());
+            return Ok(chunk_refs);
         }
     };
 
-    let chunk_refs: Vec<(ChunkType, i64, i64)> = chunk_content(
-        &content,
-        model.chunk_size as usize,
-        model.chunk_overlap as usize,
-    )
-    .into_iter()
-    .map(|(start, end)| (ChunkType::Content, start as i64, end as i64))
-    .collect();
+    chunk_refs.extend(
+        chunk_content(
+            &content,
+            model.chunk_size as usize,
+            model.chunk_overlap as usize,
+        )
+        .into_iter()
+        .map(|(start, end)| (ChunkType::Content, start as i64, end as i64)),
+    );
 
-    if chunk_refs.is_empty() {
-        return Ok(());
-    }
-
-    repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
-        .with_context(|| format!("failed to queue content embeddings for {filepath}"))?;
-
-    Ok(())
+    Ok(chunk_refs)
 }
 
 /// Split `content` into overlapping chunks by byte offset.

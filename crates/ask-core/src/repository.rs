@@ -58,7 +58,14 @@ pub fn upsert_document(conn: &mut Connection, doc: &Document) -> Result<(i64, bo
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("failed to start upsert_document transaction")?;
 
-    let existing = load_document_by_path(&tx, &doc.filepath)?;
+    let outcome = upsert_document_in_tx(&tx, doc)?;
+
+    tx.commit().context("failed to commit upsert_document")?;
+    Ok(outcome)
+}
+
+fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool)> {
+    let existing = load_document_by_path(conn, &doc.filepath)?;
 
     let outcome = match existing {
         Some(existing)
@@ -70,7 +77,7 @@ pub fn upsert_document(conn: &mut Connection, doc: &Document) -> Result<(i64, bo
             (existing.id, false)
         }
         Some(existing) => {
-            tx.execute(
+            conn.execute(
                 "UPDATE documents
                  SET file_type = ?1,
                      doc_category = ?2,
@@ -88,11 +95,11 @@ pub fn upsert_document(conn: &mut Connection, doc: &Document) -> Result<(i64, bo
                 ],
             )
             .context("failed to update document row")?;
-            mark_documents_stale(&tx, &[existing.id])?;
+            mark_documents_stale(conn, &[existing.id])?;
             (existing.id, true)
         }
         None => {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -105,12 +112,79 @@ pub fn upsert_document(conn: &mut Connection, doc: &Document) -> Result<(i64, bo
                 ],
             )
             .context("failed to insert document row")?;
-            (tx.last_insert_rowid(), true)
+            (conn.last_insert_rowid(), true)
         }
     };
 
-    tx.commit().context("failed to commit upsert_document")?;
     Ok(outcome)
+}
+
+/// Upsert one document and replace its pending embedding work in one transaction.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc` - Canonical document snapshot to persist.
+/// * `model_id` - Embedding model identifier whose pending work should be refreshed.
+/// * `chunks` - Pending chunks to queue for the document and model.
+/// * `now` - Unix timestamp stored on any queued embedding rows.
+///
+/// # Returns
+///
+/// A tuple of `(document_id, changed)`. `changed` is `true` when the document row
+/// was inserted or updated and its pending embedding rows were refreshed.
+///
+/// # Errors
+///
+/// Returns an error if the transaction, document write, pending-row delete,
+/// pending-row insert, or commit fails.
+pub fn upsert_document_and_replace_pending_embeddings(
+    conn: &mut Connection,
+    doc: &Document,
+    model_id: i64,
+    chunks: &[(ChunkType, i64, i64)],
+    now: i64,
+) -> Result<(i64, bool)> {
+    upsert_document_and_replace_pending_embeddings_with_hook(
+        conn,
+        doc,
+        model_id,
+        chunks,
+        now,
+        || Ok(()),
+    )
+}
+
+fn upsert_document_and_replace_pending_embeddings_with_hook<F>(
+    conn: &mut Connection,
+    doc: &Document,
+    model_id: i64,
+    chunks: &[(ChunkType, i64, i64)],
+    now: i64,
+    before_queue: F,
+) -> Result<(i64, bool)>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start transactional document ingest")?;
+
+    let (doc_id, changed) = upsert_document_in_tx(&tx, doc)?;
+
+    if !changed {
+        tx.commit()
+            .context("failed to commit transactional document ingest")?;
+        return Ok((doc_id, false));
+    }
+
+    before_queue()?;
+    delete_pending_embeddings_for_model(&tx, doc_id, model_id)?;
+    insert_pending_embeddings(&tx, doc_id, model_id, chunks, now)?;
+
+    tx.commit()
+        .context("failed to commit transactional document ingest")?;
+    Ok((doc_id, true))
 }
 
 /// Find a document by its filepath.
@@ -323,6 +397,83 @@ pub fn delete_pending_embeddings_for_model(
     .context("failed to delete pending embeddings")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChunkType, DocCategory};
+
+    fn setup_documents_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory database must open");
+        conn.execute_batch(
+            "CREATE TABLE documents (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                filepath         TEXT NOT NULL,
+                file_type        TEXT NOT NULL,
+                doc_category     TEXT NOT NULL,
+                file_modified_at INTEGER NOT NULL,
+                file_size        INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL
+            );
+            CREATE TABLE document_embeddings (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                model_id        INTEGER NOT NULL,
+                chunk_type      TEXT    NOT NULL,
+                chunk_start     INTEGER NOT NULL,
+                chunk_end       INTEGER NOT NULL,
+                state           TEXT    NOT NULL,
+                embedding       BLOB,
+                created_at      INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_embeddings_unique
+                ON document_embeddings (document_id, model_id, chunk_type, chunk_start);",
+        )
+        .expect("document schema must be created");
+        conn
+    }
+
+    #[test]
+    fn transactional_document_ingest_rolls_back_when_queue_step_fails() {
+        let mut conn = setup_documents_db();
+        let doc = Document {
+            id: 0,
+            filepath: "/tmp/a.txt".to_string(),
+            file_type: "txt".to_string(),
+            doc_category: DocCategory::Resource,
+            file_modified_at: 100,
+            file_size: 10,
+            updated_at: 100,
+        };
+
+        let err = upsert_document_and_replace_pending_embeddings_with_hook(
+            &mut conn,
+            &doc,
+            1,
+            &[(ChunkType::Filename, 0, 0)],
+            100,
+            || anyhow::bail!("synthetic queue failure"),
+        )
+        .expect_err("synthetic queue failure must abort the transaction");
+
+        assert!(
+            err.to_string().contains("synthetic queue failure"),
+            "unexpected error: {err:#}"
+        );
+
+        let document_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+            .expect("document count query must succeed");
+        let embedding_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_embeddings", [], |row| {
+                row.get(0)
+            })
+            .expect("embedding count query must succeed");
+
+        assert_eq!(document_count, 0);
+        assert_eq!(embedding_count, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

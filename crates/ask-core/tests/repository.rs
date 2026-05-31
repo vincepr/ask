@@ -1,7 +1,7 @@
 use ask_core::models::{Document, JobQueueEntry};
 use ask_core::repository::{
     claim_job, complete_job, enqueue_job, find_document_by_path, insert_pending_embeddings,
-    upsert_document,
+    upsert_document, upsert_document_and_replace_pending_embeddings,
 };
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use rusqlite::{Connection, params};
@@ -439,6 +439,100 @@ fn insert_pending_embeddings_replaces_existing_row() {
     assert_eq!(state, EmbedState::Pending);
     assert_eq!(embedding_is_null, 1);
     assert_eq!(created_at, 200);
+}
+
+#[test]
+fn transactional_document_ingest_replaces_pending_embeddings() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    let (doc_id, changed) = upsert_document_and_replace_pending_embeddings(
+        &mut conn,
+        &doc,
+        7,
+        &[(ChunkType::Filename, 0, 0), (ChunkType::Content, 0, 8)],
+        100,
+    )
+    .unwrap();
+
+    assert!(changed);
+
+    let queued: Vec<(ChunkType, i64, i64, EmbedState)> = conn
+        .prepare(
+            "SELECT chunk_type, chunk_start, chunk_end, state
+             FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2
+             ORDER BY chunk_type, chunk_start",
+        )
+        .unwrap()
+        .query_map(params![doc_id, 7], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(
+        queued,
+        vec![
+            (ChunkType::Content, 0, 8, EmbedState::Pending),
+            (ChunkType::Filename, 0, 0, EmbedState::Pending),
+        ]
+    );
+}
+
+#[test]
+fn transactional_document_ingest_keeps_existing_pending_rows_when_unchanged() {
+    let mut conn = setup_documents_db();
+    let doc = Document {
+        id: 0,
+        filepath: "/tmp/a.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 10,
+        updated_at: 100,
+    };
+
+    let (doc_id, _) =
+        upsert_document_and_replace_pending_embeddings(&mut conn, &doc, 7, &[], 100).unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            doc_id,
+            7,
+            ChunkType::Filename,
+            0,
+            0,
+            EmbedState::Pending,
+            100
+        ],
+    )
+    .unwrap();
+
+    let (_, changed) =
+        upsert_document_and_replace_pending_embeddings(&mut conn, &doc, 7, &[], 200).unwrap();
+
+    assert!(!changed);
+
+    let embedding_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
+            params![doc_id, 7],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedding_count, 1);
 }
 
 #[test]
