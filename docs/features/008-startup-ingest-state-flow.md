@@ -1,135 +1,138 @@
-# Startup State Flow: Silent Empty State
+# Startup State Flow
 
-After deleting the old DB and restarting, the server starts, creates a fresh
-schema, registers the embedding model, and sits idle — no documents, no jobs,
-no errors. From the outside, everything looks healthy: the HTTP server responds
-to `/health`, the worker polls every 5s and finds nothing, logs are clean.
+## Goal
 
-There is no indication that the system is effectively inert until an external
-action (an ingest request) is taken.
+Make startup explicit, predictable, and cheap.
 
-## How We Got Here
+A freshly started server should reconcile lightweight persisted state, surface
+ whether it has any work to do, and then begin serving. Startup must not hide
+ heavy ingest behavior, directory walks, or long-running maintenance behind a
+ "healthy" process state.
 
-The full startup flow (`crates/ask-server/src/bin/ask-server.rs`):
+## Problem
 
-1. **Config load** — reads env vars, picks defaults for anything unset.
-2. **Database init** — opens SQLite, runs pending migrations (creating tables
-   if empty).
-3. **Model lookup/insert** (`ask-server.rs:35-57`):
-   - If a row exists in `embedding_models` with `name='default'`: use it
-   - If not: insert one, then call `backfill_pending_for_model()` which
-     iterates `list_documents()` and enqueues `EmbedDocument` jobs
-4. **Vector index setup** — creates/rebuilds the sqlite-vec virtual table.
-5. **Worker spawn** — starts a background task that polls `job_queue` every 5s.
-6. **HTTP server** — serves endpoints, including `POST /ingest`.
+The current startup flow does the following:
 
-The critical point: step 3's backfill only produces jobs if documents already
-exist in the `documents` table. If the DB is fresh (zero documents), backfill
-is a no-op. The worker runs forever finding nothing.
+1. load config
+2. run DB migrations
+3. ensure the configured embedding model exists
+4. rebuild or confirm the active sqlite-vec index
+5. start the worker
+6. start the HTTP server
 
-Documents only enter the system through `POST /ingest`, which enqueues an
-`IngestFolder` job. That job walks the directory, upserts documents, and
-enqueues `EmbedDocument` jobs. Only then does embedding actually happen.
+That leaves two gaps:
 
-## The Unspoken Precondition
+- On a fresh database with zero documents, the server starts cleanly but gives no
+  actionable signal that nothing has been ingested yet.
+- When the embedding model already exists, startup does not currently guarantee
+  that recoverable pending work has been re-queued before the worker begins its
+  normal polling loop.
 
-The design assumes that either:
-- The user knows to call `POST /ingest` after startup, or
-- The DB is a pre-seeded artifact (from a previous run or backup)
+The result is a process that can be technically healthy while still being
+ operationally inert.
 
-Neither of these is discoverable from the server's runtime behavior. Logs show
-"applied pending migrations applied_count=0" and "ensured sqlite-vec search
-index ... backfilled=0" — accurate, but silent on what the user should do next.
+## Decision
 
-## Questions on State Flow Design
+- Keep ingest explicit. Startup must not auto-ingest the configured resource
+  directory.
+- Keep startup work cheap. Startup may run lightweight database reconciliation,
+  but it must not walk the filesystem or perform embedding work.
+- Run embedding-job reconciliation synchronously during startup.
+- Emit an explicit startup summary after reconciliation so empty or idle states
+  are obvious.
+- Do not add a recurring scheduler, a long-lived maintenance worker, or a new
+  queue job type for this feature.
 
-**Entry points for data:**
-- Should there be an auto-ingest at startup that walks the configured
-  `resource_dir` and ingests everything? This would make first-time setup
-  seamless but might be surprising if `resource_dir` is large or slow.
-- If auto-ingest exists, should it be opt-in (env var flag) or the default
-  behavior?
-- Should the `IngestFolderHandler` be invoked at startup for the configured
-  `resource_dir`, enqueuing the same job that `POST /ingest` would create?
+## Why This Design
 
-**Discoverability:**
-- Should the health endpoint or a status endpoint report "no documents, no
-  embeddings" as a warning state?
-- Should the startup log contain an explicit message like
-  "resource directory is empty or no documents found; use POST /ingest to
-  begin"?
+This is the smallest design that fixes the actual problem.
 
-**Backfill semantics:**
-- `backfill_pending_for_model` only runs for new models. Once a model exists,
-  re-ingesting documents or changing the resource directory requires manual
-  API calls. Should the server detect changes to the resource directory on
-  restart and re-ingest automatically?
-- If a model row exists but `document_embeddings` is empty for that model,
-  should that be treated the same as "new model" and trigger backfill?
-  (Currently it would not — the model lookup matches by name and returns the
-  existing row.)
+- It preserves the current architecture: explicit ingest, queued background
+  work, and a small worker loop.
+- It avoids hidden startup side effects such as unexpected directory scans.
+- It avoids adding a maintenance-job abstraction for work that is only a cheap
+  database reconciliation pass.
+- It improves reliability and operator clarity without turning startup into a
+  second orchestration system.
 
-**Orchestration vs simplicity:**
-- The current design is simple: a background worker polls a queue, the HTTP
-  server enqueues jobs, no cron, no watchers, no filesystem monitoring.
-- Adding auto-ingest, health-based state detection, or startup recovery adds
-  complexity. Where is the right balance for this project?
-- For a single-user, single-model, single-directory deployment (which appears
-  to be the primary use case), could the startup be simplified to:
-  - Walk the resource dir on startup
-  - Upsert all documents
-  - Backfill all pending embeddings
-  - Block until embedding completes
-  - Then serve?
-  This would eliminate the job queue entirely for this use case.
+## Non-Goals
 
-**Failure modes:**
-- The user deletes the DB to "reset" but doesn't know to re-ingest.
-- The user changes `resource_dir` in config but the old paths in the DB are
-  stale.
-- The user expects the server to "just work" pointing at a directory of files,
-  but nothing happens until they discover the API.
+- No startup auto-ingest.
+- No blocking startup on document indexing or embedding completion.
+- No recurring maintenance scheduler.
+- No new queue job type just to trigger cheap reconciliation logic.
+- No `/health` redesign in this feature. Health remains a basic liveness check.
+- No queue-model rewrite.
 
-## Recommended Direction
+## Required Startup Behavior
 
-- Keep the startup story explicit and simple.
-- Prefer a small amount of self-healing startup behavior over a silent healthy
-  but inert process.
-- Do not add continuous watchers or background orchestration unless the simpler
-  startup recovery path proves insufficient.
+Startup should perform these steps in order:
+
+1. apply pending migrations
+2. ensure the configured embedding model row exists
+3. if the model is newly created, backfill pending rows for existing documents
+4. seed missing `embed_document` jobs from pending or stale embedding rows
+5. ensure the active sqlite-vec index matches the active model
+6. inspect lightweight state and log an actionable startup summary
+7. start the worker and HTTP server
+
+The key constraint is that steps 3 through 6 are database reconciliation only.
+ They must not scan the configured resource directory or perform embedding HTTP
+ requests.
+
+## Implementation Plan
+
+1. Extract the startup state reconciliation into a small focused function or
+   module so `main` is no longer responsible for manually sequencing every
+   startup detail inline.
+2. Reuse the existing repository primitive that seeds missing `embed_document`
+   jobs from recoverable embedding rows.
+3. Keep the "new model" path and the "existing model" path aligned so startup
+   always ends with the same queue reconciliation behavior.
+4. Add one lightweight startup-state query layer that can answer at least:
+   - how many documents exist
+   - how many recoverable document/model pairs exist
+   - how many jobs were newly seeded during this startup pass
+5. Emit explicit logs from startup based on those counts.
+6. Keep worker startup unchanged after reconciliation is complete.
+
+## Logging Expectations
+
+Startup logs should make these states obvious:
+
+- zero documents exist: the server is empty and the next action is to call
+  `POST /ingest`
+- documents exist and pending work was re-queued: recovery happened
+- documents exist and no work is pending: the corpus is currently idle
+
+The logs should be actionable, not noisy. One concise startup summary is enough.
 
 ## Implementation Notes
 
-- A good first step is not full auto-ingest. It is:
-  - detect and log actionable state on startup
-  - recover pending/backfill work automatically
-  - make "no documents indexed yet" visible through logs or status
-- If auto-ingest is added, keep it narrow and idempotent:
-  - operate on the configured resource root only
-  - avoid duplicate document rows
-  - avoid surprise destructive behavior
-- A reasonable decision boundary is:
-  - if there are zero documents, startup may enqueue an ingest for the resource
-    root
-  - if documents already exist, rely on normal ingest and recovery semantics
-- Reuse the same queueing/backfill code path as manual ingest where possible.
-  Startup should not invent a second ingestion mechanism.
+- The reconciliation function should stay synchronous because the work is only a
+  few DB queries and enqueue operations.
+- Do not introduce a new maintenance job just to move cheap logic out of `main`.
+  That would increase queue surface area without reducing real complexity.
+- If startup reconciliation ever becomes expensive, that is a signal that the
+  design has drifted beyond this feature's intended scope.
+- Manual ingest remains the only document-discovery mechanism.
 
-## Dependencies and Sequencing
+## Test Plan
 
-- Depends on pending-recovery behavior in
-  [005-pending-embedding-recovery.md](/home/vince/ask/docs/features/005-pending-embedding-recovery.md).
-- Path behavior from
-  [006-document-filepath-invariants.md](/home/vince/ask/docs/features/006-document-filepath-invariants.md)
-  matters if startup ever re-ingests automatically.
+- Startup regression test for an existing model with pending or stale embedding
+  rows and no queued jobs: recovery seeds the missing jobs before the worker
+  starts.
+- Startup regression test for a fresh database with zero documents: startup does
+  not auto-ingest and emits the empty-state signal.
+- Startup regression test for an existing fully idle corpus: no duplicate jobs
+  are created.
+- Regression test that startup reconciliation is safe to run repeatedly.
 
-## Test Expectations
+## Acceptance Criteria
 
-- Startup test for empty DB with no documents.
-- Startup test for empty DB with documents available under the configured
-  resource root.
-- Regression test that startup recovery does not duplicate previously ingested
-  documents.
-
----
-_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
+- Startup performs cheap embedding-work reconciliation every time.
+- A fresh empty database no longer looks silently complete; logs explain the next
+  action.
+- Startup does not scan the resource directory or auto-ingest files.
+- No new scheduler or maintenance job abstraction is introduced.
+- The startup path remains simple and cheap enough to run synchronously.
