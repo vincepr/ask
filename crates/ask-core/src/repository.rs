@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::models::{Document, EmbedDocumentPayload, EmbeddingModel, JobQueueEntry};
+use crate::models::{Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, JobQueueEntry};
 use crate::types::*;
 
 /// A job with a claim older than this (in seconds) is considered dead and can
@@ -191,6 +191,42 @@ where
 /// Find a document by its filepath.
 pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Document>> {
     load_document_by_path(conn, filepath)
+}
+
+/// Find a document by its id.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `id` - Persisted document identifier.
+///
+/// # Returns
+///
+/// The matching document when present.
+///
+/// # Errors
+///
+/// Returns an error if the lookup query fails.
+pub fn find_document_by_id(conn: &Connection, id: i64) -> Result<Option<Document>> {
+    conn.query_row(
+        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at
+         FROM documents
+         WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Document {
+                id: row.get(0)?,
+                filepath: row.get(1)?,
+                file_type: row.get(2)?,
+                doc_category: row.get(3)?,
+                file_modified_at: row.get(4)?,
+                file_size: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to query document by id")
 }
 
 /// Mark all embeddings for the given documents as stale across every model.
@@ -403,6 +439,74 @@ pub fn delete_pending_embeddings_for_model(
     )
     .context("failed to delete pending embeddings")?;
 
+    Ok(())
+}
+
+/// Replace every embedding row for one document/model pair in one transaction.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc_id` - Persisted document identifier.
+/// * `model_id` - Embedding model identifier.
+/// * `chunks` - Fully embedded rows to store for the pair.
+/// * `now` - Unix timestamp stored on the replacement rows.
+///
+/// # Returns
+///
+/// `Ok(())` when the pair has been replaced atomically.
+///
+/// # Errors
+///
+/// Returns an error if the transaction cannot start, the old rows cannot be
+/// deleted, a new row cannot be inserted, or the transaction cannot commit.
+pub fn replace_embeddings_for_document_model(
+    conn: &mut Connection,
+    doc_id: i64,
+    model_id: i64,
+    chunks: &[EmbeddedChunk],
+    now: i64,
+) -> Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start replace_embeddings_for_document_model transaction")?;
+
+    tx.execute(
+        "DELETE FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
+        params![doc_id, model_id],
+    )
+    .context("failed to delete old embeddings for document/model pair")?;
+
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO document_embeddings
+                (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .context("failed to prepare replacement embedding insert")?;
+
+    for chunk in chunks {
+        stmt.execute(params![
+            doc_id,
+            model_id,
+            chunk.chunk_type,
+            chunk.chunk_start,
+            chunk.chunk_end,
+            EmbedState::Embedded,
+            &chunk.embedding,
+            now,
+        ])
+        .with_context(|| {
+            format!(
+                "failed to insert embedded chunk ({doc_id}, {model_id}, {}, {})",
+                chunk.chunk_type, chunk.chunk_start
+            )
+        })?;
+    }
+
+    drop(stmt);
+    tx.commit()
+        .context("failed to commit replace_embeddings_for_document_model")?;
     Ok(())
 }
 

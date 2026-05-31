@@ -1,4 +1,5 @@
 pub mod config;
+pub mod embeddings;
 pub mod http;
 mod ingest;
 pub mod migrations;

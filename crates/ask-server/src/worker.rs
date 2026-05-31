@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use ask_core::models::{
-    Document, EmbedDocumentPayload, EmbeddingModel, IngestFolderPayload, JobQueueEntry,
+    Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingModel, IngestFolderPayload,
+    JobQueueEntry,
 };
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, JobType};
@@ -11,17 +13,18 @@ use ignore::WalkBuilder;
 use tracing::{error, info, warn};
 
 use crate::DbPool;
+use crate::embeddings::{EmbeddingClient, SharedEmbeddingClient};
 use crate::ingest;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawns a background task that polls for unclaimed or stale jobs.
-pub fn spawn(pool: DbPool, model_id: i64) {
+pub fn spawn(pool: DbPool, model_id: i64, embedding_client: SharedEmbeddingClient) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
 
-            if let Err(err) = tick(pool.clone(), model_id).await {
+            if let Err(err) = tick(pool.clone(), model_id, embedding_client.clone()).await {
                 error!(error = %format!("{err:#}"), "worker tick failed");
             }
         }
@@ -30,7 +33,7 @@ pub fn spawn(pool: DbPool, model_id: i64) {
 
 /// Claim a job and process it, all on a blocking thread so the async runtime
 /// is never held up by DB or filesystem calls.
-async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
+async fn tick(pool: DbPool, model_id: i64, embedding_client: SharedEmbeddingClient) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let now = unix_now();
         let mut conn = pool.get()?;
@@ -42,7 +45,7 @@ async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
         };
 
         info!(job_id = entry.id, job_type = %entry.job_type, "claimed job");
-        dispatch_job_with_resolver(&pool, &entry, model_id, resolve_handler)
+        dispatch_job_with_resolver(&pool, &entry, model_id, embedding_client, resolve_handler)
     })
     .await
     .context("worker tick panicked")??;
@@ -53,7 +56,8 @@ async fn tick(pool: DbPool, model_id: i64) -> Result<()> {
 struct JobContext<'a> {
     pool: &'a DbPool,
     entry: &'a JobQueueEntry,
-    model_id: i64,
+    ingest_model_id: i64,
+    embedding_client: SharedEmbeddingClient,
 }
 
 trait JobHandler: Send + Sync {
@@ -69,8 +73,13 @@ trait JobHandler: Send + Sync {
 ///
 /// Successful handlers remove the queue row. Failed handlers leave the claim in
 /// place so the row becomes claimable again only after the stale timeout.
-pub fn dispatch_job(pool: &DbPool, entry: &JobQueueEntry, model_id: i64) -> Result<()> {
-    dispatch_job_with_resolver(pool, entry, model_id, resolve_handler)
+pub fn dispatch_job(
+    pool: &DbPool,
+    entry: &JobQueueEntry,
+    model_id: i64,
+    embedding_client: Arc<dyn EmbeddingClient>,
+) -> Result<()> {
+    dispatch_job_with_resolver(pool, entry, model_id, embedding_client, resolve_handler)
 }
 
 /// Queue pending embeddings for every existing document under a new model.
@@ -110,6 +119,7 @@ fn dispatch_job_with_resolver<R>(
     pool: &DbPool,
     entry: &JobQueueEntry,
     model_id: i64,
+    embedding_client: SharedEmbeddingClient,
     resolve_handler: R,
 ) -> Result<()>
 where
@@ -128,7 +138,8 @@ where
     let result = handler.process(JobContext {
         pool,
         entry,
-        model_id,
+        ingest_model_id: model_id,
+        embedding_client,
     });
 
     match result {
@@ -182,11 +193,100 @@ impl JobHandler for EmbedDocumentHandler {
         let payload: EmbedDocumentPayload = serde_json::from_str(&ctx.entry.payload)
             .with_context(|| format!("failed to decode payload for job {}", ctx.entry.id))?;
 
-        Err(anyhow!(
-            "embed_document execution is not implemented yet for document {} and model {}",
-            payload.document_id,
-            payload.model_id
-        ))
+        info!(
+            job_id = ctx.entry.id,
+            document_id = payload.document_id,
+            model_id = payload.model_id,
+            "processing embed_document job"
+        );
+
+        let (document, model) = {
+            let conn = ctx.pool.get().with_context(|| {
+                format!(
+                    "failed to acquire connection to load document {} and model {} for job {}",
+                    payload.document_id, payload.model_id, ctx.entry.id
+                )
+            })?;
+
+            let document = repository::find_document_by_id(&conn, payload.document_id)?
+                .with_context(|| {
+                    format!(
+                        "document {} not found for job {}",
+                        payload.document_id, ctx.entry.id
+                    )
+                })?;
+            let model =
+                repository::find_model_by_id(&conn, payload.model_id)?.with_context(|| {
+                    format!(
+                        "embedding model {} not found for job {}",
+                        payload.model_id, ctx.entry.id
+                    )
+                })?;
+
+            (document, model)
+        };
+
+        let prepared_chunks = prepare_embedded_chunks(Path::new(&document.filepath), &model)
+            .with_context(|| {
+                format!(
+                    "failed to prepare chunks for document {} and model {}",
+                    document.id, model.id
+                )
+            })?;
+        let inputs = prepared_chunks
+            .iter()
+            .map(|chunk| chunk.input.clone())
+            .collect::<Vec<_>>();
+        let vectors = ctx
+            .embedding_client
+            .embed(&model, &inputs)
+            .with_context(|| {
+                format!(
+                    "failed to embed document {} with model {}",
+                    document.id, model.id
+                )
+            })?;
+
+        if vectors.len() != prepared_chunks.len() {
+            return Err(anyhow!(
+                "embedding client returned {} vectors for {} prepared chunks",
+                vectors.len(),
+                prepared_chunks.len()
+            ));
+        }
+
+        let rows = prepared_chunks
+            .into_iter()
+            .zip(vectors)
+            .map(|(chunk, vector)| EmbeddedChunk {
+                chunk_type: chunk.chunk_type,
+                chunk_start: chunk.chunk_start,
+                chunk_end: chunk.chunk_end,
+                embedding: serialize_embedding(&vector),
+            })
+            .collect::<Vec<_>>();
+
+        let mut conn = ctx.pool.get().with_context(|| {
+            format!(
+                "failed to acquire connection to replace embeddings for document {} and model {}",
+                document.id, model.id
+            )
+        })?;
+        repository::replace_embeddings_for_document_model(
+            &mut conn,
+            document.id,
+            model.id,
+            &rows,
+            unix_now(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to replace embeddings for document {} and model {}",
+                document.id, model.id
+            )
+        })?;
+
+        Ok(())
     }
 }
 
@@ -222,14 +322,14 @@ impl JobHandler for IngestFolderHandler {
             let conn = ctx.pool.get().with_context(|| {
                 format!(
                     "failed to acquire connection to load model {} for job {}",
-                    ctx.model_id, ctx.entry.id
+                    ctx.ingest_model_id, ctx.entry.id
                 )
             })?;
 
-            repository::find_model_by_id(&conn, ctx.model_id)?.with_context(|| {
+            repository::find_model_by_id(&conn, ctx.ingest_model_id)?.with_context(|| {
                 format!(
                     "embedding model {} not found for job {}",
-                    ctx.model_id, ctx.entry.id
+                    ctx.ingest_model_id, ctx.entry.id
                 )
             })?
         };
@@ -359,6 +459,65 @@ impl JobHandler for IngestFolderHandler {
     }
 }
 
+struct PreparedChunk {
+    chunk_type: ChunkType,
+    chunk_start: i64,
+    chunk_end: i64,
+    input: String,
+}
+
+fn prepare_embedded_chunks(path: &Path, model: &EmbeddingModel) -> Result<Vec<PreparedChunk>> {
+    let filepath = path.to_string_lossy();
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| filepath.into_owned());
+    let mut chunks = vec![PreparedChunk {
+        chunk_type: ChunkType::Filename,
+        chunk_start: 0,
+        chunk_end: 0,
+        input: filename,
+    }];
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) if !content.is_empty() => content,
+        Ok(_) => return Ok(chunks),
+        Err(err) => {
+            warn!(
+                path = %path.to_string_lossy(),
+                error = %err,
+                "skipping content embedding for unreadable file"
+            );
+            return Ok(chunks);
+        }
+    };
+
+    for (start, end) in chunk_content(
+        &content,
+        model.chunk_size as usize,
+        model.chunk_overlap as usize,
+    ) {
+        let input = String::from_utf8_lossy(&content.as_bytes()[start..end]).into_owned();
+        chunks.push(PreparedChunk {
+            chunk_type: ChunkType::Content,
+            chunk_start: start as i64,
+            chunk_end: end as i64,
+            input,
+        });
+    }
+
+    Ok(chunks)
+}
+
+fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 fn queue_pending_embeddings_for_document(
     conn: &rusqlite::Connection,
     path: &Path,
@@ -448,12 +607,14 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use ask_core::repository;
 
     use super::*;
+    use crate::embeddings::DeterministicEmbeddingClient;
     use crate::{create_pool, migrations};
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -546,8 +707,14 @@ mod tests {
         let entry = enqueue_and_claim_job(&db, r#"{"root_path":"/tmp"}"#, 10, 100);
         let pool = db.pool();
 
-        let err =
-            dispatch_job_with_resolver(&pool, &entry, 1, |_| Box::new(FailingHandler)).unwrap_err();
+        let err = dispatch_job_with_resolver(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+            |_| Box::new(FailingHandler),
+        )
+        .unwrap_err();
         let err_text = format!("{err:#}");
 
         assert!(
@@ -573,7 +740,14 @@ mod tests {
         let entry = enqueue_and_claim_job(&db, r#"{"root_path":"/tmp"}"#, 10, 100);
         let pool = db.pool();
 
-        dispatch_job_with_resolver(&pool, &entry, 1, |_| Box::new(FailingHandler)).unwrap_err();
+        dispatch_job_with_resolver(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+            |_| Box::new(FailingHandler),
+        )
+        .unwrap_err();
 
         let mut conn = pool.get().unwrap();
         let reclaimed = repository::claim_job(&mut conn, 100 + 86_400 + 1)
@@ -590,7 +764,13 @@ mod tests {
         let entry = enqueue_and_claim_job(&db, "{not json", 10, 100);
         let pool = db.pool();
 
-        let err = dispatch_job(&pool, &entry, 1).unwrap_err();
+        let err = dispatch_job(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+        )
+        .unwrap_err();
         let err_text = format!("{err:#}");
 
         assert!(
@@ -664,7 +844,13 @@ mod tests {
         let entry = enqueue_and_claim_job(&db, r#"{"root_path":1}"#, 10, 100);
         let pool = db.pool();
 
-        let err = dispatch_job(&pool, &entry, current_time()).unwrap_err();
+        let err = dispatch_job(
+            &pool,
+            &entry,
+            current_time(),
+            Arc::new(DeterministicEmbeddingClient::new()),
+        )
+        .unwrap_err();
         let err_text = format!("{err:#}");
         assert!(
             err_text.contains("failed to decode payload"),
@@ -676,5 +862,12 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
             .unwrap();
         assert_eq!(document_count, 0);
+    }
+
+    #[test]
+    fn serialize_embedding_writes_little_endian_f32_bytes() {
+        let bytes = serialize_embedding(&[1.0, -2.5]);
+
+        assert_eq!(bytes, [0, 0, 128, 63, 0, 0, 32, 192]);
     }
 }

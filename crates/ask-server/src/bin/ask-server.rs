@@ -2,7 +2,9 @@ use anyhow::Result;
 use ask_core::models::EmbeddingModel;
 use ask_core::repository;
 use ask_core::{WORKSPACE_NAME, workspace_members};
+use ask_server::embeddings::HttpEmbeddingClient;
 use ask_server::{config, create_pool, http, migrations, worker};
+use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
@@ -55,6 +57,7 @@ async fn main() -> Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+    let embedding_client = Arc::new(HttpEmbeddingClient::new(config.embedding_provider.clone())?);
 
     info!(
         workspace = WORKSPACE_NAME,
@@ -73,7 +76,7 @@ async fn main() -> Result<()> {
 
     let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?;
 
-    worker::spawn(pool.clone(), model.id);
+    worker::spawn(pool.clone(), model.id, embedding_client);
     axum::serve(listener, http::router(app_state)).await?;
 
     Ok(())

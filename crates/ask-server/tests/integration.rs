@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,6 +7,7 @@ use ask_core::models::{DEFAULT_FILE_PATTERN, EmbedDocumentPayload, IngestFolderP
 use ask_core::repository;
 use ask_core::types::DocCategory;
 use ask_core::types::JobType;
+use ask_server::embeddings::DeterministicEmbeddingClient;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http, migrations};
 use axum::body::{Body, Bytes, to_bytes};
@@ -146,6 +148,10 @@ fn count_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) -> i64 {
 fn delete_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) {
     conn.execute("DELETE FROM job_queue WHERE job_type = ?1", [job_type])
         .unwrap();
+}
+
+fn test_embedding_client() -> Arc<DeterministicEmbeddingClient> {
+    Arc::new(DeterministicEmbeddingClient::new())
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -557,7 +563,7 @@ async fn ingest_folder_inserts_documents_and_pending_embeddings() {
 
     // Process it.
     let pool = db.pool();
-    dispatch_job(&pool, &entry, model.id).unwrap();
+    dispatch_job(&pool, &entry, model.id, test_embedding_client()).unwrap();
 
     // Verify: documents were inserted.
     let conn = db.pool().get().unwrap();
@@ -625,7 +631,7 @@ async fn ingest_folder_recursively_inserts_nested_documents() {
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
 
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let doc_count: i64 = conn
@@ -675,7 +681,7 @@ async fn ingest_folder_filters_files_by_normalized_relative_path() {
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
 
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let ingested_paths: Vec<String> = {
@@ -722,7 +728,7 @@ async fn ingest_folder_ignore_files_and_regex_filter_compose() {
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
 
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let ingested_paths: Vec<String> = {
@@ -777,7 +783,7 @@ async fn ingest_folder_skips_unchanged_files() {
 
     let model_id = 1;
     let pool = db.pool();
-    dispatch_job(&pool, &entry, model_id).unwrap();
+    dispatch_job(&pool, &entry, model_id, test_embedding_client()).unwrap();
 
     // Doc count after first ingest.
     let conn = db.pool().get().unwrap();
@@ -792,7 +798,7 @@ async fn ingest_folder_skips_unchanged_files() {
     let mut conn = db.pool().get().unwrap();
     let entry2 = repository::claim_job(&mut conn, now + 11).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&pool, &entry2, model_id).unwrap();
+    dispatch_job(&pool, &entry2, model_id, test_embedding_client()).unwrap();
 
     // Doc count should NOT have increased.
     let conn = db.pool().get().unwrap();
@@ -835,7 +841,7 @@ async fn ingest_folder_updates_existing_document_when_file_changes() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let first_doc_id: i64 = conn
@@ -862,7 +868,7 @@ async fn ingest_folder_updates_existing_document_when_file_changes() {
         .unwrap()
         .unwrap();
     drop(conn);
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let row_count: i64 = conn
@@ -934,7 +940,7 @@ async fn ingest_folder_path_variants_reuse_same_document_row() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     let later = current_time();
     let conn = db.pool().get().unwrap();
@@ -945,7 +951,7 @@ async fn ingest_folder_path_variants_reuse_same_document_row() {
         .unwrap()
         .unwrap();
     drop(conn);
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let row_count: i64 = conn
@@ -988,7 +994,7 @@ async fn ingest_folder_empty_dir_completes_job() {
     drop(conn);
 
     let pool = db.pool();
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     // No documents, no errors, job completed.
     let conn = db.pool().get().unwrap();
@@ -1018,7 +1024,7 @@ async fn ingest_folder_nonexistent_path_completes_job() {
     drop(conn);
 
     let pool = db.pool();
-    dispatch_job(&pool, &entry, 1).unwrap();
+    dispatch_job(&pool, &entry, 1, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let job_count: i64 = conn
@@ -1049,7 +1055,7 @@ async fn dispatch_job_missing_model_returns_error_and_keeps_job_claimed() {
     drop(conn);
 
     let pool = db.pool();
-    let err = dispatch_job(&pool, &entry, 999).unwrap_err();
+    let err = dispatch_job(&pool, &entry, 999, test_embedding_client()).unwrap_err();
     let err_text = format!("{err:#}");
     assert!(
         err_text.contains("embedding model 999 not found"),
@@ -1092,7 +1098,7 @@ async fn multiple_ingest_jobs_sequentially_all_complete() {
     let mut conn = db.pool().get().unwrap();
     let entry1 = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry1, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry1, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     delete_jobs_by_type(&conn, JobType::EmbedDocument);
@@ -1100,7 +1106,7 @@ async fn multiple_ingest_jobs_sequentially_all_complete() {
     let mut conn = db.pool().get().unwrap();
     let entry2 = repository::claim_job(&mut conn, now + 11).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry2, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry2, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let doc_count: i64 = conn
@@ -1135,7 +1141,7 @@ async fn ingest_files_with_special_characters_in_names() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let doc_count: i64 = conn
@@ -1178,7 +1184,7 @@ async fn ingest_mixed_file_types() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let doc_count: i64 = conn
@@ -1260,7 +1266,7 @@ async fn ingest_large_file_produces_many_chunks() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let content_emb: i64 = conn
@@ -1271,6 +1277,179 @@ async fn ingest_large_file_produces_many_chunks() {
         )
         .unwrap();
     assert_eq!(content_emb, 13);
+}
+
+#[tokio::test]
+async fn embed_document_job_replaces_rows_for_exact_document_model_pair() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "embed-success");
+    let other_model_id = register_model(&db.pool(), now + 1, "embed-other");
+
+    let file_path = db.create_file("embedded.txt");
+    std::fs::write(&file_path, "abcdefghij").unwrap();
+    let document_id = insert_document(&db.pool(), now, &file_path);
+
+    let conn = db.pool().get().unwrap();
+    conn.execute_batch(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES
+            (1, 1, 'filename', 0, 0, 'pending', NULL, 100),
+            (1, 1, 'content', 0, 5, 'stale', NULL, 100),
+            (1, 2, 'filename', 0, 0, 'embedded', X'01', 100)",
+    )
+    .unwrap();
+
+    let payload = serde_json::to_string(&EmbedDocumentPayload {
+        document_id,
+        model_id,
+    })
+    .unwrap();
+    repository::enqueue_job(&conn, &JobType::EmbedDocument, &payload, now + 2).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 3).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &entry, 999, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let rows: Vec<(String, i64, i64, String, i64, i64)> = conn
+        .prepare(
+            "SELECT chunk_type, chunk_start, chunk_end, state, length(embedding), created_at
+             FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2
+             ORDER BY chunk_type, chunk_start",
+        )
+        .unwrap()
+        .query_map([document_id, model_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "content");
+    assert_eq!(rows[0].1, 0);
+    assert_eq!(rows[0].2, 10);
+    assert_eq!(rows[0].3, "embedded");
+    assert_eq!(rows[0].4, 768 * 4);
+    assert!(rows[0].5 >= now);
+    assert_eq!(rows[1].0, "filename");
+    assert_eq!(rows[1].3, "embedded");
+    assert_eq!(rows[1].4, 768 * 4);
+
+    let other_model_embedding: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
+            [document_id, other_model_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(other_model_embedding, vec![1]);
+
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 0);
+}
+
+#[tokio::test]
+async fn embed_document_provider_failure_keeps_job_claimed_and_rows_unchanged() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "embed-failure");
+
+    let file_path = db.create_file("fail.txt");
+    std::fs::write(&file_path, "please fail-provider now").unwrap();
+    let document_id = insert_document(&db.pool(), now, &file_path);
+
+    let conn = db.pool().get().unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, 'filename', 0, 0, 'pending', NULL, ?3)",
+        rusqlite::params![document_id, model_id, now],
+    )
+    .unwrap();
+
+    let payload = serde_json::to_string(&EmbedDocumentPayload {
+        document_id,
+        model_id,
+    })
+    .unwrap();
+    repository::enqueue_job(&conn, &JobType::EmbedDocument, &payload, now + 1).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
+    drop(conn);
+
+    let err = dispatch_job(
+        &db.pool(),
+        &entry,
+        1,
+        Arc::new(DeterministicEmbeddingClient::fail_on_input("fail-provider")),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("failed to embed document"));
+
+    let conn = db.pool().get().unwrap();
+    let pair_rows: Vec<(String, Option<Vec<u8>>)> = conn
+        .prepare(
+            "SELECT state, embedding FROM document_embeddings
+             WHERE document_id = ?1 AND model_id = ?2",
+        )
+        .unwrap()
+        .query_map([document_id, model_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pair_rows, vec![("pending".to_string(), None)]);
+
+    let claimed_at: Option<i64> = conn
+        .query_row(
+            "SELECT claimed_at FROM job_queue WHERE id = ?1",
+            [entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_at, Some(now + 2));
+}
+
+#[tokio::test]
+async fn embed_document_malformed_payload_keeps_job_claimed() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(
+        &conn,
+        &JobType::EmbedDocument,
+        r#"{"document_id":"bad"}"#,
+        now,
+    )
+    .unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+
+    let err = dispatch_job(&db.pool(), &entry, 1, test_embedding_client()).unwrap_err();
+    assert!(format!("{err:#}").contains("failed to decode payload"));
+
+    let conn = db.pool().get().unwrap();
+    let claimed_at: Option<i64> = conn
+        .query_row(
+            "SELECT claimed_at FROM job_queue WHERE id = ?1",
+            [entry.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed_at, Some(now + 1));
 }
 
 #[tokio::test]
@@ -1288,7 +1467,7 @@ async fn ingest_non_utf8_file_only_gets_filename_embedding() {
     let mut conn = db.pool().get().unwrap();
     let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
     drop(conn);
-    dispatch_job(&db.pool(), &entry, model_id).unwrap();
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
     let filename_emb: i64 = conn
