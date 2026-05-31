@@ -80,3 +80,9 @@ trait hierarchy through a long transition.
 2. Vector search uses `pgvector` rather than application-side BLOB scanning.
 3. HTTP handlers and workers perform database calls without `spawn_blocking`.
 4. Existing SQLite data can be migrated with a documented path.
+
+
+## HUMAN REMARK
+- After switching to postgres write a new docs/feature:
+- support a out of the box fuzzy search for alternative searching. (when the api is unavialiable aswell as toggleable via a mode!)
+- https://rdegges.com/2013/easy-fuzzy-text-searching-with-postgresql/
