@@ -9,6 +9,19 @@ match. Every `EmbedDocument` job fails, no embeddings get stored.
 
 ## Questions
 
+## Quickfix Applied
+
+- Added `ASK_SERVER_EMBEDDING_DIMENSIONS=1024` to `.env` and
+  `docker-compose.yml`.
+- Deleted `./data/ask.sqlite3` so the model row is re-created with the correct
+  dimensions.
+
+This is a band-aid. If the env var is ever removed or a different model is
+used, the mismatch will reappear. A proper solution should handle this
+automatically.
+
+## Questions
+
 - Should dimensions be statically configured, auto-detected from the provider at
   startup, or left as a tunable parameter with a fail-fast check?
 - If auto-detected, what does that imply for provider availability during
