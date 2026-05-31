@@ -89,3 +89,6 @@ index ... backfilled=0" — accurate, but silent on what the user should do next
   stale.
 - The user expects the server to "just work" pointing at a directory of files,
   but nothing happens until they discover the API.
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

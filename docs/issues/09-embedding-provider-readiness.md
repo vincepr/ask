@@ -77,3 +77,6 @@ not discoverable.
   against this class of failure?
 - Does the docker-compose healthcheck ordering (`depends_on` + `condition`)
   solve enough to defer the code-level changes?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

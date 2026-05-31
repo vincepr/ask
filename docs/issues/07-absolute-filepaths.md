@@ -30,3 +30,6 @@ fails to resolve.
   This would eliminate path resolution entirely at the cost of storage.
 - What is the simplest set of invariants that makes the system work correctly
   without adding layers of path-normalization code?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

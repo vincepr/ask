@@ -29,3 +29,6 @@ worked normally.
   the networking setup more predictable and debuggable?
 - Is there a way to make the startup more resilient to this class of failure,
   or is the correct response always "clean up and retry"?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

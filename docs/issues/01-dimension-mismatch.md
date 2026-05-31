@@ -33,3 +33,6 @@ automatically.
   to delete the old model row manually, or automate the migration?
 - Is there a simpler approach that avoids adding startup-time network calls or
   migration complexity, given this is fundamentally a one-time config fix?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

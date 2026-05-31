@@ -37,3 +37,6 @@ that value is never passed to the worker.
 - What invariants should the `Document.filepath` field guarantee, and where
   should they be enforced — the DB schema, the repository layer, or the
   caller?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

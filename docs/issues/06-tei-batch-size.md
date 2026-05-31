@@ -84,3 +84,6 @@ enforces model name validation in a future version.
   indirection and the stale-row problem?
 - If multiple models are a future concern, what minimal schema supports that
   without over-engineering today?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

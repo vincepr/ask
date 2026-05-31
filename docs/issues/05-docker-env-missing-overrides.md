@@ -30,3 +30,6 @@ automatically set the corresponding container environment variable.
   enough for someone new to the project?
 - What is the minimum set of env vars needed in docker-compose.yml to make the
   stack work correctly without surprises?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._

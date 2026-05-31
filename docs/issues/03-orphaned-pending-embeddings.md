@@ -33,3 +33,6 @@ manual intervention and knowing which document IDs to pass.
   just jobs)?
 - Given that the user's `.data/` directory is persistent across restarts, what
   recovery semantics should the system guarantee?
+
+---
+_This document captures problems observed during exploration. Update or close when the corresponding implementation resolves the underlying concern._
