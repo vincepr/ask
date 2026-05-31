@@ -2,6 +2,7 @@ use anyhow::Result;
 use ask_core::migrations;
 use ask_core::{WORKSPACE_NAME, workspace_members};
 use ask_server::embeddings::HttpEmbeddingClient;
+use ask_server::startup::StartupSummaryKind;
 use ask_server::{config, create_pool, http, startup, vector_index, worker};
 use std::sync::Arc;
 use tracing::info;
@@ -42,6 +43,33 @@ async fn main() -> Result<()> {
         seeded_jobs = startup_state.seeded_jobs,
         "reconciled embedding startup state"
     );
+    match startup_state.summary_kind {
+        StartupSummaryKind::Empty => {
+            info!(
+                document_count = startup_state.document_count,
+                recoverable_pairs = startup_state.recoverable_pairs,
+                seeded_jobs = startup_state.seeded_jobs,
+                next_action = "POST /ingest",
+                "startup summary: no documents ingested yet"
+            );
+        }
+        StartupSummaryKind::Recovered => {
+            info!(
+                document_count = startup_state.document_count,
+                recoverable_pairs = startup_state.recoverable_pairs,
+                seeded_jobs = startup_state.seeded_jobs,
+                "startup summary: recoverable embedding work is pending"
+            );
+        }
+        StartupSummaryKind::Idle => {
+            info!(
+                document_count = startup_state.document_count,
+                recoverable_pairs = startup_state.recoverable_pairs,
+                seeded_jobs = startup_state.seeded_jobs,
+                "startup summary: corpus is currently idle"
+            );
+        }
+    }
 
     {
         let conn = pool.get()?;

@@ -11,7 +11,7 @@ use ask_core::models::{
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
-use ask_server::startup::reconcile_embedding_startup;
+use ask_server::startup::{StartupSummaryKind, reconcile_embedding_startup};
 use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
 use ask_server::{create_pool, http};
@@ -2057,7 +2057,91 @@ fn startup_recovery_does_not_seed_jobs_for_embedded_only_rows() {
 
     assert_eq!(startup.backfilled_documents, 0);
     assert_eq!(startup.seeded_jobs, 0);
+    assert_eq!(startup.document_count, 1);
+    assert_eq!(startup.recoverable_pairs, 0);
+    assert_eq!(startup.summary_kind, StartupSummaryKind::Idle);
     assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 0);
+}
+
+#[test]
+fn startup_recovery_reports_empty_database_state() {
+    let db = TempDb::new();
+    let now = current_time();
+    let conn = db.pool().get().unwrap();
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-empty", 768), now).unwrap();
+
+    assert_eq!(startup.backfilled_documents, 0);
+    assert_eq!(startup.seeded_jobs, 0);
+    assert_eq!(startup.document_count, 0);
+    assert_eq!(startup.recoverable_pairs, 0);
+    assert_eq!(startup.summary_kind, StartupSummaryKind::Empty);
+}
+
+#[test]
+fn startup_recovery_reports_recoverable_work_in_summary_state() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_id = insert_document(&db.pool(), now, &db.create_file("summary-recoverable.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-summary-recoverable");
+    let conn = db.pool().get().unwrap();
+
+    insert_embedding_row(
+        &conn,
+        doc_id,
+        model_id,
+        ChunkType::Filename,
+        0,
+        0,
+        EmbedState::Pending,
+        now,
+    );
+
+    let startup = reconcile_embedding_startup(
+        &conn,
+        embedding_identity("startup-summary-recoverable", 768),
+        now,
+    )
+    .unwrap();
+
+    assert_eq!(startup.document_count, 1);
+    assert_eq!(startup.recoverable_pairs, 1);
+    assert_eq!(startup.summary_kind, StartupSummaryKind::Recovered);
+}
+
+#[test]
+fn startup_recovery_reports_idle_corpus_state() {
+    let db = TempDb::new();
+    let now = current_time();
+    let doc_id = insert_document(&db.pool(), now, &db.create_file("summary-idle.txt"));
+    let model_id = register_model(&db.pool(), now, "startup-summary-idle");
+    let conn = db.pool().get().unwrap();
+
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            doc_id,
+            model_id,
+            ChunkType::Filename,
+            0,
+            0,
+            EmbedState::Embedded,
+            serialize_embedding(&[1.0_f32; 768]),
+            now
+        ],
+    )
+    .unwrap();
+
+    let startup =
+        reconcile_embedding_startup(&conn, embedding_identity("startup-summary-idle", 768), now)
+            .unwrap();
+
+    assert_eq!(startup.document_count, 1);
+    assert_eq!(startup.recoverable_pairs, 0);
+    assert_eq!(startup.summary_kind, StartupSummaryKind::Idle);
 }
 
 // ---------------------------------------------------------------------------
