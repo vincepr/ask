@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ask_core::models::IngestFolderPayload;
 use ask_core::{repository, types::JobType};
@@ -14,7 +14,49 @@ use serde_json::{Value, json};
 use crate::DbPool;
 use crate::ingest;
 
-pub type AppState = DbPool;
+/// Shared HTTP application state.
+#[derive(Clone)]
+pub struct AppState {
+    pool: DbPool,
+    resource_root: PathBuf,
+}
+
+impl AppState {
+    /// Creates HTTP state with a canonicalized ingest sandbox root.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Shared SQLite connection pool.
+    /// * `resource_dir` - Configured filesystem root allowed for ingest requests.
+    ///
+    /// # Returns
+    ///
+    /// Canonicalized application state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `resource_dir` cannot be canonicalized.
+    pub fn new(pool: DbPool, resource_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        Ok(Self {
+            pool,
+            resource_root: std::fs::canonicalize(resource_dir)?,
+        })
+    }
+
+    /// Returns the shared SQLite connection pool.
+    #[must_use]
+    pub fn pool(&self) -> &DbPool {
+        &self.pool
+    }
+}
+
+impl std::ops::Deref for AppState {
+    type Target = DbPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
 
 /// Returns the HTTP router with all routes registered.
 pub fn router(state: AppState) -> Router {
@@ -36,6 +78,7 @@ enum IngestOutcome {
     Queued,
     NotFound(String),
     NotADirectory(String),
+    OutsideAllowedRoot(String),
     InvalidPattern(String),
     Conflict(String),
 }
@@ -47,9 +90,12 @@ struct IngestRequest {
 }
 
 async fn ingest(
-    State(pool): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<IngestRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state.pool().clone();
+    let resource_root = state.resource_root.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         let root_path = body.root_path;
         let file_pattern = match ingest::resolve_file_pattern(body.file_pattern.as_deref()) {
@@ -65,6 +111,10 @@ async fn ingest(
 
         if !canonical_root.is_dir() {
             return IngestOutcome::NotADirectory(root_path);
+        }
+
+        if !canonical_root.starts_with(&resource_root) {
+            return IngestOutcome::OutsideAllowedRoot(root_path);
         }
 
         let canonical_root = canonical_root.to_string_lossy().into_owned();
@@ -112,6 +162,11 @@ async fn ingest(
             StatusCode::BAD_REQUEST,
             "bad_request",
             format!("path is not a directory: {p}"),
+        )),
+        IngestOutcome::OutsideAllowedRoot(p) => Err(error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("path is outside the configured resource root: {p}"),
         )),
         IngestOutcome::InvalidPattern(msg) => Err(error_response(
             StatusCode::BAD_REQUEST,

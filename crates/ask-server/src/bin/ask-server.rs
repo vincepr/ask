@@ -71,8 +71,10 @@ async fn main() -> Result<()> {
         "starting ask-server"
     );
 
+    let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?;
+
     worker::spawn(pool.clone(), model.id);
-    axum::serve(listener, http::router(pool)).await?;
+    axum::serve(listener, http::router(app_state)).await?;
 
     Ok(())
 }

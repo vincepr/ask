@@ -23,7 +23,7 @@ fn current_time() -> i64 {
 }
 
 fn register_model(pool: &http::AppState, now: i64, name: &str) -> i64 {
-    let conn = pool.get().unwrap();
+    let conn = pool.pool().get().unwrap();
     let model = ask_core::models::EmbeddingModel {
         id: 0,
         name: name.to_string(),
@@ -57,7 +57,7 @@ fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i
         file_size: metadata.len() as i64,
         updated_at: now,
     };
-    let mut conn = pool.get().unwrap();
+    let mut conn = pool.pool().get().unwrap();
     repository::upsert_document(&mut conn, &document).unwrap().0
 }
 
@@ -74,9 +74,10 @@ impl TempDb {
         let pool = create_pool(&db_path.to_string_lossy()).unwrap();
         let mut conn = pool.get().unwrap();
         migrations::apply_pending_migrations(&mut conn).unwrap();
+        let state = http::AppState::new(pool, &dir).unwrap();
         Self {
             dir,
-            pool: Some(pool),
+            pool: Some(state),
         }
     }
 
@@ -234,6 +235,39 @@ async fn ingest_valid_dir_returns_200() {
     let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(body["status"], "queued");
     assert_eq!(body["job_type"], "ingest_folder");
+}
+
+#[tokio::test]
+async fn ingest_path_outside_resource_root_returns_403() {
+    let db = TempDb::new();
+    let outside_dir = unique_temp_dir();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let payload = format!(r#"{{"root_path":"{}"}}"#, outside_dir.display());
+
+    let res = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(json_body(&payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    let conn = db.pool().pool().get().unwrap();
+    let queued_jobs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_queue", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(queued_jobs, 0);
+
+    std::fs::remove_dir_all(outside_dir).unwrap();
 }
 
 #[tokio::test]

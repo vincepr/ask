@@ -13,8 +13,11 @@ fn dummy_state() -> http::AppState {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("ask-server-test-{unique_suffix}.db"));
-    create_pool(&path.to_string_lossy()).expect("test pool")
+    let dir = std::env::temp_dir().join(format!("ask-server-test-{unique_suffix}"));
+    std::fs::create_dir_all(&dir).expect("test dir");
+    let path = dir.join("ask.sqlite3");
+    let pool = create_pool(&path.to_string_lossy()).expect("test pool");
+    http::AppState::new(pool, &dir).expect("test state")
 }
 
 #[tokio::test]
