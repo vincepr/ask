@@ -20,6 +20,12 @@ COPY crates/ask-server ./crates/ask-server
 
 RUN cargo build --locked --release --quiet -p ask-server --bin ask-server
 
+# NOTE: Runtime image stays on Debian/glibc for now because Alpine/musl builds
+# currently fail in `sqlite-vec` C compilation (`u_int8_t`/`uint8_t` errors).
+# Future check: rerun
+# `docker compose --profile tei build ask-server` using the former musl setup.
+# If that succeeds upstream (or sqlite-vec is removed/migrated), Alpine can be
+# reconsidered.
 FROM debian:bookworm-slim
 
 RUN apt-get update \
