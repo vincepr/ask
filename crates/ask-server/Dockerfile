@@ -1,21 +1,24 @@
-FROM rust:1.85-alpine AS builder
+FROM rust:1.86-bookworm AS builder
 
-RUN apk add --no-cache build-base musl-dev
-RUN rustup target add x86_64-unknown-linux-musl
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ask-core ./crates/ask-core
 COPY crates/ask-server ./crates/ask-server
 
-RUN cargo build --locked --release --quiet --target x86_64-unknown-linux-musl -p ask-server --bin ask-server
+RUN cargo build --locked --release --quiet -p ask-server --bin ask-server
 
-FROM alpine:3.22
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates wget
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/ask-server /usr/local/bin/ask-server
+COPY --from=builder /app/target/release/ask-server /usr/local/bin/ask-server
 
 ENV ASK_SERVER_DATA_DIR=/data
 ENV ASK_SERVER_RESOURCE_DIR=/resources
