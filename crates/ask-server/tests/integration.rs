@@ -279,8 +279,7 @@ fn insert_embedding_row(
     document_id: i64,
     model_id: i64,
     chunk_type: ChunkType,
-    chunk_start: i64,
-    chunk_end: i64,
+    chunk_range: std::ops::Range<i64>,
     state: EmbedState,
     now: i64,
 ) {
@@ -292,8 +291,8 @@ fn insert_embedding_row(
             document_id,
             model_id,
             chunk_type,
-            chunk_start,
-            chunk_end,
+            chunk_range.start,
+            chunk_range.end,
             state,
             now
         ],
@@ -2260,8 +2259,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_a,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2270,8 +2268,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_a,
         model_id,
         ChunkType::Content,
-        0,
-        7,
+        0..7,
         EmbedState::Pending,
         now,
     );
@@ -2280,8 +2277,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_b,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2320,8 +2316,7 @@ fn startup_recovery_seeds_jobs_for_existing_stale_rows() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Stale,
         now,
     );
@@ -2354,8 +2349,7 @@ fn startup_recovery_does_not_duplicate_existing_queued_or_claimed_jobs() {
         queued_doc,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2364,8 +2358,7 @@ fn startup_recovery_does_not_duplicate_existing_queued_or_claimed_jobs() {
         claimed_doc,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Stale,
         now,
     );
@@ -2418,8 +2411,7 @@ fn startup_recovery_is_idempotent_across_repeated_boots() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2504,8 +2496,7 @@ fn startup_recovery_reports_recoverable_work_in_summary_state() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
