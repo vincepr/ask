@@ -484,6 +484,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_utf8_planner_implements_chunk_planner_trait() {
+        fn plan_with_trait(
+            planner: &impl chunking::ChunkPlanner,
+            content: &str,
+        ) -> chunking::ChunkPlan {
+            planner.plan(content, 5, 0)
+        }
+
+        let planner = chunking::FixedUtf8ChunkPlanner;
+        let plan = plan_with_trait(&planner, "abcdefghij");
+
+        assert_eq!(plan.strategy, "fixed_utf8");
+        assert_eq!(
+            plan.spans,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 5 },
+                chunking::ChunkSpan { start: 5, end: 10 },
+            ]
+        );
+    }
+
+    #[test]
     fn structure_chunks_prefers_heading_breakpoint() {
         let content = "# Alpha\nfirst paragraph\n\n## Beta\nsecond paragraph\n";
         let split = content.find("## Beta").unwrap();
@@ -554,7 +576,7 @@ mod tests {
     fn routed_planner_defaults_to_structure() {
         let plan = chunking::plan_chunks(std::path::Path::new("notes.md"), "# A\n\n# B\n", 6, 0);
 
-        assert_eq!(plan.strategy, chunking::ChunkStrategy::Structure);
+        assert_eq!(plan.strategy, "structure");
     }
 
     #[test]

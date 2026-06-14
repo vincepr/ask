@@ -2,19 +2,52 @@ use std::path::Path;
 
 const DISTANCE_DECAY: f64 = 0.7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChunkStrategy {
-    #[allow(dead_code)]
-    FixedUtf8,
-    Structure,
+/// Plans content chunk byte spans for one chunking strategy.
+///
+/// Implementations must return UTF-8 boundary-safe offsets because embedding later rereads the
+/// source file and slices the original `str` with these spans.
+pub(super) trait ChunkPlanner {
+    fn strategy_name(&self) -> &'static str;
+
+    fn plan_spans(&self, content: &str, chunk_size: usize, overlap: usize) -> Vec<ChunkSpan>;
+
+    fn plan(&self, content: &str, chunk_size: usize, overlap: usize) -> ChunkPlan {
+        ChunkPlan {
+            strategy: self.strategy_name(),
+            spans: self.plan_spans(content, chunk_size, overlap),
+        }
+    }
 }
 
-impl ChunkStrategy {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::FixedUtf8 => "fixed_utf8",
-            Self::Structure => "structure",
-        }
+/// Splits content into fixed-size byte windows while shifting every boundary to a valid UTF-8
+/// scalar boundary and preserving the requested overlap.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub(super) struct FixedUtf8ChunkPlanner;
+
+impl ChunkPlanner for FixedUtf8ChunkPlanner {
+    fn strategy_name(&self) -> &'static str {
+        "fixed_utf8"
+    }
+
+    fn plan_spans(&self, content: &str, chunk_size: usize, overlap: usize) -> Vec<ChunkSpan> {
+        fixed_utf8_chunks(content, chunk_size, overlap)
+    }
+}
+
+/// Splits content by searching backward from each target boundary for Markdown-like structural
+/// breakpoints, then falls back to UTF-8-safe fixed splitting when no useful breakpoint exists.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StructureChunkPlanner;
+
+impl ChunkPlanner for StructureChunkPlanner {
+    fn strategy_name(&self) -> &'static str {
+        "structure"
+    }
+
+    fn plan_spans(&self, content: &str, chunk_size: usize, overlap: usize) -> Vec<ChunkSpan> {
+        let break_window = chunk_size.saturating_div(2).max(1);
+        structure_chunks(content, chunk_size, overlap, break_window)
     }
 }
 
@@ -26,7 +59,7 @@ pub(super) struct ChunkSpan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ChunkPlan {
-    pub(super) strategy: ChunkStrategy,
+    pub(super) strategy: &'static str,
     pub(super) spans: Vec<ChunkSpan>,
 }
 
@@ -37,16 +70,17 @@ struct Breakpoint {
 }
 
 pub(super) fn plan_chunks(
-    _path: &Path,
+    path: &Path,
     content: &str,
     chunk_size: usize,
     overlap: usize,
 ) -> ChunkPlan {
-    let break_window = chunk_size.saturating_div(2).max(1);
-    ChunkPlan {
-        strategy: ChunkStrategy::Structure,
-        spans: structure_chunks(content, chunk_size, overlap, break_window),
-    }
+    planner_for_path(path).plan(content, chunk_size, overlap)
+}
+
+fn planner_for_path(_path: &Path) -> &'static dyn ChunkPlanner {
+    static STRUCTURE_PLANNER: StructureChunkPlanner = StructureChunkPlanner;
+    &STRUCTURE_PLANNER
 }
 
 pub(super) fn fixed_utf8_chunks(

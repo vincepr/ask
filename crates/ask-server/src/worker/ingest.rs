@@ -670,7 +670,7 @@ fn plan_pending_embeddings_for_bytes(
 }
 
 fn plan_metadata_json(plan: &ChunkPlan) -> String {
-    metadata_json(plan.strategy.as_str(), plan.spans.len(), true)
+    metadata_json(plan.strategy, plan.spans.len(), true)
 }
 
 fn metadata_json(strategy: &str, chunk_count: usize, content_utf8: bool) -> String {
