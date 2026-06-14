@@ -3551,7 +3551,7 @@ async fn search_returns_unique_documents_with_match_score_only_by_default() {
 }
 
 #[tokio::test]
-async fn search_include_location_returns_byte_offsets_for_best_hit() {
+async fn search_include_location_uses_next_byte_offset_for_filename_hit() {
     let db = TempDb::new();
     let now = current_time();
     let model_id = register_model_with_dimensions(&db.pool(), now, "search-location", 4);
@@ -3571,8 +3571,8 @@ async fn search_include_location_returns_byte_offsets_for_best_hit() {
         .embed(
             &model,
             &[
-                "query-location".to_string(),
-                "query-location-far".to_string(),
+                "search-location.txt".to_string(),
+                "search-location-far".to_string(),
             ],
         )
         .unwrap();
@@ -3582,6 +3582,12 @@ async fn search_include_location_returns_byte_offsets_for_best_hit() {
         doc_id,
         model_id,
         &[
+            ask_core::models::EmbeddedChunk {
+                chunk_type: ask_core::types::ChunkType::Filename,
+                chunk_start: 0,
+                chunk_end: 0,
+                embedding: serialize_embedding(&vectors[0]),
+            },
             ask_core::models::EmbeddedChunk {
                 chunk_type: ask_core::types::ChunkType::Content,
                 chunk_start: 10,
@@ -3608,7 +3614,7 @@ async fn search_include_location_returns_byte_offsets_for_best_hit() {
                 .uri("/search")
                 .header("content-type", "application/json")
                 .body(json_body(
-                    r#"{"query":"query-location","limit":1,"include_location":true}"#,
+                    r#"{"query":"search-location.txt","limit":1,"include_location":true}"#,
                 ))
                 .unwrap(),
         )
@@ -3618,8 +3624,68 @@ async fn search_include_location_returns_byte_offsets_for_best_hit() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
     let result = &body.as_array().unwrap()[0];
+    assert!(result["match_score"].as_f64().unwrap() > 0.99);
     assert_eq!(result["byte_start"], 100);
     assert_eq!(result["byte_end"], 120);
+}
+
+#[tokio::test]
+async fn search_include_location_falls_back_to_filename_offsets_when_no_content_exists() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-location-fallback", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let doc_path = db.create_file("search-location-fallback.txt");
+    let doc_id = insert_document(&db.pool(), now, &doc_path);
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let vectors = client
+        .embed(&model, &["search-location-fallback.txt".to_string()])
+        .unwrap();
+    let mut conn = db.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&vectors[0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(
+                    r#"{"query":"search-location-fallback.txt","limit":1,"include_location":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let result = &body.as_array().unwrap()[0];
+    assert!(result["match_score"].as_f64().unwrap() > 0.99);
+    assert_eq!(result["byte_start"], 0);
+    assert_eq!(result["byte_end"], 0);
 }
 
 #[tokio::test]
