@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use ask_core::models::EmbeddingModel;
@@ -70,6 +71,7 @@ impl EmbeddingClient for HttpEmbeddingClient {
         }
 
         let client = Client::builder()
+            .timeout(Duration::from_secs(60))
             .build()
             .context("failed to build embedding HTTP client")?;
         let limit = self.max_batch_size;
