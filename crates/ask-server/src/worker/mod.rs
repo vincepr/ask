@@ -504,6 +504,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_embed_document_is_completed_immediately() {
+        let db = TempDb::new();
+        let entry = enqueue_and_claim_job_with_type(
+            &db,
+            JobType::EmbedDocument,
+            r#"{"document_id":9999,"model_id":1}"#,
+            10,
+            100,
+        );
+        let pool = db.pool();
+
+        dispatch_job(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+        )
+        .expect("missing document jobs should be treated as terminal");
+
+        assert_eq!(job_queue_count(&pool), 0);
+    }
+
+    #[test]
     fn dispatcher_surfaces_payload_decode_failures_and_keeps_job_row() {
         let db = TempDb::new();
         let entry = enqueue_and_claim_job(&db, "{not json", 10, 100);

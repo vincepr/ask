@@ -34,13 +34,16 @@ impl JobHandler for EmbedDocumentHandler {
                 )
             })?;
 
-            let document = repository::find_document_by_id(&conn, payload.document_id)?
-                .with_context(|| {
+            let Some(document) = repository::find_document_by_id(&conn, payload.document_id)?
+            else {
+                repository::complete_job(&conn, ctx.entry.id).with_context(|| {
                     format!(
-                        "document {} not found for job {}",
-                        payload.document_id, ctx.entry.id
+                        "failed to complete orphaned embed job {} for missing document {}",
+                        ctx.entry.id, payload.document_id
                     )
                 })?;
+                return Ok(());
+            };
             let model =
                 repository::find_model_by_id(&conn, payload.model_id)?.with_context(|| {
                     format!(
