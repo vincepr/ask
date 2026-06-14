@@ -98,7 +98,12 @@ pub(crate) async fn search(
     })?;
 
     match outcome {
-        Ok(response) => Ok(Json(response)),
+        Ok(mut response) => {
+            for result in &mut response {
+                result.filepath = state.response_filepath(&result.filepath);
+            }
+            Ok(Json(response))
+        }
         Err(SearchFailure::BadGateway(message)) => Err(error_response(
             StatusCode::BAD_GATEWAY,
             "bad_gateway",
