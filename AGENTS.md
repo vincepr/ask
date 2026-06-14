@@ -226,6 +226,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** include a complete MR/PR description whenever opening a merge request or pull request
   - At minimum include: Summary, Changes, Verification (commands + results), and Risks/Notes
 - **MUST** use `gh` to create pull requests/merge requests only when explicitly asked by the user
+- When passing MR/PR bodies through shell commands, **MUST** use `--body-file` or equivalent safe quoting; never pass Markdown with backticks unescaped in the shell command itself
 - For tag-based releases, **MUST** treat one version tag as one release version.
   - Multiple platform assets (e.g., ubuntu/macOS binaries) are expected under the same release and do **NOT** imply multiple versions.
 - **NEVER** commit commented-out code; delete it
