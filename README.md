@@ -66,6 +66,10 @@ Use an external OpenAI-compatible embeddings backend:
 docker compose up --build
 ```
 
+The static frontend is exposed at `http://localhost:13001/` by default and
+proxies API requests to the server container under `/api/*`. Override that host
+port with `ASK_FRONTEND_EXPOSE_PORT`.
+
 ## Ingesting documents
 
 After the server is running, tell it what to index by POSTing to `/ingest`:

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ask</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap"
+        rel="stylesheet"
+    >
+    <link
+        rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+    >
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+    <main class="shell container">
+        <section class="hero">
+            <div>
+                <p class="eyebrow">Knowledge Query Workspace</p>
+                <h1>ask control surface</h1>
+                <p class="hero-copy">
+                    Minimal search, ingest, and embedding status without waiting for the API
+                    container to finish warming up.
+                </p>
+            </div>
+            <div class="hero-actions">
+                <button id="theme-toggle" type="button" class="secondary outline">
+                    Toggle theme
+                </button>
+                <nav class="api-links">
+                    <a href="/api/swagger-ui/" target="_blank" rel="noreferrer">Swagger UI</a>
+                    <a href="/api/api.html" target="_blank" rel="noreferrer">Scalar</a>
+                </nav>
+            </div>
+        </section>
+
+        <section class="status-strip">
+            <article class="status-card">
+                <header>API</header>
+                <p id="api-status-badge" class="status-badge status-starting">Starting</p>
+                <small id="api-status-detail">Polling /api/health</small>
+            </article>
+            <article id="embedding-status-card" class="status-card">
+                <header>Embedding</header>
+                <p id="embedding-status-badge" class="status-badge status-starting">Starting</p>
+                <small id="embedding-status-detail">Polling /tei/health</small>
+            </article>
+        </section>
+
+        <section class="tabs-panel">
+            <div role="tablist" aria-label="ask sections" class="tabs">
+                <button type="button" class="tab-button active" data-tab="search">Search</button>
+                <button type="button" class="tab-button" data-tab="ingest">Ingest</button>
+                <button type="button" class="tab-button" data-tab="progress">Progress</button>
+                <button type="button" class="tab-button" data-tab="stats">Stats</button>
+            </div>
+
+            <section id="tab-search" class="tab-section active">
+                <form id="search-form">
+                    <label for="search-query">Query</label>
+                    <textarea
+                        id="search-query"
+                        name="query"
+                        placeholder="Find relevant files or passages"
+                        rows="4"
+                    ></textarea>
+                    <div class="form-grid">
+                        <label>
+                            Limit
+                            <input id="search-limit" name="limit" type="number" min="1" max="100" value="10">
+                        </label>
+                        <label class="checkbox">
+                            <input id="search-include-location" name="include_location" type="checkbox">
+                            Include byte offsets
+                        </label>
+                    </div>
+                    <button id="search-submit" type="submit">Run search</button>
+                </form>
+                <pre id="search-output" class="result-panel">Search results will appear here.</pre>
+            </section>
+
+            <section id="tab-ingest" class="tab-section">
+                <form id="ingest-form">
+                    <label for="ingest-root-path">Root path</label>
+                    <input
+                        id="ingest-root-path"
+                        name="root_path"
+                        type="text"
+                        placeholder="/resources"
+                    >
+                    <label for="ingest-file-pattern">File pattern</label>
+                    <input
+                        id="ingest-file-pattern"
+                        name="file_pattern"
+                        type="text"
+                        placeholder="Optional regex, e.g. (?i)^.+\\.md$"
+                    >
+                    <label class="checkbox">
+                        <input id="ingest-use-git" name="use_git" type="checkbox">
+                        Use git-tracked file selection
+                    </label>
+                    <button id="ingest-submit" type="submit">Queue ingest</button>
+                </form>
+                <pre id="ingest-output" class="result-panel">Ingest responses will appear here.</pre>
+            </section>
+
+            <section id="tab-progress" class="tab-section">
+                <div class="progress-grid">
+                    <article>
+                        <header>Documents</header>
+                        <dl id="document-progress" class="stats-list"></dl>
+                    </article>
+                    <article>
+                        <header>Embeddings</header>
+                        <dl id="embedding-progress" class="stats-list"></dl>
+                    </article>
+                </div>
+                <article>
+                    <header>File Types</header>
+                    <div id="file-type-table" class="table-wrap">
+                        <p class="muted">Waiting for stats.</p>
+                    </div>
+                </article>
+            </section>
+
+            <section id="tab-stats" class="tab-section">
+                <div class="progress-grid">
+                    <article>
+                        <header>Active Model</header>
+                        <dl id="model-stats" class="stats-list"></dl>
+                    </article>
+                    <article>
+                        <header>Runtime Config</header>
+                        <dl id="config-stats" class="stats-list"></dl>
+                    </article>
+                </div>
+            </section>
+        </section>
+    </main>
+
+    <script src="/config.js"></script>
+    <script src="/app.js"></script>
+</body>
+</html>

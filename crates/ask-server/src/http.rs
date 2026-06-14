@@ -26,7 +26,43 @@ use self::ingest::IngestRequest;
 use self::progress::EmbeddingStatsResponse;
 use self::search::{SearchDocumentResult, SearchRequest};
 use crate::DbPool;
+use crate::config::{
+    Config, DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL,
+    DEFAULT_WORKER_COUNT,
+};
 use crate::embeddings::{DeterministicEmbeddingClient, SharedEmbeddingClient};
+
+/// Non-secret runtime configuration surfaced to the frontend and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    /// Filesystem path to the persistent data directory.
+    pub data_dir: String,
+    /// Filesystem path to the ingest/resource root directory.
+    pub resource_dir: String,
+    /// Embedding provider mode label.
+    pub embedding_mode: String,
+    /// Embedding provider base URL.
+    pub embedding_base_url: String,
+    /// Maximum embedding batch size for outbound provider requests.
+    pub embedding_max_batch_size: usize,
+    /// Number of passive embedding workers.
+    pub embedding_worker_count: usize,
+}
+
+impl RuntimeConfig {
+    /// Builds a runtime summary from the loaded server configuration.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            data_dir: config.data_dir.clone(),
+            resource_dir: config.resource_dir.clone(),
+            embedding_mode: config.embedding_provider.mode_name().to_string(),
+            embedding_base_url: config.embedding_provider.base_url().to_string(),
+            embedding_max_batch_size: config.embedding_max_batch_size,
+            embedding_worker_count: config.embedding_worker_count,
+        }
+    }
+}
 
 /// Shared HTTP application state.
 #[derive(Clone)]
@@ -34,6 +70,7 @@ pub struct AppState {
     pool: DbPool,
     resource_root: PathBuf,
     embedding_client: SharedEmbeddingClient,
+    runtime_config: RuntimeConfig,
 }
 
 impl AppState {
@@ -52,10 +89,19 @@ impl AppState {
     ///
     /// Returns an error if `resource_dir` cannot be canonicalized.
     pub fn new(pool: DbPool, resource_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let resource_root = std::fs::canonicalize(resource_dir)?;
         Ok(Self {
             pool,
-            resource_root: std::fs::canonicalize(resource_dir)?,
+            resource_root: resource_root.clone(),
             embedding_client: Arc::new(DeterministicEmbeddingClient::new()),
+            runtime_config: RuntimeConfig {
+                data_dir: DEFAULT_DATA_DIR.to_string(),
+                resource_dir: resource_root.display().to_string(),
+                embedding_mode: "tei".to_string(),
+                embedding_base_url: DEFAULT_TEI_BASE_URL.to_string(),
+                embedding_max_batch_size: DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
+                embedding_worker_count: DEFAULT_WORKER_COUNT,
+            },
         })
     }
 
@@ -63,6 +109,13 @@ impl AppState {
     #[must_use]
     pub fn with_embedding_client(mut self, embedding_client: SharedEmbeddingClient) -> Self {
         self.embedding_client = embedding_client;
+        self
+    }
+
+    /// Returns a copy of this state with a custom runtime configuration summary.
+    #[must_use]
+    pub fn with_runtime_config(mut self, runtime_config: RuntimeConfig) -> Self {
+        self.runtime_config = runtime_config;
         self
     }
 
@@ -82,6 +135,12 @@ impl AppState {
     #[must_use]
     pub fn resource_root(&self) -> &Path {
         &self.resource_root
+    }
+
+    /// Returns the non-secret runtime configuration summary.
+    #[must_use]
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.runtime_config
     }
 }
 

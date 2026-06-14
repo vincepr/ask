@@ -1,0 +1,3 @@
+window.ASK_FRONTEND_CONFIG = Object.freeze({
+    embeddingMode: "${ASK_SERVER_EMBEDDING_MODE}"
+});

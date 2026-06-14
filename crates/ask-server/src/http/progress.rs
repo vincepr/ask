@@ -8,11 +8,12 @@ use serde::Serialize;
 use serde_json::Value;
 use utoipa::ToSchema;
 
-use super::{AppState, error_response, load_active_model};
+use super::{AppState, RuntimeConfig, error_response, load_active_model};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(super) struct EmbeddingStatsResponse {
     model: ActiveEmbeddingModelResponse,
+    config: EmbeddingRuntimeConfigResponse,
     total_documents: i64,
     embedded_documents: i64,
     failed_locked_documents: i64,
@@ -54,6 +55,16 @@ struct ActiveEmbeddingModelResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+struct EmbeddingRuntimeConfigResponse {
+    data_dir: String,
+    resource_dir: String,
+    embedding_mode: String,
+    embedding_base_url: String,
+    embedding_max_batch_size: usize,
+    embedding_worker_count: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 struct DocumentFileTypeCount {
     file_type: String,
     document_count: i64,
@@ -71,6 +82,7 @@ pub(crate) async fn embedding_stats(
     State(state): State<AppState>,
 ) -> Result<Json<EmbeddingStatsResponse>, (StatusCode, Json<Value>)> {
     let pool = state.pool().clone();
+    let runtime_config = state.runtime_config().clone();
 
     let response = tokio::task::spawn_blocking(move || {
         let now = std::time::SystemTime::now()
@@ -80,7 +92,11 @@ pub(crate) async fn embedding_stats(
         let conn = pool.get().map_err(|err| anyhow!("database error: {err}"))?;
         let model = load_active_model(&conn)?;
         let snapshot = load_embedding_stats_snapshot(&conn, &model, now)?;
-        Ok::<_, anyhow::Error>(build_embedding_stats_response(&model, snapshot))
+        Ok::<_, anyhow::Error>(build_embedding_stats_response(
+            &model,
+            runtime_config,
+            snapshot,
+        ))
     })
     .await
     .map_err(|err| {
@@ -309,6 +325,7 @@ fn load_document_embedding_counts(
 
 fn build_embedding_stats_response(
     model: &EmbeddingModel,
+    runtime_config: RuntimeConfig,
     snapshot: EmbeddingStatsSnapshot,
 ) -> EmbeddingStatsResponse {
     let progress_percent = if snapshot.total_documents == 0 {
@@ -331,6 +348,14 @@ fn build_embedding_stats_response(
             chunk_size: model.chunk_size,
             chunk_overlap: model.chunk_overlap,
             created_at: model.created_at,
+        },
+        config: EmbeddingRuntimeConfigResponse {
+            data_dir: runtime_config.data_dir,
+            resource_dir: runtime_config.resource_dir,
+            embedding_mode: runtime_config.embedding_mode,
+            embedding_base_url: runtime_config.embedding_base_url,
+            embedding_max_batch_size: runtime_config.embedding_max_batch_size,
+            embedding_worker_count: runtime_config.embedding_worker_count,
         },
         total_documents: snapshot.total_documents,
         embedded_documents: snapshot.embedded_documents,

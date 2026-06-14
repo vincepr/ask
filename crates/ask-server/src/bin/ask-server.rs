@@ -99,7 +99,9 @@ async fn main() -> Result<()> {
         "starting ask-server"
     );
 
+    let runtime_config = http::RuntimeConfig::from_config(&config);
     let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?
+        .with_runtime_config(runtime_config)
         .with_embedding_client(embedding_client.clone());
 
     worker::spawn(

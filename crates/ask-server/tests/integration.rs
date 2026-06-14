@@ -11,6 +11,9 @@ use ask_core::models::{
 };
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
+use ask_server::config::{
+    DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
+};
 use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
 use ask_server::startup::{StartupSummaryKind, reconcile_embedding_startup};
 use ask_server::vector_index;
@@ -499,6 +502,22 @@ async fn embedding_stats_reports_document_level_counts_and_estimates() {
     assert_eq!(body["document_embeddings_embedded"], 2);
     assert_eq!(body["document_embeddings_pending"], 1);
     assert_eq!(body["document_embeddings_stale"], 1);
+    assert_eq!(body["config"]["data_dir"], DEFAULT_DATA_DIR);
+    assert_eq!(
+        body["config"]["resource_dir"],
+        db.dir.canonicalize().unwrap().display().to_string()
+    );
+    assert_eq!(body["config"]["embedding_mode"], "tei");
+    assert_eq!(body["config"]["embedding_base_url"], DEFAULT_TEI_BASE_URL);
+    assert_eq!(
+        body["config"]["embedding_max_batch_size"],
+        DEFAULT_EMBEDDING_MAX_BATCH_SIZE
+    );
+    assert_eq!(
+        body["config"]["embedding_worker_count"],
+        DEFAULT_WORKER_COUNT
+    );
+    assert!(body["config"]["embedding_auth_token"].is_null());
     let file_type_counts = body["documents_by_file_type"].as_array().unwrap();
     assert_eq!(file_type_counts.len(), 2);
     assert_eq!(file_type_counts[0]["file_type"], "md");

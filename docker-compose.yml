@@ -1,4 +1,14 @@
 services:
+  ask-frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: ask-frontend
+    environment:
+      ASK_SERVER_EMBEDDING_MODE: ${ASK_SERVER_EMBEDDING_MODE:-tei}
+    ports:
+      - "${ASK_FRONTEND_EXPOSE_PORT:-13001}:80"
+
   ask-server:
     build:
       context: .
