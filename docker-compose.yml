@@ -5,7 +5,9 @@ services:
       dockerfile: frontend/Dockerfile
     container_name: ask-frontend
     environment:
+      ASK_FRONTEND_EXPOSE_PORT: ${ASK_FRONTEND_EXPOSE_PORT:-13001}
       ASK_SERVER_EMBEDDING_MODE: ${ASK_SERVER_EMBEDDING_MODE:-tei}
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
     ports:
       - "${ASK_FRONTEND_EXPOSE_PORT:-13001}:80"
 
@@ -52,6 +54,7 @@ services:
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
     container_name: ask-tei-qwen3-embedding
+    restart: unless-stopped
     profiles:
       - tei
     command:

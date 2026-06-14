@@ -1,6 +1,9 @@
 server {
     listen 80;
     server_name _;
+    access_log off;
+    error_log /dev/null crit;
+    resolver 127.0.0.11 ipv6=off;
 
     root /usr/share/nginx/html;
     index index.html;
@@ -10,9 +13,19 @@ server {
     }
 
     location /api/ {
-        resolver 127.0.0.11 ipv6=off;
-        set $ask_upstream http://ask-server:3000/;
-        proxy_pass $ask_upstream;
+        set $ask_upstream ask-server:3000;
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass http://$ask_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 10s;
+    }
+
+    location /api-docs/ {
+        set $ask_upstream ask-server:3000;
+        proxy_pass http://$ask_upstream;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -21,9 +34,8 @@ server {
     }
 
     location = /tei/health {
-        resolver 127.0.0.11 ipv6=off;
-        set $tei_upstream http://tei:80/health;
-        proxy_pass $tei_upstream;
+        set $tei_upstream tei:80;
+        proxy_pass http://$tei_upstream/health;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

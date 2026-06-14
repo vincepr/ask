@@ -2,15 +2,13 @@ const config = window.ASK_FRONTEND_CONFIG || { embeddingMode: "tei" };
 
 const state = {
     apiOnline: false,
-    embeddingMode: config.embeddingMode || "tei",
-    stats: null
+    stats: null,
+    apiHealthInFlight: false,
+    statsInFlight: false
 };
 
 const apiStatusBadge = document.getElementById("api-status-badge");
 const apiStatusDetail = document.getElementById("api-status-detail");
-const embeddingStatusCard = document.getElementById("embedding-status-card");
-const embeddingStatusBadge = document.getElementById("embedding-status-badge");
-const embeddingStatusDetail = document.getElementById("embedding-status-detail");
 const searchForm = document.getElementById("search-form");
 const ingestForm = document.getElementById("ingest-form");
 const searchOutput = document.getElementById("search-output");
@@ -24,18 +22,10 @@ function bootstrap() {
     initializeForms();
     updateActionState();
 
-    if (state.embeddingMode !== "tei") {
-        embeddingStatusCard.hidden = true;
-    }
-
     pollHealth();
-    pollEmbeddingHealth();
     pollStats();
 
     window.setInterval(pollHealth, 2000);
-    if (state.embeddingMode === "tei") {
-        window.setInterval(pollEmbeddingHealth, 2000);
-    }
     window.setInterval(pollStats, 3000);
 }
 
@@ -130,6 +120,11 @@ function initializeForms() {
 }
 
 async function pollHealth() {
+    if (state.apiHealthInFlight) {
+        return;
+    }
+
+    state.apiHealthInFlight = true;
     try {
         await fetchJson("/api/health");
         state.apiOnline = true;
@@ -149,33 +144,10 @@ async function pollHealth() {
             "Starting",
             extractShortError(error)
         );
+    } finally {
+        state.apiHealthInFlight = false;
     }
     updateActionState();
-}
-
-async function pollEmbeddingHealth() {
-    if (state.embeddingMode !== "tei") {
-        return;
-    }
-
-    try {
-        await fetchJson("/tei/health");
-        setStatus(
-            embeddingStatusBadge,
-            embeddingStatusDetail,
-            "online",
-            "Online",
-            "TEI is responding"
-        );
-    } catch (error) {
-        setStatus(
-            embeddingStatusBadge,
-            embeddingStatusDetail,
-            "starting",
-            "Starting",
-            extractShortError(error)
-        );
-    }
 }
 
 async function pollStats() {
@@ -184,11 +156,18 @@ async function pollStats() {
         return;
     }
 
+    if (state.statsInFlight) {
+        return;
+    }
+
+    state.statsInFlight = true;
     try {
         state.stats = await fetchJson("/api/embedding/stats");
         renderStats(state.stats);
     } catch (error) {
         renderStats(null, error);
+    } finally {
+        state.statsInFlight = false;
     }
 }
 
@@ -213,10 +192,7 @@ function renderStats(stats, error) {
             "model-stats",
             [["status", message]]
         );
-        setDefinitionList(
-            "config-stats",
-            [["embedding_mode", state.embeddingMode]]
-        );
+        setDefinitionList("config-stats", [["status", message]]);
         document.getElementById("file-type-table").innerHTML =
             `<p class="muted">${escapeHtml(message)}</p>`;
         return;
@@ -277,7 +253,14 @@ function renderFileTypeTable(rows) {
         return;
     }
 
-    const body = rows
+    const orderedRows = [...rows].sort((left, right) => {
+        if (right.document_count !== left.document_count) {
+            return right.document_count - left.document_count;
+        }
+        return left.file_type.localeCompare(right.file_type);
+    });
+
+    const body = orderedRows
         .map(
             (row) =>
                 `<tr><td>${escapeHtml(row.file_type)}</td><td>${escapeHtml(
@@ -317,11 +300,23 @@ function setStatus(badge, detail, kind, text, message) {
 async function fetchJson(url, options) {
     const response = await fetch(url, options);
     const text = await response.text();
-    const payload = text ? JSON.parse(text) : {};
+    const payload = parseJsonBody(text);
     if (!response.ok) {
         throw new Error(payload.error?.message || `${response.status} ${response.statusText}`);
     }
     return payload;
+}
+
+function parseJsonBody(text) {
+    if (!text) {
+        return {};
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch {
+        return {};
+    }
 }
 
 function formatError(error) {
