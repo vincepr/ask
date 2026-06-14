@@ -18,7 +18,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ask-core ./crates/ask-core
 COPY crates/ask-server ./crates/ask-server
 
-RUN cargo build --locked --release -p ask-server --bin ask-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --locked --release -p ask-server --bin ask-server \
+    && cp /app/target/release/ask-server /tmp/ask-server
 
 # NOTE: Runtime image stays on Debian/glibc for now because Alpine/musl builds
 # currently fail in `sqlite-vec` C compilation (`u_int8_t`/`uint8_t` errors).
@@ -33,7 +37,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/ask-server /usr/local/bin/ask-server
+COPY --from=builder /tmp/ask-server /usr/local/bin/ask-server
 
 ENV ASK_SERVER_DATA_DIR=/data
 ENV ASK_SERVER_RESOURCE_DIR=/resources
