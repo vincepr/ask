@@ -395,6 +395,120 @@ async fn health_returns_200() {
     assert_eq!(body_text(res).await, r#"{"status":"healthy"}"#);
 }
 
+#[tokio::test]
+async fn embedding_stats_reports_document_level_counts_and_estimates() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "progress-model");
+    let conn = db.pool().pool().get().unwrap();
+    conn.execute(
+        "INSERT INTO embedding_search_state (singleton_id, active_model_id, dimensions, updated_at)
+         VALUES (1, ?1, ?2, ?3)",
+        rusqlite::params![model_id, 768_i64, now],
+    )
+    .unwrap();
+
+    let doc_1 = insert_document(&db.pool(), now, &db.create_file("progress-1.md"));
+    let txt_path = db.dir.join("progress-2.txt");
+    std::fs::write(&txt_path, b"content").unwrap();
+    let doc_2 = insert_document(&db.pool(), now, &txt_path);
+    let doc_3 = insert_document(&db.pool(), now, &db.create_file("progress-3.md"));
+    let doc_4 = insert_document(&db.pool(), now, &db.create_file("progress-4.md"));
+    let _doc_5 = insert_document(&db.pool(), now, &db.create_file("progress-5.md"));
+
+    insert_embedding_row(
+        &conn,
+        doc_1,
+        model_id,
+        ChunkType::Filename,
+        0..0,
+        EmbedState::Embedded,
+        now - 60,
+    );
+    insert_embedding_row(
+        &conn,
+        doc_2,
+        model_id,
+        ChunkType::Filename,
+        0..0,
+        EmbedState::Embedded,
+        now - 600,
+    );
+    insert_embedding_row(
+        &conn,
+        doc_3,
+        model_id,
+        ChunkType::Filename,
+        0..0,
+        EmbedState::Pending,
+        now - 120,
+    );
+    insert_embedding_row(
+        &conn,
+        doc_4,
+        model_id,
+        ChunkType::Filename,
+        0..0,
+        EmbedState::Stale,
+        now - 180,
+    );
+    enqueue_embed_document_job(&conn, doc_3, model_id, now - 120);
+    conn.execute(
+        "UPDATE job_queue
+         SET claimed_at = ?1
+         WHERE job_type = ?2
+           AND payload = ?3",
+        rusqlite::params![
+            now - 120,
+            JobType::EmbedDocument,
+            serde_json::to_string(&EmbedDocumentPayload {
+                document_id: doc_3,
+                model_id,
+            })
+            .unwrap()
+        ],
+    )
+    .unwrap();
+
+    let response = db
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/embedding/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["model"]["name"], "progress-model");
+    assert_eq!(body["model"]["id"], model_id);
+    assert_eq!(body["model"]["dimensions"], 768);
+    assert_eq!(body["model"]["chunk_size"], 512);
+    assert_eq!(body["model"]["chunk_overlap"], 0);
+    assert_eq!(body["model"]["created_at"], now);
+    assert_eq!(body["total_documents"], 5);
+    assert_eq!(body["embedded_documents"], 2);
+    assert_eq!(body["failed_locked_documents"], 1);
+    assert_eq!(body["remaining_documents"], 2);
+    assert_eq!(body["documents_embedded_last_five_minutes"], 1);
+    assert_eq!(body["estimated_documents_per_hour"], 12.0);
+    assert_eq!(body["document_embeddings_total"], 4);
+    assert_eq!(body["document_embeddings_embedded"], 2);
+    assert_eq!(body["document_embeddings_pending"], 1);
+    assert_eq!(body["document_embeddings_stale"], 1);
+    let file_type_counts = body["documents_by_file_type"].as_array().unwrap();
+    assert_eq!(file_type_counts.len(), 2);
+    assert_eq!(file_type_counts[0]["file_type"], "md");
+    assert_eq!(file_type_counts[0]["document_count"], 4);
+    assert_eq!(file_type_counts[1]["file_type"], "txt");
+    assert_eq!(file_type_counts[1]["document_count"], 1);
+    assert!((body["progress_percent"].as_f64().unwrap() - 40.0).abs() < 0.000_001);
+    assert!((body["estimated_hours_remaining"].as_f64().unwrap() - (2.0 / 12.0)).abs() < 0.000_001);
+}
+
 // ---------------------------------------------------------------------------
 // POST /ingest — path validation
 // ---------------------------------------------------------------------------
