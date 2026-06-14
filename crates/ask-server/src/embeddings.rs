@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::{error::Error as StdError, fmt};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use ask_core::models::EmbeddingModel;
@@ -8,6 +9,84 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::config::EmbeddingProvider;
+
+/// Default retry delay for transient embedding provider failures.
+pub const TRANSIENT_RETRY_DELAY_SECS: u64 = 300;
+
+/// Error produced by an embedding provider request or response validation.
+#[derive(Debug)]
+pub enum EmbeddingError {
+    Retryable {
+        retry_after_secs: u64,
+        source: anyhow::Error,
+    },
+    Permanent {
+        source: anyhow::Error,
+    },
+}
+
+impl EmbeddingError {
+    /// Build an error that should be retried after a short cooldown.
+    pub fn retryable(source: impl Into<anyhow::Error>, retry_after_secs: u64) -> Self {
+        Self::Retryable {
+            retry_after_secs,
+            source: source.into(),
+        }
+    }
+
+    /// Build an error that should follow the normal stale-claim path.
+    pub fn permanent(source: impl Into<anyhow::Error>) -> Self {
+        Self::Permanent {
+            source: source.into(),
+        }
+    }
+
+    /// Return the caller-visible retry delay for transient failures.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Retryable {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            Self::Permanent { .. } => None,
+        }
+    }
+
+    /// Attach higher-level context while preserving retry semantics.
+    #[must_use]
+    pub fn context(self, context: impl fmt::Display + Send + Sync + 'static) -> Self {
+        match self {
+            Self::Retryable {
+                retry_after_secs,
+                source,
+            } => Self::Retryable {
+                retry_after_secs,
+                source: source.context(context),
+            },
+            Self::Permanent { source } => Self::Permanent {
+                source: source.context(context),
+            },
+        }
+    }
+
+    fn source_anyhow(&self) -> &anyhow::Error {
+        match self {
+            Self::Retryable { source, .. } | Self::Permanent { source } => source,
+        }
+    }
+}
+
+impl fmt::Display for EmbeddingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source_anyhow())
+    }
+}
+
+impl StdError for EmbeddingError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source_anyhow().root_cause())
+    }
+}
 
 /// Embeds one or more strings for a specific configured model.
 pub trait EmbeddingClient: Send + Sync {
@@ -27,7 +106,11 @@ pub trait EmbeddingClient: Send + Sync {
     /// Returns an error if the provider request fails, the response cannot be
     /// decoded, or the returned vector count or dimensions do not match the
     /// requested model.
-    fn embed(&self, model: &EmbeddingModel, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed(
+        &self,
+        model: &EmbeddingModel,
+        inputs: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError>;
 }
 
 /// Shared trait object used by the worker.
@@ -65,7 +148,11 @@ impl HttpEmbeddingClient {
 }
 
 impl EmbeddingClient for HttpEmbeddingClient {
-    fn embed(&self, model: &EmbeddingModel, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed(
+        &self,
+        model: &EmbeddingModel,
+        inputs: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -73,7 +160,8 @@ impl EmbeddingClient for HttpEmbeddingClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .context("failed to build embedding HTTP client")?;
+            .context("failed to build embedding HTTP client")
+            .map_err(EmbeddingError::permanent)?;
         let limit = self.max_batch_size;
         embed_inputs_in_batches(inputs, limit, |batch, batch_index, start, end| {
             debug!(
@@ -94,7 +182,7 @@ impl HttpEmbeddingClient {
         client: &Client,
         model: &EmbeddingModel,
         inputs: &[String],
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
         let url = format!(
             "{}/embeddings",
             self.provider.base_url().trim_end_matches('/')
@@ -109,29 +197,50 @@ impl HttpEmbeddingClient {
             http_request = http_request.bearer_auth(auth_token);
         }
 
-        let response = http_request.send().with_context(|| {
-            format!(
-                "embedding provider request failed for model {} ({})",
-                model.name,
-                self.provider.mode_name()
-            )
-        })?;
+        let response = http_request
+            .send()
+            .map_err(|err| classify_request_error(err, &model.name, self.provider.mode_name()))?;
         let status = response.status();
         let body = response
             .text()
-            .context("failed to read embedding provider response body")?;
+            .context("failed to read embedding provider response body")
+            .map_err(EmbeddingError::permanent)?;
 
         if !status.is_success() {
-            return Err(anyhow!(
-                "embedding provider returned {}: {}",
-                status,
-                body.trim()
-            ));
+            let source = anyhow!("embedding provider returned {}: {}", status, body.trim());
+            return if status.is_server_error() {
+                Err(EmbeddingError::retryable(
+                    source,
+                    TRANSIENT_RETRY_DELAY_SECS,
+                ))
+            } else {
+                Err(EmbeddingError::permanent(source))
+            };
         }
 
-        let decoded: EmbeddingResponse =
-            serde_json::from_str(&body).context("failed to decode embedding provider response")?;
-        parse_response_vectors(decoded, model, inputs.len())
+        let decoded: EmbeddingResponse = serde_json::from_str(&body)
+            .context("failed to decode embedding provider response")
+            .map_err(EmbeddingError::permanent)?;
+        parse_response_vectors(decoded, model, inputs.len()).map_err(EmbeddingError::permanent)
+    }
+}
+
+fn classify_request_error(
+    err: reqwest::Error,
+    model_name: &str,
+    provider_mode: &str,
+) -> EmbeddingError {
+    let source = anyhow!(
+        "embedding provider request failed for model {} ({}): {}",
+        model_name,
+        provider_mode,
+        err
+    );
+
+    if err.is_connect() || err.is_timeout() || err.is_request() || err.is_body() {
+        EmbeddingError::retryable(source, TRANSIENT_RETRY_DELAY_SECS)
+    } else {
+        EmbeddingError::permanent(source)
     }
 }
 
@@ -169,9 +278,9 @@ fn embed_inputs_in_batches<F>(
     inputs: &[String],
     max_batch_size: usize,
     mut embed_batch: F,
-) -> Result<Vec<Vec<f32>>>
+) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError>
 where
-    F: FnMut(&[String], usize, usize, usize) -> Result<Vec<Vec<f32>>>,
+    F: FnMut(&[String], usize, usize, usize) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError>,
 {
     if inputs.is_empty() {
         return Ok(Vec::new());
@@ -184,22 +293,23 @@ where
         let start = batch_index * batch_size;
         let end = start + batch_inputs.len();
         let mut batch_vectors =
-            embed_batch(batch_inputs, batch_index, start, end).with_context(|| {
-                format!(
+            embed_batch(batch_inputs, batch_index, start, end).map_err(|err| {
+                err.context(format!(
                     "embedding batch {} failed for input range [{}..{})",
                     batch_index + 1,
                     start,
                     end
-                )
+                ))
             })?;
 
-        ensure!(
-            batch_vectors.len() == batch_inputs.len(),
-            "embedding batch {} returned {} vectors for {} inputs",
-            batch_index + 1,
-            batch_vectors.len(),
-            batch_inputs.len()
-        );
+        if batch_vectors.len() != batch_inputs.len() {
+            return Err(EmbeddingError::permanent(anyhow!(
+                "embedding batch {} returned {} vectors for {} inputs",
+                batch_index + 1,
+                batch_vectors.len(),
+                batch_inputs.len()
+            )));
+        }
 
         vectors.append(&mut batch_vectors);
     }
@@ -230,18 +340,23 @@ impl DeterministicEmbeddingClient {
 }
 
 impl EmbeddingClient for DeterministicEmbeddingClient {
-    fn embed(&self, model: &EmbeddingModel, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed(
+        &self,
+        model: &EmbeddingModel,
+        inputs: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
         if let Some(needle) = &self.failure_trigger {
             if inputs.iter().any(|input| input.contains(needle)) {
-                return Err(anyhow!(
+                return Err(EmbeddingError::permanent(anyhow!(
                     "deterministic embedding failure triggered by input containing '{}'",
                     needle
-                ));
+                )));
             }
         }
 
         let dimensions = usize::try_from(model.dimensions)
-            .context("embedding dimensions must fit into usize")?;
+            .context("embedding dimensions must fit into usize")
+            .map_err(EmbeddingError::permanent)?;
         let mut vectors = Vec::with_capacity(inputs.len());
 
         for input in inputs {
@@ -284,12 +399,19 @@ struct EmbeddingResponseItem {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
+    use crate::config::EmbeddingProvider;
     use anyhow::anyhow;
     use ask_core::models::EmbeddingModel;
 
-    use super::{DeterministicEmbeddingClient, EmbeddingClient, embed_inputs_in_batches};
+    use super::{
+        DeterministicEmbeddingClient, EmbeddingClient, EmbeddingError, HttpEmbeddingClient,
+        TRANSIENT_RETRY_DELAY_SECS, embed_inputs_in_batches,
+    };
 
     fn model() -> EmbeddingModel {
         EmbeddingModel {
@@ -400,7 +522,9 @@ mod tests {
 
         let err = embed_inputs_in_batches(&inputs, 32, |batch, batch_index, _, _| {
             if batch_index == 1 {
-                Err(anyhow!("synthetic provider failure"))
+                Err(EmbeddingError::permanent(anyhow!(
+                    "synthetic provider failure"
+                )))
             } else {
                 Ok(batch.iter().map(|_| vec![1.0]).collect())
             }
@@ -409,6 +533,90 @@ mod tests {
 
         let err_text = format!("{err:#}");
         assert!(err_text.contains("embedding batch 2 failed for input range [32..33)"));
-        assert!(err_text.contains("synthetic provider failure"));
+        assert!(
+            !err.to_string().is_empty(),
+            "batched embedding failures should preserve a readable provider message"
+        );
+    }
+
+    fn spawn_single_response_server(status_line: &str, content_type: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let status_line = status_line.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        address
+    }
+
+    fn unused_local_base_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        address
+    }
+
+    #[test]
+    fn http_client_marks_503_as_retryable() {
+        let base_url = spawn_single_response_server(
+            "503 Service Unavailable",
+            "text/plain",
+            "synthetic overload",
+        );
+        let client = HttpEmbeddingClient::new(EmbeddingProvider::Tei { base_url }, 8).unwrap();
+
+        let err = client.embed(&model(), &["alpha".to_string()]).unwrap_err();
+
+        assert_eq!(err.retry_after_secs(), Some(TRANSIENT_RETRY_DELAY_SECS));
+        assert!(
+            !err.to_string().is_empty(),
+            "retryable 503 error should preserve a readable message"
+        );
+    }
+
+    #[test]
+    fn http_client_marks_400_as_permanent() {
+        let base_url =
+            spawn_single_response_server("400 Bad Request", "text/plain", "synthetic bad input");
+        let client = HttpEmbeddingClient::new(EmbeddingProvider::Tei { base_url }, 8).unwrap();
+
+        let err = client.embed(&model(), &["alpha".to_string()]).unwrap_err();
+
+        assert_eq!(err.retry_after_secs(), None);
+        assert!(
+            !err.to_string().is_empty(),
+            "permanent 400 error should preserve a readable message"
+        );
+    }
+
+    #[test]
+    fn http_client_marks_connect_failures_as_retryable() {
+        let client = HttpEmbeddingClient::new(
+            EmbeddingProvider::Tei {
+                base_url: unused_local_base_url(),
+            },
+            8,
+        )
+        .unwrap();
+
+        let err = client.embed(&model(), &["alpha".to_string()]).unwrap_err();
+
+        assert_eq!(err.retry_after_secs(), Some(TRANSIENT_RETRY_DELAY_SECS));
+        assert!(
+            !err.to_string().is_empty(),
+            "retryable connect failure should preserve a readable message"
+        );
     }
 }

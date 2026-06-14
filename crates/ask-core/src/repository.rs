@@ -1138,6 +1138,34 @@ pub fn claim_job(conn: &mut Connection, now: i64) -> Result<Option<JobQueueEntry
     Ok(entry)
 }
 
+/// Defer a claimed job for a short retry cooldown without changing the schema.
+///
+/// The queue already treats rows as claimable when `claimed_at` is older than the
+/// stale cutoff `now - STALE_JOB_AGE_SECS`. By writing a synthetic claim timestamp
+/// slightly newer than that cutoff, we can make the row become claimable again
+/// after `retry_after_secs` without introducing extra queue state.
+pub fn defer_job_for_retry(
+    conn: &Connection,
+    job_id: i64,
+    now: i64,
+    retry_after_secs: u64,
+) -> Result<()> {
+    let retry_after_secs = retry_after_secs.min(STALE_JOB_AGE_SECS as u64);
+    let retry_after_secs = i64::try_from(retry_after_secs)
+        .expect("retry delay must fit into i64 after clamping to stale age");
+    let deferred_claimed_at = now - STALE_JOB_AGE_SECS + retry_after_secs.saturating_sub(1);
+
+    conn.execute(
+        "UPDATE job_queue
+         SET claimed_at = ?1
+         WHERE id = ?2",
+        params![deferred_claimed_at, job_id],
+    )
+    .context("failed to defer job retry")?;
+
+    Ok(())
+}
+
 /// Remove a completed job from the queue.
 pub fn complete_job(conn: &Connection, job_id: i64) -> Result<()> {
     conn.execute("DELETE FROM job_queue WHERE id = ?1", params![job_id])

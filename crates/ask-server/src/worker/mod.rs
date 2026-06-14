@@ -8,7 +8,7 @@ use ask_core::types::JobType;
 use tracing::{error, info};
 
 use crate::DbPool;
-use crate::embeddings::{EmbeddingClient, SharedEmbeddingClient};
+use crate::embeddings::{EmbeddingClient, EmbeddingError, SharedEmbeddingClient};
 
 mod chunking;
 mod embed_document;
@@ -175,6 +175,18 @@ where
             Ok(())
         }
         Err(err) => {
+            if let Some(retry_after_secs) = embedding_retry_after_secs(&err) {
+                defer_job_retry(pool, entry.id, unix_now(), retry_after_secs)?;
+                error!(
+                    job_id = entry.id,
+                    job_type = %entry.job_type,
+                    retry_after_secs,
+                    error = %format!("{err:#}"),
+                    "job failed transiently; deferred retry"
+                );
+                return Err(err.context(format!("job {} ({})", entry.id, entry.job_type)));
+            }
+
             error!(
                 job_id = entry.id,
                 job_type = %entry.job_type,
@@ -203,6 +215,23 @@ fn complete_job(pool: &DbPool, job_id: i64) -> Result<()> {
     Ok(())
 }
 
+fn defer_job_retry(pool: &DbPool, job_id: i64, now: i64, retry_after_secs: u64) -> Result<()> {
+    let conn = pool
+        .get()
+        .with_context(|| format!("failed to acquire connection to defer job {job_id}"))?;
+    repository::defer_job_for_retry(&conn, job_id, now, retry_after_secs)
+        .with_context(|| format!("failed to defer job {job_id}"))?;
+    Ok(())
+}
+
+fn embedding_retry_after_secs(err: &anyhow::Error) -> Option<u64> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<EmbeddingError>()
+            .and_then(EmbeddingError::retry_after_secs)
+    })
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +254,9 @@ mod tests {
 
     use super::*;
     use crate::create_pool;
-    use crate::embeddings::DeterministicEmbeddingClient;
+    use crate::embeddings::{
+        DeterministicEmbeddingClient, EmbeddingError, TRANSIENT_RETRY_DELAY_SECS,
+    };
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -263,6 +294,8 @@ mod tests {
 
     struct FailingHandler;
 
+    struct TransientEmbedFailingHandler;
+
     impl JobHandler for FailingHandler {
         fn job_type(&self) -> JobType {
             JobType::IngestFolder
@@ -270,6 +303,19 @@ mod tests {
 
         fn process(&self, _ctx: JobContext<'_>) -> Result<()> {
             Err(anyhow!("synthetic handler failure"))
+        }
+    }
+
+    impl JobHandler for TransientEmbedFailingHandler {
+        fn job_type(&self) -> JobType {
+            JobType::EmbedDocument
+        }
+
+        fn process(&self, _ctx: JobContext<'_>) -> Result<()> {
+            Err(anyhow::Error::new(EmbeddingError::retryable(
+                anyhow!("synthetic upstream overload"),
+                TRANSIENT_RETRY_DELAY_SECS,
+            )))
         }
     }
 
@@ -296,8 +342,18 @@ mod tests {
         queued_at: i64,
         claimed_at: i64,
     ) -> JobQueueEntry {
+        enqueue_and_claim_job_with_type(db, JobType::IngestFolder, payload, queued_at, claimed_at)
+    }
+
+    fn enqueue_and_claim_job_with_type(
+        db: &TempDb,
+        job_type: JobType,
+        payload: &str,
+        queued_at: i64,
+        claimed_at: i64,
+    ) -> JobQueueEntry {
         let conn = db.pool().get().unwrap();
-        repository::enqueue_job(&conn, &JobType::IngestFolder, payload, queued_at).unwrap();
+        repository::enqueue_job(&conn, &job_type, payload, queued_at).unwrap();
 
         let mut conn = db.pool().get().unwrap();
         repository::claim_job(&mut conn, claimed_at)
@@ -395,6 +451,56 @@ mod tests {
 
         assert_eq!(reclaimed.id, entry.id);
         assert_eq!(reclaimed.claimed_at, Some(100 + 86_400 + 1));
+    }
+
+    #[test]
+    fn transient_embed_failure_defers_retry_instead_of_waiting_for_stale_timeout() {
+        let db = TempDb::new();
+        let entry = enqueue_and_claim_job_with_type(
+            &db,
+            JobType::EmbedDocument,
+            r#"{"document_id":7,"model_id":1}"#,
+            10,
+            100,
+        );
+        let pool = db.pool();
+
+        let err = dispatch_job_with_resolver(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+            |_| Box::new(TransientEmbedFailingHandler),
+        )
+        .unwrap_err();
+        let err_text = format!("{err:#}");
+
+        assert!(
+            err_text.contains("synthetic upstream overload"),
+            "unexpected error: {err:#}"
+        );
+
+        let mut conn = pool.get().unwrap();
+        let deferred_claimed_at: i64 = conn
+            .query_row(
+                "SELECT claimed_at FROM job_queue WHERE id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retry_ready_at = deferred_claimed_at + 86_400;
+
+        let too_early = repository::claim_job(&mut conn, retry_ready_at).unwrap();
+        assert!(
+            too_early.is_none(),
+            "transient embed failure should not be re-claimed before 5 minutes"
+        );
+
+        let retried = repository::claim_job(&mut conn, retry_ready_at + 1)
+            .unwrap()
+            .expect("job should become claimable after 5-minute cooldown");
+        assert_eq!(retried.id, entry.id);
+        assert_eq!(retried.claimed_at, Some(retry_ready_at + 1));
     }
 
     #[test]

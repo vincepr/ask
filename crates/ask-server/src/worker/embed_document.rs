@@ -126,6 +126,7 @@ impl JobHandler for EmbedDocumentHandler {
         let vectors = ctx
             .embedding_client
             .embed(&model, &inputs)
+            .map_err(anyhow::Error::new)
             .with_context(|| {
                 format!(
                     "failed to embed document {} with model {}",

@@ -253,7 +253,7 @@ mod tests {
             &self,
             model: &EmbeddingModel,
             inputs: &[String],
-        ) -> anyhow::Result<Vec<Vec<f32>>> {
+        ) -> std::result::Result<Vec<Vec<f32>>, crate::embeddings::EmbeddingError> {
             if let Some(tx) = self.entered_tx.lock().unwrap().take() {
                 tx.send(()).unwrap();
             }

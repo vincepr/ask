@@ -3,8 +3,8 @@ use ask_core::models::{
     Document, EmbedDocumentPayload, EmbeddedChunk, EmbeddingIdentity, EmbeddingModel, JobQueueEntry,
 };
 use ask_core::repository::{
-    claim_job, complete_job, enqueue_job, find_document_by_id, find_document_by_path,
-    insert_pending_embeddings, replace_embeddings_for_document_model,
+    claim_job, complete_job, defer_job_for_retry, enqueue_job, find_document_by_id,
+    find_document_by_path, insert_pending_embeddings, replace_embeddings_for_document_model,
     search_documents_by_embedding, seed_embed_jobs, upsert_document,
     upsert_document_and_replace_pending_embeddings,
 };
@@ -258,6 +258,34 @@ fn claim_reclaims_stale_job() {
 
     assert_eq!(entry.id, 1);
     assert_eq!(entry.claimed_at, Some(now + STALE_JOB_AGE_SECS + 10));
+}
+
+#[test]
+fn deferred_job_retries_after_short_cooldown_without_schema_changes() {
+    let mut conn = setup_db();
+    let now = 100_000i64;
+    let retry_after_secs = 300_u64;
+    let retry_after_secs_i64 = i64::try_from(retry_after_secs).unwrap();
+    enqueue(&conn, r#"{"root_path":"/tmp"}"#, now).unwrap();
+
+    let entry = claim_job(&mut conn, now + 1)
+        .unwrap()
+        .expect("job should be claimable");
+    assert_eq!(entry.claimed_at, Some(now + 1));
+
+    defer_job_for_retry(&conn, entry.id, now + 1, retry_after_secs).unwrap();
+
+    let retry_before = claim_job(&mut conn, now + retry_after_secs_i64).unwrap();
+    assert!(
+        retry_before.is_none(),
+        "job must stay deferred until the retry window elapses"
+    );
+
+    let retry_ready = claim_job(&mut conn, now + retry_after_secs_i64 + 1)
+        .unwrap()
+        .expect("job should become claimable after retry cooldown");
+    assert_eq!(retry_ready.id, entry.id);
+    assert_eq!(retry_ready.claimed_at, Some(now + retry_after_secs_i64 + 1));
 }
 
 #[test]
