@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         model_chunk_overlap = model.chunk_overlap,
         embedding_mode = config.embedding_provider.mode_name(),
         embedding_base_url = config.embedding_provider.base_url(),
+        embedding_worker_count = config.embedding_worker_count,
         bind_address,
         "starting ask-server"
     );
@@ -101,7 +102,12 @@ async fn main() -> Result<()> {
     let app_state = http::AppState::new(pool.clone(), &config.resource_dir)?
         .with_embedding_client(embedding_client.clone());
 
-    worker::spawn(pool.clone(), model.id, embedding_client);
+    worker::spawn(
+        pool.clone(),
+        model.id,
+        embedding_client,
+        config.embedding_worker_count,
+    );
     axum::serve(listener, http::router(app_state)).await?;
 
     Ok(())

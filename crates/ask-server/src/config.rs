@@ -10,6 +10,7 @@ pub const EMBEDDING_DIMENSIONS_ENV: &str = "ASK_SERVER_EMBEDDING_DIMENSIONS";
 pub const EMBEDDING_CHUNK_SIZE_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_SIZE";
 pub const EMBEDDING_CHUNK_OVERLAP_ENV: &str = "ASK_SERVER_EMBEDDING_CHUNK_OVERLAP";
 pub const EMBEDDING_MAX_BATCH_SIZE_ENV: &str = "ASK_SERVER_EMBEDDING_MAX_BATCH_SIZE";
+pub const EMBEDDING_WORKER_COUNT_ENV: &str = "ASK_SERVER_EMBEDDING_WORKER_COUNT";
 pub const EMBEDDING_MODE_ENV: &str = "ASK_SERVER_EMBEDDING_MODE";
 pub const EMBEDDING_BASE_URL_ENV: &str = "ASK_SERVER_EMBEDDING_BASE_URL";
 pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
@@ -22,6 +23,7 @@ pub const DEFAULT_EMBEDDING_DIMENSIONS: i64 = 768;
 pub const DEFAULT_EMBEDDING_CHUNK_SIZE: i64 = 512;
 pub const DEFAULT_EMBEDDING_CHUNK_OVERLAP: i64 = 0;
 pub const DEFAULT_EMBEDDING_MAX_BATCH_SIZE: usize = 32;
+pub const DEFAULT_WORKER_COUNT: usize = 4;
 pub const DEFAULT_TEI_BASE_URL: &str = "http://localhost:18080";
 
 /// Embedding backend configuration loaded from the environment.
@@ -81,6 +83,8 @@ pub struct Config {
     pub embedding_chunk_overlap: i64,
     /// Maximum number of inputs to send in one embedding HTTP request.
     pub embedding_max_batch_size: usize,
+    /// Number of passive background embedding workers to run.
+    pub embedding_worker_count: usize,
     /// Embedding provider configuration.
     pub embedding_provider: EmbeddingProvider,
 }
@@ -175,12 +179,22 @@ pub fn load() -> Result<Config> {
         })?,
         Err(_) => DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
     };
+    let embedding_worker_count = match std::env::var(EMBEDDING_WORKER_COUNT_ENV) {
+        Ok(raw) => raw.parse::<usize>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                EMBEDDING_WORKER_COUNT_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_WORKER_COUNT,
+    };
     let embedding_provider = load_embedding_provider()?;
     validate_embedding_settings(
         embedding_dimensions,
         embedding_chunk_size,
         embedding_chunk_overlap,
         embedding_max_batch_size,
+        embedding_worker_count,
     )?;
 
     Ok(Config {
@@ -193,6 +207,7 @@ pub fn load() -> Result<Config> {
         embedding_chunk_size,
         embedding_chunk_overlap,
         embedding_max_batch_size,
+        embedding_worker_count,
         embedding_provider,
     })
 }
@@ -262,6 +277,7 @@ fn validate_embedding_settings(
     embedding_chunk_size: i64,
     embedding_chunk_overlap: i64,
     embedding_max_batch_size: usize,
+    _embedding_worker_count: usize,
 ) -> Result<()> {
     ensure!(
         embedding_dimensions > 0,

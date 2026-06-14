@@ -47,6 +47,9 @@ experiments:
 ASK_SERVER_BIND_PORT=3001 cargo run -p ask-server
 ```
 
+Set `ASK_SERVER_EMBEDDING_WORKER_COUNT=0` to disable passive background
+embedding while keeping the server and query endpoint running.
+
 The server exposes a health endpoint at `GET /health`.
 
 ## Docker

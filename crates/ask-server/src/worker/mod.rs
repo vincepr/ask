@@ -20,16 +20,35 @@ use ingest::{IngestFolderGitHandler, IngestFolderHandler};
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawns a background task that polls for unclaimed or stale jobs.
-pub fn spawn(pool: DbPool, model_id: i64, embedding_client: SharedEmbeddingClient) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+pub fn spawn(
+    pool: DbPool,
+    model_id: i64,
+    embedding_client: SharedEmbeddingClient,
+    worker_count: usize,
+) {
+    if worker_count == 0 {
+        info!("background embedding workers disabled");
+        return;
+    }
 
-            if let Err(err) = tick(pool.clone(), model_id, embedding_client.clone()).await {
-                error!(error = %format!("{err:#}"), "worker tick failed");
+    for worker_id in 0..worker_count {
+        let pool = pool.clone();
+        let embedding_client = embedding_client.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+
+                if let Err(err) = tick(pool.clone(), model_id, embedding_client.clone()).await {
+                    error!(
+                        worker_id,
+                        error = %format!("{err:#}"),
+                        "worker tick failed"
+                    );
+                }
             }
-        }
-    });
+        });
+    }
 }
 
 /// Dispatch a claimed job to the appropriate handler.
