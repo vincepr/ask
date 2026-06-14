@@ -7,8 +7,10 @@ use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, JobType};
 use ignore::WalkBuilder;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use super::chunking::{self, ChunkPlan};
 use super::{JobContext, JobHandler, unix_now};
 use crate::ingest;
 
@@ -282,6 +284,20 @@ fn ingest_candidate_file(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(now);
     let file_size = metadata.len() as i64;
+    let raw_bytes = match std::fs::read(&canonical_path) {
+        Ok(raw_bytes) => raw_bytes,
+        Err(err) => {
+            warn!(
+                job_id = ctx.entry.id,
+                path = ?canonical_path,
+                error = %err,
+                "failed to read file bytes; continuing"
+            );
+            return Ok(());
+        }
+    };
+    let file_hash = hash_bytes(&raw_bytes);
+    let planned = plan_pending_embeddings_for_bytes(&canonical_path, &raw_bytes, model);
 
     let mut conn = ctx
         .pool
@@ -295,17 +311,16 @@ fn ingest_candidate_file(
         doc_category: DocCategory::Resource,
         file_modified_at,
         file_size,
+        file_hash,
+        metadata_json: planned.metadata_json,
         updated_at: now,
     };
-
-    let chunk_refs = plan_pending_embeddings_for_document(&canonical_path, model)
-        .with_context(|| format!("failed to plan pending embeddings for {filepath}"))?;
 
     repository::upsert_document_and_replace_pending_embeddings(
         &mut conn,
         &doc,
         model.id,
-        &chunk_refs,
+        &planned.chunks,
         now,
     )
     .with_context(|| format!("failed to ingest document for {filepath}"))?;
@@ -542,7 +557,18 @@ pub(super) fn queue_pending_embeddings_for_document(
 ) -> Result<()> {
     let filepath = path.to_string_lossy();
 
-    let chunk_refs = plan_pending_embeddings_for_document(path, model)?;
+    let raw_bytes = match std::fs::read(path) {
+        Ok(raw_bytes) => raw_bytes,
+        Err(err) => {
+            warn!(
+                path = %filepath,
+                error = %err,
+                "queueing filename-only embedding for unreadable file"
+            );
+            Vec::new()
+        }
+    };
+    let chunk_refs = plan_pending_embeddings_for_bytes(path, &raw_bytes, model).chunks;
 
     repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
         .with_context(|| format!("failed to queue embeddings for {filepath}"))?;
@@ -550,68 +576,118 @@ pub(super) fn queue_pending_embeddings_for_document(
     Ok(())
 }
 
-fn plan_pending_embeddings_for_document(
-    path: &Path,
+pub(super) fn replan_document_from_bytes(
+    conn: &mut rusqlite::Connection,
+    doc: &Document,
     model: &EmbeddingModel,
-) -> Result<Vec<(ChunkType, i64, i64)>> {
+    raw_bytes: &[u8],
+    now: i64,
+) -> Result<()> {
+    let path = Path::new(&doc.filepath);
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to read file metadata for {}", doc.filepath))?;
+    let file_modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(now);
+    let planned = plan_pending_embeddings_for_bytes(path, raw_bytes, model);
+    let updated_doc = Document {
+        id: doc.id,
+        filepath: doc.filepath.clone(),
+        file_type: doc.file_type.clone(),
+        doc_category: doc.doc_category,
+        file_modified_at,
+        file_size: metadata.len() as i64,
+        file_hash: hash_bytes(raw_bytes),
+        metadata_json: planned.metadata_json,
+        updated_at: now,
+    };
+
+    repository::upsert_document_and_replace_pending_embeddings(
+        conn,
+        &updated_doc,
+        model.id,
+        &planned.chunks,
+        now,
+    )?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedEmbeddings {
+    chunks: Vec<(ChunkType, i64, i64)>,
+    metadata_json: String,
+}
+
+fn plan_pending_embeddings_for_bytes(
+    path: &Path,
+    raw_bytes: &[u8],
+    model: &EmbeddingModel,
+) -> PlannedEmbeddings {
     let filepath = path.to_string_lossy();
     let mut chunk_refs = vec![(ChunkType::Filename, 0, 0)];
 
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::str::from_utf8(raw_bytes) {
         Ok(content) if !content.is_empty() => content,
-        Ok(_) => return Ok(chunk_refs),
+        Ok(_) => {
+            return PlannedEmbeddings {
+                chunks: chunk_refs,
+                metadata_json: metadata_json("structure", 0, false),
+            };
+        }
         Err(err) => {
             warn!(
                 path = %filepath,
                 error = %err,
-                "skipping content chunking for unreadable file"
+                "skipping content chunking for non-utf8 file"
             );
-            return Ok(chunk_refs);
+            return PlannedEmbeddings {
+                chunks: chunk_refs,
+                metadata_json: metadata_json("structure", 0, false),
+            };
         }
     };
 
+    let plan = chunking::plan_chunks(
+        path,
+        content,
+        model.chunk_size as usize,
+        model.chunk_overlap as usize,
+    );
     chunk_refs.extend(
-        chunk_content(
-            &content,
-            model.chunk_size as usize,
-            model.chunk_overlap as usize,
-        )
-        .into_iter()
-        .map(|(start, end)| (ChunkType::Content, start as i64, end as i64)),
+        plan.spans
+            .iter()
+            .map(|span| (ChunkType::Content, span.start as i64, span.end as i64)),
     );
 
-    Ok(chunk_refs)
+    PlannedEmbeddings {
+        chunks: chunk_refs,
+        metadata_json: plan_metadata_json(&plan),
+    }
 }
 
-/// Split `content` into overlapping chunks by byte offset.
-/// Each chunk covers at most `chunk_size` bytes; consecutive chunks overlap
-/// by `overlap` bytes.
-pub(super) fn chunk_content(
-    content: &str,
-    chunk_size: usize,
-    overlap: usize,
-) -> Vec<(usize, usize)> {
-    if content.is_empty() || chunk_size == 0 {
-        return Vec::new();
+fn plan_metadata_json(plan: &ChunkPlan) -> String {
+    metadata_json(plan.strategy.as_str(), plan.spans.len(), true)
+}
+
+fn metadata_json(strategy: &str, chunk_count: usize, content_utf8: bool) -> String {
+    serde_json::json!({
+        "strategy": strategy,
+        "planned_chunk_count": chunk_count,
+        "content_utf8": content_utf8,
+    })
+    .to_string()
+}
+
+pub(super) fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hash, "{byte:02x}").expect("writing to String cannot fail");
     }
-
-    let len = content.len();
-    let step = chunk_size.saturating_sub(overlap);
-    if step == 0 {
-        return vec![(0, len)];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < len {
-        let end = std::cmp::min(start + chunk_size, len);
-        chunks.push((start, end));
-        if end >= len {
-            break;
-        }
-        start += step;
-    }
-
-    chunks
+    hash
 }

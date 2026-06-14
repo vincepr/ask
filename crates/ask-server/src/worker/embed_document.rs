@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use ask_core::models::{EmbedDocumentPayload, EmbeddedChunk};
+use ask_core::models::{Document, DocumentEmbedding, EmbedDocumentPayload, EmbeddedChunk};
 use ask_core::repository;
 use ask_core::types::{ChunkType, JobType};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{JobContext, JobHandler, unix_now};
 
@@ -52,13 +52,73 @@ impl JobHandler for EmbedDocumentHandler {
             (document, model)
         };
 
-        let prepared_chunks = prepare_embedded_chunks(Path::new(&document.filepath), &model)
+        let path = Path::new(&document.filepath);
+        let raw_bytes = match std::fs::read(path) {
+            Ok(raw_bytes) => raw_bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut conn = ctx.pool.get().with_context(|| {
+                    format!(
+                        "failed to acquire connection to delete missing document {}",
+                        document.id
+                    )
+                })?;
+                repository::delete_document(&mut conn, document.id).with_context(|| {
+                    format!("failed to delete missing document {}", document.id)
+                })?;
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read document bytes from {}", document.filepath)
+                });
+            }
+        };
+
+        let current_hash = super::ingest::hash_bytes(&raw_bytes);
+        if current_hash != document.file_hash {
+            let mut conn = ctx.pool.get().with_context(|| {
+                format!(
+                    "failed to acquire connection to replan document {}",
+                    document.id
+                )
+            })?;
+            repository::complete_job(&conn, ctx.entry.id)
+                .with_context(|| format!("failed to remove stale embed job {}", ctx.entry.id))?;
+            super::ingest::replan_document_from_bytes(
+                &mut conn,
+                &document,
+                &model,
+                &raw_bytes,
+                unix_now(),
+            )
             .with_context(|| {
                 format!(
-                    "failed to prepare chunks for document {} and model {}",
+                    "failed to replan document {} after hash mismatch",
+                    document.id
+                )
+            })?;
+            return Ok(());
+        }
+
+        let recoverable_rows = {
+            let conn = ctx.pool.get().with_context(|| {
+                format!(
+                    "failed to acquire connection to load pending chunks for document {} and model {}",
                     document.id, model.id
                 )
             })?;
+            repository::list_recoverable_embeddings_for_model(&conn, document.id, model.id)?
+        };
+
+        let prepared_chunks =
+            prepare_embedded_chunks(path, &document, &recoverable_rows, &raw_bytes).with_context(
+                || {
+                    format!(
+                        "failed to prepare chunks for document {} and model {}",
+                        document.id, model.id
+                    )
+                },
+            )?;
         let inputs = prepared_chunks
             .iter()
             .map(|chunk| chunk.input.clone())
@@ -125,7 +185,9 @@ struct PreparedChunk {
 
 fn prepare_embedded_chunks(
     path: &Path,
-    model: &ask_core::models::EmbeddingModel,
+    document: &Document,
+    rows: &[DocumentEmbedding],
+    raw_bytes: &[u8],
 ) -> Result<Vec<PreparedChunk>> {
     let filepath = path.to_string_lossy().into_owned();
     let filename = path
@@ -133,41 +195,52 @@ fn prepare_embedded_chunks(
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| filepath.clone());
-    let mut chunks = vec![PreparedChunk {
-        chunk_type: ChunkType::Filename,
-        chunk_start: 0,
-        chunk_end: 0,
-        input: filename,
-    }];
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) if !content.is_empty() => content,
-        Ok(_) => return Ok(chunks),
+    let content = match std::str::from_utf8(raw_bytes) {
+        Ok(content) => Some(content),
         Err(err) => {
-            if err.kind() != std::io::ErrorKind::InvalidData {
-                return Err(err)
-                    .with_context(|| format!("failed to read document content from {filepath}"));
-            }
-
-            tracing::warn!(
+            warn!(
                 path = %filepath,
                 error = %err,
                 "skipping content embedding for non-utf8 file"
             );
-            return Ok(chunks);
+            None
         }
     };
 
-    for (start, end) in super::ingest::chunk_content(
-        &content,
-        model.chunk_size as usize,
-        model.chunk_overlap as usize,
-    ) {
-        let input = String::from_utf8_lossy(&content.as_bytes()[start..end]).into_owned();
+    let mut chunks = Vec::with_capacity(rows.len());
+    for row in rows {
+        let input = match row.chunk_type {
+            ChunkType::Filename => filename.clone(),
+            ChunkType::Content => {
+                let content = content.with_context(|| {
+                    format!(
+                        "document {} has content rows but is not valid UTF-8",
+                        document.id
+                    )
+                })?;
+                let start =
+                    usize::try_from(row.chunk_start).context("chunk_start must fit into usize")?;
+                let end =
+                    usize::try_from(row.chunk_end).context("chunk_end must fit into usize")?;
+                anyhow::ensure!(
+                    start <= end
+                        && end <= content.len()
+                        && content.is_char_boundary(start)
+                        && content.is_char_boundary(end),
+                    "stored chunk range {}..{} is invalid for document {}",
+                    row.chunk_start,
+                    row.chunk_end,
+                    document.id
+                );
+                content[start..end].to_string()
+            }
+        };
+
         chunks.push(PreparedChunk {
-            chunk_type: ChunkType::Content,
-            chunk_start: start as i64,
-            chunk_end: end as i64,
+            chunk_type: row.chunk_type,
+            chunk_start: row.chunk_start,
+            chunk_end: row.chunk_end,
             input,
         });
     }

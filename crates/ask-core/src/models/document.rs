@@ -9,5 +9,7 @@ pub struct Document {
     pub doc_category: DocCategory,
     pub file_modified_at: i64,
     pub file_size: i64,
+    pub file_hash: String,
+    pub metadata_json: String,
     pub updated_at: i64,
 }

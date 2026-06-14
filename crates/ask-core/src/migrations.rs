@@ -41,6 +41,11 @@ const MIGRATIONS: &[Migration] = &[
         required_actions: None,
         sql: include_str!("../migrations/0006_rebuild_embedding_model_identity.sql"),
     },
+    Migration {
+        version: 7,
+        required_actions: None,
+        sql: include_str!("../migrations/0007_add_document_hash_metadata.sql"),
+    },
 ];
 
 /// Applies every embedded migration that has not yet been recorded.
