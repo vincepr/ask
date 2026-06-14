@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use ask_core::models::DocumentSearchResult;
 use ask_core::repository;
+use ask_core::types::ChunkType;
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -154,33 +155,59 @@ fn collapse_to_documents(
     limit: usize,
     include_location: bool,
 ) -> Vec<SearchDocumentResult> {
-    let mut seen_documents = HashSet::with_capacity(limit);
-    let mut results = Vec::with_capacity(limit);
+    let mut document_indices: HashMap<i64, usize> = HashMap::with_capacity(limit);
+    let mut results: Vec<CollapsedSearchDocument> = Vec::with_capacity(limit);
 
     for hit in hits {
-        if !seen_documents.insert(hit.document_id) {
+        if let Some(&index) = document_indices.get(&hit.document_id) {
+            if include_location
+                && results[index].result.byte_start.is_none()
+                && hit.chunk_type != ChunkType::Filename
+            {
+                results[index].result.byte_start = Some(hit.chunk_start);
+                results[index].result.byte_end = Some(hit.chunk_end);
+            }
             continue;
         }
 
-        let (byte_start, byte_end) = if include_location {
-            (Some(hit.chunk_start), Some(hit.chunk_end))
-        } else {
-            (None, None)
-        };
-
-        results.push(SearchDocumentResult {
-            filepath: hit.filepath,
-            match_score: distance_to_score(hit.distance),
-            byte_start,
-            byte_end,
-        });
-
         if results.len() == limit {
-            break;
+            continue;
+        }
+
+        let use_hit_location = include_location && hit.chunk_type != ChunkType::Filename;
+        let byte_start = use_hit_location.then_some(hit.chunk_start);
+        let byte_end = use_hit_location.then_some(hit.chunk_end);
+
+        document_indices.insert(hit.document_id, results.len());
+
+        results.push(CollapsedSearchDocument {
+            result: SearchDocumentResult {
+                filepath: hit.filepath,
+                match_score: distance_to_score(hit.distance),
+                byte_start,
+                byte_end,
+            },
+            original_byte_start: hit.chunk_start,
+            original_byte_end: hit.chunk_end,
+        });
+    }
+
+    if include_location {
+        for result in &mut results {
+            if result.result.byte_start.is_none() {
+                result.result.byte_start = Some(result.original_byte_start);
+                result.result.byte_end = Some(result.original_byte_end);
+            }
         }
     }
 
-    results
+    results.into_iter().map(|result| result.result).collect()
+}
+
+struct CollapsedSearchDocument {
+    result: SearchDocumentResult,
+    original_byte_start: i64,
+    original_byte_end: i64,
 }
 
 fn distance_to_score(distance: f64) -> f64 {
@@ -191,4 +218,60 @@ fn expanded_raw_limit(limit: usize) -> usize {
     limit
         .saturating_mul(SEARCH_RAW_LIMIT_MULTIPLIER)
         .min(SEARCH_RAW_LIMIT_CAP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(
+        document_id: i64,
+        chunk_type: ChunkType,
+        chunk_start: i64,
+        chunk_end: i64,
+        distance: f64,
+    ) -> DocumentSearchResult {
+        DocumentSearchResult {
+            document_id,
+            filepath: format!("doc-{document_id}.txt"),
+            file_type: "txt".to_string(),
+            doc_category: ask_core::types::DocCategory::Resource,
+            file_modified_at: 0,
+            file_size: 0,
+            document_updated_at: 0,
+            embedding_id: document_id,
+            model_id: 1,
+            chunk_type,
+            chunk_start,
+            chunk_end,
+            distance,
+        }
+    }
+
+    #[test]
+    fn collapse_to_documents_preserves_score_and_backfills_location_from_later_chunk() {
+        let results = collapse_to_documents(
+            vec![
+                hit(1, ChunkType::Filename, 0, 0, 0.0),
+                hit(1, ChunkType::Content, 42, 64, 0.5),
+            ],
+            1,
+            true,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].match_score, 1.0);
+        assert_eq!(results[0].byte_start, Some(42));
+        assert_eq!(results[0].byte_end, Some(64));
+    }
+
+    #[test]
+    fn collapse_to_documents_keeps_filename_offsets_when_no_better_location_exists() {
+        let results = collapse_to_documents(vec![hit(1, ChunkType::Filename, 0, 0, 0.0)], 1, true);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].match_score, 1.0);
+        assert_eq!(results[0].byte_start, Some(0));
+        assert_eq!(results[0].byte_end, Some(0));
+    }
 }
