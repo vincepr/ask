@@ -76,8 +76,7 @@ The useful outcome is an `ask`-specific retrieval design, not a direct port.
   has document modification timestamps but no persisted section or chunk-text
   table.
 - Existing notes already identify related work in
-  [`005-utf8-safe-chunking.md`](../improvements/005-utf8-safe-chunking.md) and
-  [`009-sqlite-fuzzy-search.md`](../features/009-sqlite-fuzzy-search.md).
+  [`sqlite-fuzzy-or-hybrid-search.md`](../backlog/sqlite-fuzzy-or-hybrid-search.md).
 
 ## Improvements Applicable To `ask`
 
@@ -124,7 +123,7 @@ Reference that stable row from `document_embeddings`.
 
 Add an FTS5 index over chunk text. Use the normal prose tokenizer for content
 search. Keep the trigram tokenizer proposed in
-[`009-sqlite-fuzzy-search.md`](../features/009-sqlite-fuzzy-search.md) for the
+[`sqlite-fuzzy-or-hybrid-search.md`](../backlog/sqlite-fuzzy-or-hybrid-search.md) for the
 separate filepath-search mode, where substring matching is the intended
 behavior.
 

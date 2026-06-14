@@ -43,9 +43,8 @@ This is simpler than qmd, but the gap is now clear: qmd has a retrieval system;
 
 The qmd lessons support the direction already hinted by existing docs:
 
-- `docs/improvements/005-utf8-safe-chunking.md`
-- `docs/features/010-text-decoding-beyond-utf8.md`
-- `docs/features/009-sqlite-fuzzy-search.md`
+- `docs/issues/003-text-decoding-beyond-utf8.md`
+- `docs/backlog/sqlite-fuzzy-or-hybrid-search.md`
 - `docs/temp/anthropic-contextual-retrieval-analysis.md`
 
 The most useful path is not to copy qmd wholesale. The right path is to adopt
@@ -157,8 +156,8 @@ worth adapting:
 - keep stale or pending chunks visible in status endpoints,
 - retry failed chunks without hiding unrecovered failures behind logs.
 
-This connects directly to existing provider-readiness notes in
-`docs/issues/004-embedding-provider-readiness.md`.
+The old provider-readiness note was removed after transient embedding retry
+behavior became good enough for the current queue model.
 
 ## Lesson 4: Add FTS5 Before Reranking
 

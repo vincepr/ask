@@ -55,7 +55,7 @@ Implication:
 ### `ask`
 
 - Normal ingestion walks all regular files under the root. Git-mode avoids some obvious binary/media/archive extensions through a small denylist, but plain walk mode does not: `crates/ask-server/src/worker/ingest.rs:18-21`, `524-533`.
-- The repo already documents that there are no real size guards or binary sniffing yet: `docs/improvements/006-file-filtering-and-size-guards.md:3-24`.
+- The repo already documents that there are no real size guards or binary sniffing yet: `docs/issues/004-file-filtering-and-size-guards.md`.
 
 Implication:
 - `ask` is currently optimistic: it tries to read almost everything as UTF-8 text and only falls back after the read fails.
@@ -150,10 +150,9 @@ Implication:
 
 ### `ask`
 
-- Both ingest chunk planning and embed-time chunk preparation use `std::fs::read_to_string()`: `crates/ask-server/src/worker/ingest.rs:560-571`, `crates/ask-server/src/worker/embed_document.rs:143-159`.
+- Both ingest chunk planning and embed-time chunk preparation read full raw file bytes before decoding or chunk preparation.
 - Non-UTF-8 or unreadable files degrade to filename-only embeddings.
-- The repo already tracks this as a known limitation and explicitly wants a shared decoding helper later: `docs/features/010-text-decoding-beyond-utf8.md:11-34`, `54-82`.
-- The repo also documents a known UTF-8 boundary issue because chunking uses raw byte offsets: `docs/improvements/005-utf8-safe-chunking.md:3-25`.
+- The repo already tracks non-UTF-8 decoding as a known limitation and explicitly wants a shared decoding helper later: `docs/issues/003-text-decoding-beyond-utf8.md`.
 
 Implication:
 - `ask` currently has a correctness risk around multibyte boundaries and a recall loss for decodable non-UTF-8 text files.

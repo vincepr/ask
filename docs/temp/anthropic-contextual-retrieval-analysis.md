@@ -117,17 +117,15 @@ Suggested query flow:
 This improves exact identifier retrieval for code, filenames, configuration
 keys, and error strings without introducing a generation dependency. Use the
 normal FTS tokenizer for content. Keep the trigram filepath mode proposed in
-[`009-sqlite-fuzzy-search.md`](../features/009-sqlite-fuzzy-search.md) as a
+[`sqlite-fuzzy-or-hybrid-search.md`](../backlog/sqlite-fuzzy-or-hybrid-search.md) as a
 separate fallback search mode.
 
 ### 3. Fix Chunk Planning Before Measuring Contextual Retrieval
 
 The configured chunk size is described as tokens in
-[`config.rs`](../../crates/ask-server/src/config.rs), but
-[`worker/ingest.rs`](../../crates/ask-server/src/worker/ingest.rs) currently
-splits by byte count. The existing
-[`005-utf8-safe-chunking.md`](../improvements/005-utf8-safe-chunking.md) note
-also identifies unsafe UTF-8 boundary behavior.
+[`config.rs`](../../crates/ask-server/src/config.rs). Current chunk planning is
+UTF-8-safe and structure-aware, but still uses byte spans rather than true token
+counts.
 
 Generated context cannot compensate for poor chunk boundaries. Introduce one
 shared planner used by ingest planning and embed-time materialization. At
@@ -178,9 +176,7 @@ Useful deterministic context can include:
 
 This is particularly suitable for source trees, where filepath and symbol
 names carry retrieval meaning. It also avoids making ingestion depend on a
-generation API while the job retry semantics in
-[`004-embedding-provider-readiness.md`](../issues/004-embedding-provider-readiness.md)
-remain unresolved.
+generation API.
 
 LLM-generated context can then be evaluated as an optional strategy for prose,
 notes, and documents where deterministic metadata is insufficient.
@@ -190,7 +186,7 @@ notes, and documents where deterministic metadata is insufficient.
 The article's prompt includes the whole document for each chunk, with prompt
 caching proposed to reduce repeated cost. `ask` currently reads whole files and
 already has an open size-guard concern in
-[`006-file-filtering-and-size-guards.md`](../improvements/006-file-filtering-and-size-guards.md).
+[`004-file-filtering-and-size-guards.md`](../issues/004-file-filtering-and-size-guards.md).
 
 An LLM contextualizer therefore needs explicit bounds:
 

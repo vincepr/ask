@@ -1,4 +1,0 @@
-Problems for usability
-- Search endpoint needs priority over embedding-queue work. (or at least longer timeouts, so it will work)
-- paths from the docker container are NOT what we want expose out. Because `/resources/Cargo.toml` is not the actual filepath that is relevant for the enduser, who is calling this via mcp/cli/api etc. It should (optionally get translated to the best path we can give. Since we want to keep it simple just replacin use the existing ENV-Variables-path and replacing the /resource, or the other one)
-- use hash to re-ingest (should probably NOT be default, only started when ingesting with a special flag) -> re-calculates all embeddings on changed content. (would be best if it happens in a cleanly, only deleting once new embeddings are generated, but whatever way is easiest/smallest to maintain or what has smallest overhead. Not a super important feature. So main goal is to keep implementation clean)
