@@ -27,8 +27,8 @@ use self::progress::EmbeddingStatsResponse;
 use self::search::{SearchDocumentResult, SearchRequest};
 use crate::DbPool;
 use crate::config::{
-    Config, DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL,
-    DEFAULT_WORKER_COUNT,
+    Config, DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE, DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
+    DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
 };
 use crate::embeddings::{DeterministicEmbeddingClient, SharedEmbeddingClient};
 
@@ -37,6 +37,8 @@ use crate::embeddings::{DeterministicEmbeddingClient, SharedEmbeddingClient};
 pub struct RuntimeConfig {
     /// Filesystem path to the persistent data directory.
     pub data_dir: String,
+    /// Maximum number of SQLite connections in the shared pool.
+    pub database_pool_size: usize,
     /// Filesystem path to the ingest/resource root directory.
     pub resource_dir: String,
     /// Embedding provider mode label.
@@ -55,6 +57,7 @@ impl RuntimeConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             data_dir: config.data_dir.clone(),
+            database_pool_size: config.database_pool_size,
             resource_dir: config.resource_dir.clone(),
             embedding_mode: config.embedding_provider.mode_name().to_string(),
             embedding_base_url: config.embedding_provider.base_url().to_string(),
@@ -96,6 +99,7 @@ impl AppState {
             embedding_client: Arc::new(DeterministicEmbeddingClient::new()),
             runtime_config: RuntimeConfig {
                 data_dir: DEFAULT_DATA_DIR.to_string(),
+                database_pool_size: DEFAULT_DATABASE_POOL_SIZE,
                 resource_dir: resource_root.display().to_string(),
                 embedding_mode: "tei".to_string(),
                 embedding_base_url: DEFAULT_TEI_BASE_URL.to_string(),

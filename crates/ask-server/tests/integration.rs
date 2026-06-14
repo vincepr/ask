@@ -12,7 +12,8 @@ use ask_core::models::{
 use ask_core::repository;
 use ask_core::types::{ChunkType, DocCategory, EmbedState, JobType};
 use ask_server::config::{
-    DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
+    DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE, DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
+    DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
 };
 use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
 use ask_server::startup::{StartupSummaryKind, reconcile_embedding_startup};
@@ -516,6 +517,10 @@ async fn embedding_stats_reports_document_level_counts_and_estimates() {
     assert_eq!(
         body["config"]["embedding_worker_count"],
         DEFAULT_WORKER_COUNT
+    );
+    assert_eq!(
+        body["config"]["database_pool_size"],
+        DEFAULT_DATABASE_POOL_SIZE
     );
     assert!(body["config"]["embedding_auth_token"].is_null());
     let file_type_counts = body["documents_by_file_type"].as_array().unwrap();

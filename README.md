@@ -49,6 +49,8 @@ ASK_SERVER_BIND_PORT=3001 cargo run -p ask-server
 
 Set `ASK_SERVER_EMBEDDING_WORKER_COUNT=0` to disable passive background
 embedding while keeping the server and query endpoint running.
+Set `ASK_SERVER_DATABASE_POOL_SIZE` above the embedding worker count to keep
+request-time search from waiting behind background database work.
 
 The server exposes a health endpoint at `GET /health`.
 
