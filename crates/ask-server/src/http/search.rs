@@ -155,17 +155,16 @@ fn collapse_to_documents(
     limit: usize,
     include_location: bool,
 ) -> Vec<SearchDocumentResult> {
-    let mut document_indices: HashMap<i64, usize> = HashMap::with_capacity(limit);
-    let mut results: Vec<CollapsedSearchDocument> = Vec::with_capacity(limit);
+    let mut document_indices: HashMap<i64, (usize, bool)> = HashMap::with_capacity(limit);
+    let mut results: Vec<SearchDocumentResult> = Vec::with_capacity(limit);
 
     for hit in hits {
-        if let Some(&index) = document_indices.get(&hit.document_id) {
-            if include_location
-                && results[index].result.byte_start.is_none()
-                && hit.chunk_type != ChunkType::Filename
+        if let Some((index, location_from_filename)) = document_indices.get_mut(&hit.document_id) {
+            if include_location && *location_from_filename && hit.chunk_type != ChunkType::Filename
             {
-                results[index].result.byte_start = Some(hit.chunk_start);
-                results[index].result.byte_end = Some(hit.chunk_end);
+                results[*index].byte_start = Some(hit.chunk_start);
+                results[*index].byte_end = Some(hit.chunk_end);
+                *location_from_filename = false;
             }
             continue;
         }
@@ -174,40 +173,21 @@ fn collapse_to_documents(
             continue;
         }
 
-        let use_hit_location = include_location && hit.chunk_type != ChunkType::Filename;
-        let byte_start = use_hit_location.then_some(hit.chunk_start);
-        let byte_end = use_hit_location.then_some(hit.chunk_end);
+        let byte_start = include_location.then_some(hit.chunk_start);
+        let byte_end = include_location.then_some(hit.chunk_end);
+        let location_from_filename = include_location && hit.chunk_type == ChunkType::Filename;
+        let index = results.len();
 
-        document_indices.insert(hit.document_id, results.len());
-
-        results.push(CollapsedSearchDocument {
-            result: SearchDocumentResult {
-                filepath: hit.filepath,
-                match_score: distance_to_score(hit.distance),
-                byte_start,
-                byte_end,
-            },
-            original_byte_start: hit.chunk_start,
-            original_byte_end: hit.chunk_end,
+        results.push(SearchDocumentResult {
+            filepath: hit.filepath,
+            match_score: distance_to_score(hit.distance),
+            byte_start,
+            byte_end,
         });
+        document_indices.insert(hit.document_id, (index, location_from_filename));
     }
 
-    if include_location {
-        for result in &mut results {
-            if result.result.byte_start.is_none() {
-                result.result.byte_start = Some(result.original_byte_start);
-                result.result.byte_end = Some(result.original_byte_end);
-            }
-        }
-    }
-
-    results.into_iter().map(|result| result.result).collect()
-}
-
-struct CollapsedSearchDocument {
-    result: SearchDocumentResult,
-    original_byte_start: i64,
-    original_byte_end: i64,
+    results
 }
 
 fn distance_to_score(distance: f64) -> f64 {
