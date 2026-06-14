@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use ask_server::{create_pool, http};
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +30,16 @@ fn current_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 fn register_model(pool: &http::AppState, now: i64, name: &str) -> i64 {
@@ -108,6 +119,7 @@ fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_string();
+    let raw_bytes = std::fs::read(&canonical_path).unwrap();
     let document = ask_core::models::Document {
         id: 0,
         filepath: canonical_path.to_string_lossy().into_owned(),
@@ -115,6 +127,8 @@ fn insert_document(pool: &http::AppState, now: i64, path: &std::path::Path) -> i
         doc_category: DocCategory::Resource,
         file_modified_at,
         file_size: metadata.len() as i64,
+        file_hash: hash_bytes(&raw_bytes),
+        metadata_json: "{}".to_string(),
         updated_at: now,
     };
     let mut conn = pool.pool().get().unwrap();
@@ -260,6 +274,16 @@ fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hash, "{byte:02x}").unwrap();
+    }
+    hash
+}
+
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -279,8 +303,7 @@ fn insert_embedding_row(
     document_id: i64,
     model_id: i64,
     chunk_type: ChunkType,
-    chunk_start: i64,
-    chunk_end: i64,
+    chunk_range: std::ops::Range<i64>,
     state: EmbedState,
     now: i64,
 ) {
@@ -292,8 +315,8 @@ fn insert_embedding_row(
             document_id,
             model_id,
             chunk_type,
-            chunk_start,
-            chunk_end,
+            chunk_range.start,
+            chunk_range.end,
             state,
             now
         ],
@@ -334,6 +357,19 @@ fn queued_embed_jobs(conn: &rusqlite::Connection) -> Vec<EmbedDocumentPayload> {
     })
     .unwrap()
     .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn stored_file_hash(conn: &rusqlite::Connection, filepath: &std::path::Path) -> String {
+    conn.query_row(
+        "SELECT file_hash FROM documents WHERE filepath = ?1",
+        [filepath
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()],
+        |row| row.get(0),
+    )
     .unwrap()
 }
 
@@ -390,7 +426,7 @@ async fn ingest_nonexistent_path_returns_404() {
 async fn ingest_file_path_returns_400() {
     let db = TempDb::new();
     let file = db.create_file("not_a_dir");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, file.display());
+    let payload = ingest_payload(&file);
 
     let res = db
         .router()
@@ -414,7 +450,7 @@ async fn ingest_file_path_returns_400() {
 async fn ingest_valid_dir_returns_200() {
     let db = TempDb::new();
     let dir = db.create_dir("my_resources");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let res = db
         .router()
@@ -439,7 +475,7 @@ async fn ingest_valid_dir_returns_200() {
 async fn ingest_git_valid_dir_returns_200() {
     let db = TempDb::new();
     let dir = db.create_dir("git_resources");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let res = db
         .router()
@@ -465,7 +501,7 @@ async fn ingest_path_outside_resource_root_returns_403() {
     let db = TempDb::new();
     let outside_dir = unique_temp_dir();
     std::fs::create_dir_all(&outside_dir).unwrap();
-    let payload = format!(r#"{{"root_path":"{}"}}"#, outside_dir.display());
+    let payload = ingest_payload(&outside_dir);
 
     let res = db
         .router()
@@ -497,7 +533,7 @@ async fn ingest_path_outside_resource_root_returns_403() {
 async fn ingest_without_file_pattern_queues_default_pattern() {
     let db = TempDb::new();
     let dir = db.create_dir("default_pattern");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let res = db
         .router()
@@ -531,10 +567,7 @@ async fn ingest_without_file_pattern_queues_default_pattern() {
 async fn ingest_with_custom_file_pattern_queues_resolved_pattern() {
     let db = TempDb::new();
     let dir = db.create_dir("custom_pattern");
-    let payload = format!(
-        r#"{{"root_path":"{}","file_pattern":"(?i)^src/.+\\.rs$"}}"#,
-        dir.display()
-    );
+    let payload = ingest_payload_with_pattern(&dir, r"(?i)^src/.+\.rs$");
 
     let res = db
         .router()
@@ -564,7 +597,7 @@ async fn ingest_with_custom_file_pattern_queues_resolved_pattern() {
 async fn ingest_invalid_file_pattern_returns_400() {
     let db = TempDb::new();
     let dir = db.create_dir("invalid_pattern");
-    let payload = format!(r#"{{"root_path":"{}","file_pattern":"["}}"#, dir.display());
+    let payload = ingest_payload_with_pattern(&dir, "[");
 
     let res = db
         .router()
@@ -598,7 +631,7 @@ async fn ingest_invalid_file_pattern_returns_400() {
 async fn ingest_duplicate_path_returns_409() {
     let db = TempDb::new();
     let dir = db.create_dir("docs");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let res1 = db
         .router()
@@ -642,7 +675,7 @@ async fn ingest_duplicate_path_returns_409() {
 async fn ingest_git_duplicate_path_returns_409() {
     let db = TempDb::new();
     let dir = db.create_dir("git_docs");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let res1 = db
         .router()
@@ -678,7 +711,7 @@ async fn ingest_git_duplicate_path_returns_409() {
 async fn ingest_and_ingest_git_same_payload_queue_independently() {
     let db = TempDb::new();
     let dir = db.create_dir("split_strategy");
-    let payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
+    let payload = ingest_payload(&dir);
 
     let ingest_res = db
         .router()
@@ -717,8 +750,8 @@ async fn ingest_and_ingest_git_same_payload_queue_independently() {
 async fn ingest_canonicalized_duplicate_path_returns_409() {
     let db = TempDb::new();
     let dir = db.create_dir("canonical_docs");
-    let canonical_payload = format!(r#"{{"root_path":"{}"}}"#, dir.display());
-    let aliased_payload = format!(r#"{{"root_path":"{}/."}}"#, dir.display());
+    let canonical_payload = ingest_payload(&dir);
+    let aliased_payload = ingest_payload(&dir.join("."));
 
     let res1 = db
         .router()
@@ -758,8 +791,8 @@ async fn ingest_different_dirs_both_succeed() {
     let dir_a = db.create_dir("a");
     let dir_b = db.create_dir("b");
 
-    let payload_a = format!(r#"{{"root_path":"{}"}}"#, dir_a.display());
-    let payload_b = format!(r#"{{"root_path":"{}"}}"#, dir_b.display());
+    let payload_a = ingest_payload(&dir_a);
+    let payload_b = ingest_payload(&dir_b);
 
     let res1 = db
         .router()
@@ -1362,6 +1395,13 @@ async fn ingest_folder_skips_unchanged_files() {
         doc_count_2, 1,
         "unchanged files should not create duplicate documents"
     );
+    assert_eq!(
+        count_jobs_by_type(&conn, JobType::EmbedDocument),
+        0,
+        "unchanged hashes should not requeue embeddings"
+    );
+    let file_hash = stored_file_hash(&conn, &file_path);
+    assert!(!file_hash.is_empty(), "ingest should store a file hash");
 }
 
 #[tokio::test]
@@ -1459,6 +1499,84 @@ async fn ingest_folder_updates_existing_document_when_file_changes() {
         pending_count, 2,
         "changed files should queue fresh embeddings"
     );
+}
+
+#[tokio::test]
+async fn ingest_folder_replans_when_same_size_file_hash_changes() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    let conn = db.pool().get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "hash-change".to_string(),
+        dimensions: 768,
+        chunk_size: 3,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    let model_id = repository::insert_model(&conn, &model).unwrap();
+    drop(conn);
+
+    let ingest_dir = db.create_dir("same-size-hash");
+    let file_path = ingest_dir.join("changed.txt");
+    std::fs::write(&file_path, "alpha").unwrap();
+    let payload_json = ingest_payload(&ingest_dir);
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let first_hash = stored_file_hash(&conn, &file_path);
+    let document_id: i64 = conn
+        .query_row("SELECT id FROM documents", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "UPDATE document_embeddings
+         SET state = 'embedded', embedding = zeroblob(3072)
+         WHERE document_id = ?1",
+        [document_id],
+    )
+    .unwrap();
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
+    drop(conn);
+
+    std::fs::write(&file_path, "bravo").unwrap();
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload_json, now + 2).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 3).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let second_hash = stored_file_hash(&conn, &file_path);
+    assert_ne!(
+        first_hash, second_hash,
+        "same-size content change must update hash"
+    );
+
+    let states: Vec<String> = conn
+        .prepare(
+            "SELECT state
+             FROM document_embeddings
+             WHERE document_id = ?1
+             ORDER BY chunk_type, chunk_start",
+        )
+        .unwrap()
+        .query_map([document_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        states.iter().all(|state| state == "pending"),
+        "hash changes should replace old embedded rows with pending rows"
+    );
+    assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 1);
 }
 
 #[tokio::test]
@@ -1681,7 +1799,7 @@ async fn ingest_files_with_special_characters_in_names() {
         "file with spaces.txt",
         "file(with)parens.txt",
         "resume-dash.txt",
-        "a-b+c*d?.txt",
+        "a-b+c-d.txt",
     ];
 
     for name in &names {
@@ -1703,7 +1821,12 @@ async fn ingest_files_with_special_characters_in_names() {
     assert_eq!(doc_count, names.len() as i64);
 
     for name in &names {
-        let abs_path = dir.join(name).to_string_lossy().to_string();
+        let abs_path = dir
+            .join(name)
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
@@ -1729,7 +1852,7 @@ async fn ingest_mixed_file_types() {
 
     let target = dir.join("readme.txt");
     let link = dir.join("link_to_readme.txt");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let symlink_created = create_file_symlink(&target, &link).is_ok();
 
     let payload = ingest_payload(&dir);
     let conn = db.pool().get().unwrap();
@@ -1748,17 +1871,19 @@ async fn ingest_mixed_file_types() {
         "symlinks should not be traversed as ingest candidates"
     );
 
-    let symlink_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
-            [link.to_string_lossy().into_owned()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        symlink_count, 0,
-        "symlink paths should not be stored as documents"
-    );
+    if symlink_created {
+        let symlink_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE filepath = ?1",
+                [link.to_string_lossy().into_owned()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            symlink_count, 0,
+            "symlink paths should not be stored as documents"
+        );
+    }
 
     let content_emb: i64 = conn
         .query_row(
@@ -1891,7 +2016,7 @@ async fn embed_document_job_replaces_rows_for_exact_document_model_pair() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, "content");
     assert_eq!(rows[0].1, 0);
-    assert_eq!(rows[0].2, 10);
+    assert_eq!(rows[0].2, 5);
     assert_eq!(rows[0].3, "embedded");
     assert_eq!(rows[0].4, 768 * 4);
     assert!(rows[0].5 >= now);
@@ -1925,7 +2050,9 @@ async fn embed_document_provider_failure_keeps_job_claimed_and_rows_unchanged() 
     conn.execute(
         "INSERT INTO document_embeddings
             (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
-         VALUES (?1, ?2, 'filename', 0, 0, 'pending', NULL, ?3)",
+         VALUES
+            (?1, ?2, 'filename', 0, 0, 'pending', NULL, ?3),
+            (?1, ?2, 'content', 0, 24, 'pending', NULL, ?3)",
         rusqlite::params![document_id, model_id, now],
     )
     .unwrap();
@@ -1953,7 +2080,8 @@ async fn embed_document_provider_failure_keeps_job_claimed_and_rows_unchanged() 
     let pair_rows: Vec<(String, Option<Vec<u8>>)> = conn
         .prepare(
             "SELECT state, embedding FROM document_embeddings
-             WHERE document_id = ?1 AND model_id = ?2",
+             WHERE document_id = ?1 AND model_id = ?2
+             ORDER BY chunk_type, chunk_start",
         )
         .unwrap()
         .query_map([document_id, model_id], |row| {
@@ -1962,7 +2090,10 @@ async fn embed_document_provider_failure_keeps_job_claimed_and_rows_unchanged() 
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(pair_rows, vec![("pending".to_string(), None)]);
+    assert_eq!(
+        pair_rows,
+        vec![("pending".to_string(), None), ("pending".to_string(), None)]
+    );
 
     let claimed_at: Option<i64> = conn
         .query_row(
@@ -1995,13 +2126,16 @@ async fn embed_document_job_uses_stored_absolute_path_independent_of_working_dir
     conn.execute(
         "INSERT INTO document_embeddings
             (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
-         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
+         VALUES
+            (?1, ?2, ?3, 0, 0, ?4, ?5),
+            (?1, ?2, ?6, 0, 10, ?4, ?5)",
         rusqlite::params![
             document_id,
             model_id,
             ChunkType::Filename,
             EmbedState::Pending,
-            now
+            now,
+            ChunkType::Content,
         ],
     )
     .unwrap();
@@ -2035,7 +2169,7 @@ async fn embed_document_job_uses_stored_absolute_path_independent_of_working_dir
 }
 
 #[tokio::test]
-async fn embed_document_missing_file_returns_error_for_stored_path() {
+async fn embed_document_missing_file_deletes_document_cleanly() {
     let db = TempDb::new();
     let now = current_time();
     let model_id = register_model(&db.pool(), now, "embed-missing-file");
@@ -2075,30 +2209,166 @@ async fn embed_document_missing_file_returns_error_for_stored_path() {
     let entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
     drop(conn);
 
-    let err = dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap_err();
-    let err_text = format!("{err:#}");
-    assert!(err_text.contains("failed to read document content from"));
-    assert!(err_text.contains(&stored_path));
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
 
     let conn = db.pool().get().unwrap();
-    let claimed_at: Option<i64> = conn
-        .query_row(
-            "SELECT claimed_at FROM job_queue WHERE id = ?1",
-            [entry.id],
-            |row| row.get(0),
-        )
+    let queued_jobs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_queue", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(claimed_at, Some(now + 2));
+    assert_eq!(queued_jobs, 0);
 
-    let state: String = conn
+    let document_count: i64 = conn
         .query_row(
-            "SELECT state FROM document_embeddings
-             WHERE document_id = ?1 AND model_id = ?2 AND chunk_type = 'filename'",
-            rusqlite::params![document_id, model_id],
+            "SELECT COUNT(*) FROM documents WHERE id = ?1 OR filepath = ?2",
+            rusqlite::params![document_id, stored_path],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(state, "pending");
+    assert_eq!(document_count, 0);
+
+    let embedding_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = ?1",
+            [document_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedding_count, 0);
+}
+
+#[tokio::test]
+async fn embed_document_hash_mismatch_replans_pending_rows_and_requeues() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    let conn = db.pool().get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "embed-hash-mismatch".to_string(),
+        dimensions: 768,
+        chunk_size: 5,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    let model_id = repository::insert_model(&conn, &model).unwrap();
+    drop(conn);
+
+    let dir = db.create_dir("embed-hash-mismatch");
+    let file_path = dir.join("doc.txt");
+    std::fs::write(&file_path, "abcdefghij").unwrap();
+    let payload = ingest_payload(&dir);
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let ingest_entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &ingest_entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let old_hash = stored_file_hash(&conn, &file_path);
+    let mut conn = db.pool().get().unwrap();
+    let embed_entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
+    drop(conn);
+
+    std::fs::write(&file_path, "klmnopqrst").unwrap();
+    dispatch_job(&db.pool(), &embed_entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let new_hash = stored_file_hash(&conn, &file_path);
+    assert_ne!(old_hash, new_hash);
+
+    let rows: Vec<(String, i64, i64)> = conn
+        .prepare(
+            "SELECT state, chunk_start, chunk_end
+             FROM document_embeddings
+             WHERE model_id = ?1
+             ORDER BY chunk_type, chunk_start",
+        )
+        .unwrap()
+        .query_map([model_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("pending".to_string(), 0, 5),
+            ("pending".to_string(), 5, 10),
+            ("pending".to_string(), 0, 0),
+        ]
+    );
+    assert_eq!(
+        queued_embed_jobs(&conn),
+        vec![EmbedDocumentPayload {
+            document_id: 1,
+            model_id,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn embed_document_hash_match_uses_stored_offsets() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model(&db.pool(), now, "embed-stored-offsets");
+
+    let dir = db.create_dir("embed-stored-offsets");
+    let file_path = dir.join("doc.txt");
+    std::fs::write(&file_path, "abcdefghij").unwrap();
+    let payload = ingest_payload(&dir);
+
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let ingest_entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &ingest_entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    delete_jobs_by_type(&conn, JobType::EmbedDocument);
+    conn.execute("DELETE FROM document_embeddings", []).unwrap();
+    conn.execute(
+        "INSERT INTO document_embeddings
+            (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
+         VALUES
+            (1, ?1, 'filename', 0, 0, 'pending', ?2),
+            (1, ?1, 'content', 2, 4, 'pending', ?2)",
+        rusqlite::params![model_id, now + 2],
+    )
+    .unwrap();
+    enqueue_embed_document_job(&conn, 1, model_id, now + 3);
+    let mut conn = db.pool().get().unwrap();
+    let embed_entry = repository::claim_job(&mut conn, now + 4).unwrap().unwrap();
+    drop(conn);
+
+    dispatch_job(&db.pool(), &embed_entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let rows: Vec<(String, i64, i64)> = conn
+        .prepare(
+            "SELECT chunk_type, chunk_start, chunk_end
+             FROM document_embeddings
+             WHERE document_id = 1 AND model_id = ?1
+             ORDER BY chunk_type, chunk_start",
+        )
+        .unwrap()
+        .query_map([model_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("content".to_string(), 2, 4),
+            ("filename".to_string(), 0, 0),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2167,6 +2437,14 @@ async fn ingest_non_utf8_file_only_gets_filename_embedding() {
         )
         .unwrap();
     assert_eq!(content_emb, 0);
+
+    let file_hash: String = conn
+        .query_row("SELECT file_hash FROM documents", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        !file_hash.is_empty(),
+        "non-UTF-8 files still store raw byte hashes"
+    );
 }
 
 #[tokio::test]
@@ -2260,8 +2538,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_a,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2270,8 +2547,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_a,
         model_id,
         ChunkType::Content,
-        0,
-        7,
+        0..7,
         EmbedState::Pending,
         now,
     );
@@ -2280,8 +2556,7 @@ fn startup_recovery_seeds_jobs_for_existing_pending_rows() {
         doc_b,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2320,8 +2595,7 @@ fn startup_recovery_seeds_jobs_for_existing_stale_rows() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Stale,
         now,
     );
@@ -2354,8 +2628,7 @@ fn startup_recovery_does_not_duplicate_existing_queued_or_claimed_jobs() {
         queued_doc,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2364,8 +2637,7 @@ fn startup_recovery_does_not_duplicate_existing_queued_or_claimed_jobs() {
         claimed_doc,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Stale,
         now,
     );
@@ -2418,8 +2690,7 @@ fn startup_recovery_is_idempotent_across_repeated_boots() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2504,8 +2775,7 @@ fn startup_recovery_reports_recoverable_work_in_summary_state() {
         doc_id,
         model_id,
         ChunkType::Filename,
-        0,
-        0,
+        0..0,
         EmbedState::Pending,
         now,
     );
@@ -2619,9 +2889,11 @@ async fn mark_stale_batch_updates_embeddings() {
     )
     .unwrap();
     conn.execute_batch(
-        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES ('/a.txt', 'txt', 'resource', 100, 10, 100),
-                ('/b.txt', 'txt', 'resource', 101, 20, 101);
+        "INSERT INTO documents
+            (filepath, file_type, doc_category, file_modified_at, file_size,
+             file_hash, metadata_json, updated_at)
+         VALUES ('/a.txt', 'txt', 'resource', 100, 10, 'hash-a', '{}', 100),
+                ('/b.txt', 'txt', 'resource', 101, 20, 'hash-b', '{}', 101);
          INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
          VALUES (1, 1, 'filename', 0, 0, 'embedded', 100),
                 (1, 1, 'content', 0, 5, 'embedded', 100),
@@ -2714,8 +2986,10 @@ async fn mark_stale_nonexistent_ids_is_noop() {
     )
     .unwrap();
     conn.execute_batch(
-        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES ('/keep.txt', 'txt', 'resource', 100, 10, 100);
+        "INSERT INTO documents
+            (filepath, file_type, doc_category, file_modified_at, file_size,
+             file_hash, metadata_json, updated_at)
+         VALUES ('/keep.txt', 'txt', 'resource', 100, 10, 'hash-keep', '{}', 100);
          INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
          VALUES (1, 1, 'filename', 0, 0, 'embedded', 100);",
     )
@@ -2793,9 +3067,11 @@ async fn mark_stale_affects_all_models_and_preserves_rows() {
     .unwrap();
 
     conn.execute_batch(
-        "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES ('/doc1.txt', 'txt', 'resource', 100, 10, 100),
-                ('/doc2.txt', 'txt', 'resource', 200, 20, 200);
+        "INSERT INTO documents
+            (filepath, file_type, doc_category, file_modified_at, file_size,
+             file_hash, metadata_json, updated_at)
+         VALUES ('/doc1.txt', 'txt', 'resource', 100, 10, 'hash-doc-1', '{}', 100),
+                ('/doc2.txt', 'txt', 'resource', 200, 20, 'hash-doc-2', '{}', 200);
 
          INSERT INTO document_embeddings (document_id, model_id, chunk_type, chunk_start, chunk_end, state, created_at)
          VALUES

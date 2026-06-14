@@ -1,0 +1,5 @@
+ALTER TABLE documents
+ADD COLUMN file_hash TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE documents
+ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '';

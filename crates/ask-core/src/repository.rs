@@ -18,7 +18,8 @@ const DOCUMENT_EMBEDDING_VEC_TABLE: &str = "document_embedding_vec";
 
 fn load_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Document>> {
     conn.query_row(
-        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at
+        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size,
+                file_hash, metadata_json, updated_at
          FROM documents
          WHERE filepath = ?1
          ORDER BY updated_at DESC, id DESC
@@ -32,7 +33,9 @@ fn load_document_by_path(conn: &Connection, filepath: &str) -> Result<Option<Doc
                 doc_category: row.get(3)?,
                 file_modified_at: row.get(4)?,
                 file_size: row.get(5)?,
-                updated_at: row.get(6)?,
+                file_hash: row.get(6)?,
+                metadata_json: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         },
     )
@@ -72,14 +75,7 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
     let existing = load_document_by_path(conn, &doc.filepath)?;
 
     let outcome = match existing {
-        Some(existing)
-            if existing.file_type == doc.file_type
-                && existing.doc_category == doc.doc_category
-                && existing.file_modified_at == doc.file_modified_at
-                && existing.file_size == doc.file_size =>
-        {
-            (existing.id, false)
-        }
+        Some(existing) if existing.file_hash == doc.file_hash => (existing.id, false),
         Some(existing) => {
             conn.execute(
                 "UPDATE documents
@@ -87,13 +83,17 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
                      doc_category = ?2,
                      file_modified_at = ?3,
                      file_size = ?4,
-                     updated_at = ?5
-                 WHERE id = ?6",
+                     file_hash = ?5,
+                     metadata_json = ?6,
+                     updated_at = ?7
+                 WHERE id = ?8",
                 params![
                     doc.file_type,
                     doc.doc_category,
                     doc.file_modified_at,
                     doc.file_size,
+                    doc.file_hash,
+                    doc.metadata_json,
                     doc.updated_at,
                     existing.id,
                 ],
@@ -104,14 +104,18 @@ fn upsert_document_in_tx(conn: &Connection, doc: &Document) -> Result<(i64, bool
         }
         None => {
             conn.execute(
-                "INSERT INTO documents (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO documents
+                    (filepath, file_type, doc_category, file_modified_at, file_size,
+                     file_hash, metadata_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     doc.filepath,
                     doc.file_type,
                     doc.doc_category,
                     doc.file_modified_at,
                     doc.file_size,
+                    doc.file_hash,
+                    doc.metadata_json,
                     doc.updated_at,
                 ],
             )
@@ -183,7 +187,7 @@ where
     }
 
     before_queue()?;
-    delete_pending_embeddings_for_model(&tx, doc_id, model_id)?;
+    delete_embeddings_for_model(&tx, doc_id, model_id)?;
     insert_pending_embeddings(&tx, doc_id, model_id, chunks, now)?;
     seed_embed_jobs(&tx, now)?;
 
@@ -213,7 +217,8 @@ pub fn find_document_by_path(conn: &Connection, filepath: &str) -> Result<Option
 /// Returns an error if the lookup query fails.
 pub fn find_document_by_id(conn: &Connection, id: i64) -> Result<Option<Document>> {
     conn.query_row(
-        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at
+        "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size,
+                file_hash, metadata_json, updated_at
          FROM documents
          WHERE id = ?1",
         params![id],
@@ -225,7 +230,9 @@ pub fn find_document_by_id(conn: &Connection, id: i64) -> Result<Option<Document
                 doc_category: row.get(3)?,
                 file_modified_at: row.get(4)?,
                 file_size: row.get(5)?,
-                updated_at: row.get(6)?,
+                file_hash: row.get(6)?,
+                metadata_json: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         },
     )
@@ -318,7 +325,12 @@ where
 /// List all documents.
 pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
     let mut stmt = conn
-        .prepare("SELECT id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at FROM documents ORDER BY filepath")
+        .prepare(
+            "SELECT id, filepath, file_type, doc_category, file_modified_at, file_size,
+                    file_hash, metadata_json, updated_at
+             FROM documents
+             ORDER BY filepath",
+        )
         .context("failed to prepare list_documents")?;
 
     let rows = stmt
@@ -330,7 +342,9 @@ pub fn list_documents(conn: &Connection) -> Result<Vec<Document>> {
                 doc_category: row.get(3)?,
                 file_modified_at: row.get(4)?,
                 file_size: row.get(5)?,
-                updated_at: row.get(6)?,
+                file_hash: row.get(6)?,
+                metadata_json: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .context("failed to query documents")?;
@@ -526,6 +540,114 @@ pub fn delete_pending_embeddings_for_model(
     .context("failed to delete pending embeddings")?;
 
     Ok(())
+}
+
+/// Delete every embedding row for one document/model pair.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc_id` - Persisted document identifier.
+/// * `model_id` - Embedding model identifier.
+///
+/// # Errors
+///
+/// Returns an error if vector rows or embedding rows cannot be deleted.
+pub fn delete_embeddings_for_model(conn: &Connection, doc_id: i64, model_id: i64) -> Result<()> {
+    delete_vec_rows_for_document_model(conn, doc_id, model_id)?;
+    conn.execute(
+        "DELETE FROM document_embeddings WHERE document_id = ?1 AND model_id = ?2",
+        params![doc_id, model_id],
+    )
+    .context("failed to delete embeddings for document/model pair")?;
+
+    Ok(())
+}
+
+/// Delete a document and all embedding rows owned by it.
+///
+/// Vector rows are removed explicitly before deleting regular embedding rows
+/// because the sqlite-vec table does not participate in foreign-key cascades.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc_id` - Persisted document identifier.
+///
+/// # Errors
+///
+/// Returns an error if the transaction or any delete query fails.
+pub fn delete_document(conn: &mut Connection, doc_id: i64) -> Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start delete_document transaction")?;
+
+    delete_vec_rows_for_documents(&tx, &[doc_id])?;
+    tx.execute(
+        "DELETE FROM document_embeddings WHERE document_id = ?1",
+        params![doc_id],
+    )
+    .context("failed to delete document embeddings")?;
+    tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])
+        .context("failed to delete document")?;
+
+    tx.commit().context("failed to commit delete_document")?;
+    Ok(())
+}
+
+/// List pending or stale embedding rows for one document/model pair.
+///
+/// # Arguments
+///
+/// * `conn` - Open SQLite connection.
+/// * `doc_id` - Persisted document identifier.
+/// * `model_id` - Embedding model identifier.
+///
+/// # Returns
+///
+/// Rows ordered so embedding inputs are prepared deterministically.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn list_recoverable_embeddings_for_model(
+    conn: &Connection,
+    doc_id: i64,
+    model_id: i64,
+) -> Result<Vec<crate::models::DocumentEmbedding>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, document_id, model_id, chunk_type, chunk_start, chunk_end,
+                    state, embedding, created_at
+             FROM document_embeddings
+             WHERE document_id = ?1
+               AND model_id = ?2
+               AND state IN (?3, ?4)
+             ORDER BY chunk_type, chunk_start, id",
+        )
+        .context("failed to prepare list_recoverable_embeddings_for_model")?;
+
+    let rows = stmt
+        .query_map(
+            params![doc_id, model_id, EmbedState::Pending, EmbedState::Stale],
+            |row| {
+                Ok(crate::models::DocumentEmbedding {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    chunk_type: row.get(3)?,
+                    chunk_start: row.get(4)?,
+                    chunk_end: row.get(5)?,
+                    state: row.get(6)?,
+                    embedding: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            },
+        )
+        .context("failed to query recoverable embeddings")?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to collect recoverable embeddings")
 }
 
 /// Replace every embedding row for one document/model pair in one transaction.
@@ -1052,6 +1174,8 @@ mod tests {
             doc_category: DocCategory::Resource,
             file_modified_at: 100,
             file_size: 10,
+            file_hash: "hash-a".to_string(),
+            metadata_json: "{}".to_string(),
             updated_at: 100,
         };
 
@@ -1094,8 +1218,9 @@ mod tests {
         .expect("embedding model insert must succeed");
         conn.execute(
             "INSERT INTO documents
-                (id, filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-             VALUES (1, '/tmp/a.txt', 'txt', 'resource', 100, 10, 100)",
+                (id, filepath, file_type, doc_category, file_modified_at, file_size,
+                 file_hash, metadata_json, updated_at)
+             VALUES (1, '/tmp/a.txt', 'txt', 'resource', 100, 10, 'hash-a', '{}', 100)",
             [],
         )
         .expect("document insert must succeed");

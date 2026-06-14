@@ -14,9 +14,9 @@ fn applies_migrations_only_once() {
         .query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))
         .expect("migration count query must succeed");
 
-    assert_eq!(first_run, 6);
+    assert_eq!(first_run, 7);
     assert_eq!(second_run, 0);
-    assert_eq!(applied_total, 6);
+    assert_eq!(applied_total, 7);
 }
 
 #[test]
@@ -83,4 +83,21 @@ fn embedding_model_identity_rejects_exact_duplicates() {
         error.to_string().contains("UNIQUE"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn documents_store_file_hash_and_metadata_json() {
+    let mut connection = Connection::open_in_memory().expect("in-memory database must open");
+    apply_pending_migrations(&mut connection).expect("migration run must succeed");
+
+    let columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(documents)")
+        .expect("table info statement must prepare")
+        .query_map([], |row| row.get(1))
+        .expect("table info query must run")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("table columns must collect");
+
+    assert!(columns.iter().any(|column| column == "file_hash"));
+    assert!(columns.iter().any(|column| column == "metadata_json"));
 }

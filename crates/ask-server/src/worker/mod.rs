@@ -10,6 +10,7 @@ use tracing::{error, info};
 use crate::DbPool;
 use crate::embeddings::{EmbeddingClient, SharedEmbeddingClient};
 
+mod chunking;
 mod embed_document;
 mod ingest;
 
@@ -400,61 +401,182 @@ mod tests {
     }
 
     #[test]
-    fn chunk_content_empty() {
-        assert!(ingest::chunk_content("", 10, 0).is_empty());
+    fn fixed_utf8_chunks_empty() {
+        assert!(chunking::fixed_utf8_chunks("", 10, 0).is_empty());
     }
 
     #[test]
-    fn chunk_content_zero_chunk_size() {
-        assert!(ingest::chunk_content("hello", 0, 0).is_empty());
+    fn fixed_utf8_chunks_zero_chunk_size() {
+        assert!(chunking::fixed_utf8_chunks("hello", 0, 0).is_empty());
     }
 
     #[test]
-    fn chunk_content_smaller_than_chunk() {
-        let chunks = ingest::chunk_content("hello", 100, 0);
-        assert_eq!(chunks, vec![(0, 5)]);
+    fn fixed_utf8_chunks_smaller_than_chunk() {
+        let chunks = chunking::fixed_utf8_chunks("hello", 100, 0);
+        assert_eq!(chunks, vec![chunking::ChunkSpan { start: 0, end: 5 }]);
     }
 
     #[test]
-    fn chunk_content_exact_size() {
-        let chunks = ingest::chunk_content("12345", 5, 0);
-        assert_eq!(chunks, vec![(0, 5)]);
+    fn fixed_utf8_chunks_exact_size() {
+        let chunks = chunking::fixed_utf8_chunks("12345", 5, 0);
+        assert_eq!(chunks, vec![chunking::ChunkSpan { start: 0, end: 5 }]);
     }
 
     #[test]
-    fn chunk_content_multiple_chunks_no_overlap() {
-        let chunks = ingest::chunk_content("abcdefghij", 5, 0);
-        assert_eq!(chunks, vec![(0, 5), (5, 10)]);
+    fn fixed_utf8_chunks_multiple_chunks_no_overlap() {
+        let chunks = chunking::fixed_utf8_chunks("abcdefghij", 5, 0);
+        assert_eq!(
+            chunks,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 5 },
+                chunking::ChunkSpan { start: 5, end: 10 },
+            ]
+        );
     }
 
     #[test]
-    fn chunk_content_with_overlap() {
-        let chunks = ingest::chunk_content("abcdefghij", 6, 2);
-        assert_eq!(chunks, vec![(0, 6), (4, 10)]);
+    fn fixed_utf8_chunks_with_overlap() {
+        let chunks = chunking::fixed_utf8_chunks("abcdefghij", 6, 2);
+        assert_eq!(
+            chunks,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 6 },
+                chunking::ChunkSpan { start: 4, end: 10 },
+            ]
+        );
     }
 
     #[test]
-    fn chunk_content_full_overlap_returns_single_chunk() {
-        let chunks = ingest::chunk_content("hello world", 5, 5);
-        assert_eq!(chunks, vec![(0, 11)]);
+    fn fixed_utf8_chunks_full_overlap_returns_single_chunk() {
+        let chunks = chunking::fixed_utf8_chunks("hello world", 5, 5);
+        assert_eq!(chunks, vec![chunking::ChunkSpan { start: 0, end: 11 }]);
     }
 
     #[test]
-    fn chunk_content_overlap_greater_than_size() {
-        let chunks = ingest::chunk_content("hello world", 5, 10);
-        assert_eq!(chunks, vec![(0, 11)]);
+    fn fixed_utf8_chunks_overlap_greater_than_size() {
+        let chunks = chunking::fixed_utf8_chunks("hello world", 5, 10);
+        assert_eq!(chunks, vec![chunking::ChunkSpan { start: 0, end: 11 }]);
     }
 
     #[test]
-    fn chunk_content_chunk_size_one() {
-        let chunks = ingest::chunk_content("abc", 1, 0);
-        assert_eq!(chunks, vec![(0, 1), (1, 2), (2, 3)]);
+    fn fixed_utf8_chunks_chunk_size_one() {
+        let chunks = chunking::fixed_utf8_chunks("abc", 1, 0);
+        assert_eq!(
+            chunks,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 1 },
+                chunking::ChunkSpan { start: 1, end: 2 },
+                chunking::ChunkSpan { start: 2, end: 3 },
+            ]
+        );
     }
 
     #[test]
-    fn chunk_content_multibyte_utf8() {
-        let chunks = ingest::chunk_content("añb", 3, 0);
-        assert_eq!(chunks, vec![(0, 3), (3, 4)]);
+    fn fixed_utf8_chunks_never_split_multibyte_scalar() {
+        let chunks = chunking::fixed_utf8_chunks("éé", 3, 0);
+        assert_eq!(
+            chunks,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 2 },
+                chunking::ChunkSpan { start: 2, end: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_utf8_planner_implements_chunk_planner_trait() {
+        fn plan_with_trait(
+            planner: &impl chunking::ChunkPlanner,
+            content: &str,
+        ) -> chunking::ChunkPlan {
+            planner.plan(content, 5, 0)
+        }
+
+        let planner = chunking::FixedUtf8ChunkPlanner;
+        let plan = plan_with_trait(&planner, "abcdefghij");
+
+        assert_eq!(plan.strategy, "fixed_utf8");
+        assert_eq!(
+            plan.spans,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 5 },
+                chunking::ChunkSpan { start: 5, end: 10 },
+            ]
+        );
+    }
+
+    #[test]
+    fn structure_chunks_prefers_heading_breakpoint() {
+        let content = "# Alpha\nfirst paragraph\n\n## Beta\nsecond paragraph\n";
+        let split = content.find("## Beta").unwrap();
+        let plan = chunking::structure_chunks(content, 28, 0, 16);
+
+        assert_eq!(
+            plan[0],
+            chunking::ChunkSpan {
+                start: 0,
+                end: split
+            }
+        );
+    }
+
+    #[test]
+    fn structure_chunks_uses_blank_line_before_list_item() {
+        let content = "intro paragraph\n\n- first item\n- second item\n";
+        let split = content.find("- first item").unwrap();
+        let plan = chunking::structure_chunks(content, 24, 0, 12);
+
+        assert_eq!(
+            plan[0],
+            chunking::ChunkSpan {
+                start: 0,
+                end: split
+            }
+        );
+    }
+
+    #[test]
+    fn structure_chunks_uses_horizontal_rule_breakpoint() {
+        let content = "opening paragraph\n\n---\n\nclosing paragraph\n";
+        let split = content.find("---").unwrap();
+        let plan = chunking::structure_chunks(content, 24, 0, 12);
+
+        assert_eq!(
+            plan[0],
+            chunking::ChunkSpan {
+                start: 0,
+                end: split
+            }
+        );
+    }
+
+    #[test]
+    fn structure_chunks_ignores_headings_inside_fenced_code() {
+        let content = "intro\n```\n# not a heading\n```\n\n# Real Heading\nbody\n";
+        let fenced_heading = content.find("# not a heading").unwrap();
+        let plan = chunking::structure_chunks(content, 25, 0, 20);
+
+        assert_ne!(plan[0].end, fenced_heading);
+        assert!(plan[0].end <= content.find("# Real Heading").unwrap());
+    }
+
+    #[test]
+    fn structure_chunks_falls_back_to_utf8_safe_fixed_split() {
+        let chunks = chunking::structure_chunks("éé", 3, 0, 1);
+        assert_eq!(
+            chunks,
+            vec![
+                chunking::ChunkSpan { start: 0, end: 2 },
+                chunking::ChunkSpan { start: 2, end: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn routed_planner_defaults_to_structure() {
+        let plan = chunking::plan_chunks(std::path::Path::new("notes.md"), "# A\n\n# B\n", 6, 0);
+
+        assert_eq!(plan.strategy, "structure");
     }
 
     #[test]

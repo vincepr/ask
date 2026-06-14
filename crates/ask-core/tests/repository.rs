@@ -344,6 +344,8 @@ fn upsert_document_reuses_existing_row_for_unchanged_file() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -361,6 +363,54 @@ fn upsert_document_reuses_existing_row_for_unchanged_file() {
 }
 
 #[test]
+fn upsert_document_treats_file_hash_as_change_boundary() {
+    let mut conn = setup_documents_db();
+    let original = Document {
+        id: 0,
+        filepath: "/tmp/hash.txt".to_string(),
+        file_type: "txt".to_string(),
+        doc_category: DocCategory::Resource,
+        file_modified_at: 100,
+        file_size: 5,
+        file_hash: "hash-a".to_string(),
+        metadata_json: r#"{"strategy":"structure","chunk_count":1}"#.to_string(),
+        updated_at: 100,
+    };
+
+    let (doc_id, first_changed) = upsert_document(&mut conn, &original).unwrap();
+    assert!(first_changed);
+
+    let same_hash_new_metadata = Document {
+        updated_at: 200,
+        file_modified_at: 200,
+        metadata_json: r#"{"strategy":"structure","chunk_count":99}"#.to_string(),
+        ..original.clone()
+    };
+    let (same_id, same_changed) = upsert_document(&mut conn, &same_hash_new_metadata).unwrap();
+    assert_eq!(same_id, doc_id);
+    assert!(!same_changed, "unchanged hash must skip recalculation");
+
+    let new_hash_same_size = Document {
+        file_hash: "hash-b".to_string(),
+        metadata_json: r#"{"strategy":"structure","chunk_count":2}"#.to_string(),
+        updated_at: 300,
+        ..same_hash_new_metadata
+    };
+    let (changed_id, hash_changed) = upsert_document(&mut conn, &new_hash_same_size).unwrap();
+    assert_eq!(changed_id, doc_id);
+    assert!(hash_changed, "changed hash must force recalculation");
+
+    let stored = find_document_by_id(&conn, doc_id).unwrap().unwrap();
+    assert_eq!(stored.file_hash, "hash-b");
+    assert_eq!(stored.file_modified_at, 200);
+    assert_eq!(stored.file_size, 5);
+    assert_eq!(
+        stored.metadata_json,
+        r#"{"strategy":"structure","chunk_count":2}"#
+    );
+}
+
+#[test]
 fn upsert_document_updates_existing_row_and_marks_embeddings_stale() {
     let mut conn = setup_documents_db();
     insert_embedding_model(&conn, 1, "m1");
@@ -371,6 +421,8 @@ fn upsert_document_updates_existing_row_and_marks_embeddings_stale() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
     let (doc_id, _) = upsert_document(&mut conn, &original).unwrap();
@@ -387,6 +439,7 @@ fn upsert_document_updates_existing_row_and_marks_embeddings_stale() {
         updated_at: 200,
         file_modified_at: 200,
         file_size: 20,
+        file_hash: "hash-b".to_string(),
         ..original
     };
     let (updated_id, changed) = upsert_document(&mut conn, &updated).unwrap();
@@ -415,18 +468,23 @@ fn find_document_by_path_prefers_latest_row_when_duplicates_exist() {
     let conn = setup_documents_db();
     conn.execute(
         "INSERT INTO documents
-            (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6),
-                (?1, ?2, ?3, ?7, ?8, ?9)",
+            (filepath, file_type, doc_category, file_modified_at, file_size,
+             file_hash, metadata_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8),
+                (?1, ?2, ?3, ?9, ?10, ?11, ?12, ?13)",
         params![
             "/tmp/a.txt",
             "txt",
             DocCategory::Resource,
             100,
             10,
+            "hash-a",
+            "{}",
             100,
             200,
             20,
+            "hash-b",
+            "{}",
             200
         ],
     )
@@ -448,6 +506,8 @@ fn find_document_by_id_returns_matching_document() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -469,6 +529,8 @@ fn insert_pending_embeddings_replaces_existing_row() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
     let (doc_id, _) = upsert_document(&mut conn, &doc).unwrap();
@@ -509,6 +571,8 @@ fn transactional_document_ingest_replaces_pending_embeddings() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -558,6 +622,8 @@ fn transactional_document_ingest_keeps_existing_pending_rows_when_unchanged() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -604,6 +670,8 @@ fn replace_embeddings_for_document_model_replaces_only_target_pair_atomically() 
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
     let other_doc = Document {
@@ -729,6 +797,8 @@ fn seed_embed_jobs_enqueues_one_job_per_distinct_document_model_pair() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -799,6 +869,8 @@ fn seed_embed_jobs_deduplicates_repeated_calls() {
         doc_category: DocCategory::Resource,
         file_modified_at: 100,
         file_size: 10,
+        file_hash: "hash-a".to_string(),
+        metadata_json: "{}".to_string(),
         updated_at: 100,
     };
 
@@ -829,9 +901,19 @@ fn find_document_by_path_rejects_unknown_doc_category() {
     let conn = setup_documents_db();
     conn.execute(
         "INSERT INTO documents
-            (filepath, file_type, doc_category, file_modified_at, file_size, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params!["/tmp/a.txt", "txt", "not_a_real_category", 100, 10, 100],
+            (filepath, file_type, doc_category, file_modified_at, file_size,
+             file_hash, metadata_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "/tmp/a.txt",
+            "txt",
+            "not_a_real_category",
+            100,
+            10,
+            "hash-a",
+            "{}",
+            100
+        ],
     )
     .expect("document insert must succeed");
 
