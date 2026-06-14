@@ -57,6 +57,7 @@ struct ActiveEmbeddingModelResponse {
 #[derive(Debug, Serialize, ToSchema)]
 struct EmbeddingRuntimeConfigResponse {
     data_dir: String,
+    database_pool_size: usize,
     resource_dir: String,
     embedding_mode: String,
     embedding_base_url: String,
@@ -351,6 +352,7 @@ fn build_embedding_stats_response(
         },
         config: EmbeddingRuntimeConfigResponse {
             data_dir: runtime_config.data_dir,
+            database_pool_size: runtime_config.database_pool_size,
             resource_dir: runtime_config.resource_dir,
             embedding_mode: runtime_config.embedding_mode,
             embedding_base_url: runtime_config.embedding_base_url,

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use ask_core::models::EmbeddingIdentity;
 
 pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
+pub const DATABASE_POOL_SIZE_ENV: &str = "ASK_SERVER_DATABASE_POOL_SIZE";
 pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
 pub const BIND_HOST_ENV: &str = "ASK_SERVER_BIND_HOST";
 pub const BIND_PORT_ENV: &str = "ASK_SERVER_BIND_PORT";
@@ -16,6 +17,7 @@ pub const EMBEDDING_BASE_URL_ENV: &str = "ASK_SERVER_EMBEDDING_BASE_URL";
 pub const EMBEDDING_AUTH_TOKEN_ENV: &str = "ASK_SERVER_EMBEDDING_AUTH_TOKEN";
 
 pub const DEFAULT_DATA_DIR: &str = ".data";
+pub const DEFAULT_DATABASE_POOL_SIZE: usize = 8;
 pub const DEFAULT_RESOURCE_DIR: &str = ".";
 pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 pub const DEFAULT_BIND_PORT: u16 = 3000;
@@ -67,6 +69,8 @@ impl EmbeddingProvider {
 pub struct Config {
     /// Filesystem path to the directory containing persistent server data.
     pub data_dir: String,
+    /// Maximum number of SQLite connections in the shared pool.
+    pub database_pool_size: usize,
     /// Filesystem path to the directory containing resource files (code, configs, etc.).
     pub resource_dir: String,
     /// Host or interface the HTTP server binds to.
@@ -125,6 +129,15 @@ impl Config {
 /// missing required configuration.
 pub fn load() -> Result<Config> {
     let data_dir = std::env::var(DATA_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_DATA_DIR));
+    let database_pool_size = match std::env::var(DATABASE_POOL_SIZE_ENV) {
+        Ok(raw) => raw.parse::<usize>().with_context(|| {
+            format!(
+                "failed to parse {} value '{}' as an integer",
+                DATABASE_POOL_SIZE_ENV, raw
+            )
+        })?,
+        Err(_) => DEFAULT_DATABASE_POOL_SIZE,
+    };
     let resource_dir =
         std::env::var(RESOURCE_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_RESOURCE_DIR));
     let bind_host =
@@ -195,10 +208,12 @@ pub fn load() -> Result<Config> {
         embedding_chunk_overlap,
         embedding_max_batch_size,
         embedding_worker_count,
+        database_pool_size,
     )?;
 
     Ok(Config {
         data_dir,
+        database_pool_size,
         resource_dir,
         bind_host,
         bind_port,
@@ -278,6 +293,7 @@ fn validate_embedding_settings(
     embedding_chunk_overlap: i64,
     embedding_max_batch_size: usize,
     _embedding_worker_count: usize,
+    database_pool_size: usize,
 ) -> Result<()> {
     ensure!(
         embedding_dimensions > 0,
@@ -310,6 +326,12 @@ fn validate_embedding_settings(
         "{} must be greater than 0, got {}",
         EMBEDDING_MAX_BATCH_SIZE_ENV,
         embedding_max_batch_size
+    );
+    ensure!(
+        database_pool_size > 0,
+        "{} must be greater than 0, got {}",
+        DATABASE_POOL_SIZE_ENV,
+        database_pool_size
     );
 
     Ok(())

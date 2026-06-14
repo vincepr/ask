@@ -11,6 +11,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use r2d2::ManageConnection;
 
+use crate::config::DEFAULT_DATABASE_POOL_SIZE;
+
 /// Opens the SQLite database and creates parent directories when needed.
 ///
 /// # Errors
@@ -78,6 +80,27 @@ impl ManageConnection for SqliteConnectionManager {
 /// Returns an error if the parent directory cannot be created or the pool
 /// cannot be built.
 pub fn create_pool(database_path: &str) -> Result<DbPool> {
+    create_pool_with_max_size(database_path, DEFAULT_DATABASE_POOL_SIZE)
+}
+
+/// Creates a connection pool with an explicit maximum connection count.
+///
+/// # Arguments
+///
+/// * `database_path` - SQLite database file path.
+/// * `max_size` - Maximum number of SQLite connections kept by the shared pool.
+///
+/// # Returns
+///
+/// A ready-to-use connection pool.
+///
+/// # Errors
+///
+/// Returns an error if `max_size` is zero, cannot fit the pool builder type, the
+/// parent directory cannot be created, or the pool cannot be built.
+pub fn create_pool_with_max_size(database_path: &str, max_size: usize) -> Result<DbPool> {
+    anyhow::ensure!(max_size > 0, "database pool size must be greater than 0");
+    let max_size = u32::try_from(max_size).context("database pool size must fit into u32")?;
     vector_index::register_sqlite_vec()?;
     let path = Path::new(database_path);
 
@@ -92,7 +115,7 @@ pub fn create_pool(database_path: &str) -> Result<DbPool> {
     };
 
     let pool = r2d2::Pool::builder()
-        .max_size(4)
+        .max_size(max_size)
         .build(manager)
         .context("failed to create database connection pool")?;
 

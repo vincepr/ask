@@ -3,7 +3,7 @@ use ask_core::migrations;
 use ask_core::{WORKSPACE_NAME, workspace_members};
 use ask_server::embeddings::HttpEmbeddingClient;
 use ask_server::startup::StartupSummaryKind;
-use ask_server::{config, create_pool, http, startup, vector_index, worker};
+use ask_server::{config, create_pool_with_max_size, http, startup, vector_index, worker};
 use std::sync::Arc;
 use tracing::info;
 
@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let config = config::load()?;
     let bind_address = config.bind_address();
     let sqlite_path = config.sqlite_path();
-    let pool = create_pool(&sqlite_path)?;
+    let pool = create_pool_with_max_size(&sqlite_path, config.database_pool_size)?;
 
     // Run migrations on a dedicated connection.
     {
@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         embedding_mode = config.embedding_provider.mode_name(),
         embedding_base_url = config.embedding_provider.base_url(),
         embedding_worker_count = config.embedding_worker_count,
+        database_pool_size = config.database_pool_size,
         bind_address,
         "starting ask-server"
     );

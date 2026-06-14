@@ -4,14 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_server::{
     config::{
-        BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
-        DEFAULT_DATA_DIR, DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL,
-        DEFAULT_WORKER_COUNT, EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV,
-        EMBEDDING_CHUNK_OVERLAP_ENV, EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV,
-        EMBEDDING_MAX_BATCH_SIZE_ENV, EMBEDDING_MODE_ENV, EMBEDDING_MODEL_ENV,
-        EMBEDDING_WORKER_COUNT_ENV, EmbeddingProvider, load,
+        BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DATABASE_POOL_SIZE_ENV, DEFAULT_BIND_HOST,
+        DEFAULT_BIND_PORT, DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE,
+        DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
+        EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV, EMBEDDING_CHUNK_OVERLAP_ENV,
+        EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV, EMBEDDING_MAX_BATCH_SIZE_ENV,
+        EMBEDDING_MODE_ENV, EMBEDDING_MODEL_ENV, EMBEDDING_WORKER_COUNT_ENV, EmbeddingProvider,
+        load,
     },
-    open_database,
+    create_pool_with_max_size, open_database,
 };
 
 #[test]
@@ -23,6 +24,7 @@ fn load_uses_defaults_when_optional_env_is_missing() {
     let _mode_guard = EnvVarGuard::unset(EMBEDDING_MODE_ENV);
     let _base_url_guard = EnvVarGuard::unset(EMBEDDING_BASE_URL_ENV);
     let _token_guard = EnvVarGuard::unset(EMBEDDING_AUTH_TOKEN_ENV);
+    let _pool_guard = EnvVarGuard::unset(DATABASE_POOL_SIZE_ENV);
     let _model_guard = EnvVarGuard::set(
         EMBEDDING_MODEL_ENV,
         "onnx-community/Qwen3-Embedding-0.6B-ONNX",
@@ -50,6 +52,8 @@ fn load_uses_defaults_when_optional_env_is_missing() {
         DEFAULT_EMBEDDING_MAX_BATCH_SIZE
     );
     assert_eq!(config.embedding_worker_count, DEFAULT_WORKER_COUNT);
+    assert_eq!(config.database_pool_size, DEFAULT_DATABASE_POOL_SIZE);
+    assert!(config.database_pool_size > DEFAULT_WORKER_COUNT);
 }
 
 #[test]
@@ -63,6 +67,7 @@ fn load_uses_env_overrides_when_present() {
     let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
     let _batch_guard = EnvVarGuard::set(EMBEDDING_MAX_BATCH_SIZE_ENV, "64");
     let _worker_guard = EnvVarGuard::set(EMBEDDING_WORKER_COUNT_ENV, "4");
+    let _pool_guard = EnvVarGuard::set(DATABASE_POOL_SIZE_ENV, "9");
 
     let config = load().expect("config load must succeed");
 
@@ -80,6 +85,7 @@ fn load_uses_env_overrides_when_present() {
     assert_eq!(config.embedding_model, "custom-model");
     assert_eq!(config.embedding_max_batch_size, 64);
     assert_eq!(config.embedding_worker_count, 4);
+    assert_eq!(config.database_pool_size, 9);
 }
 
 #[test]
@@ -249,6 +255,17 @@ fn load_allows_zero_embedding_worker_count() {
 }
 
 #[test]
+fn load_rejects_zero_database_pool_size() {
+    let _env_lock = env_lock();
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
+    let _pool_guard = EnvVarGuard::set(DATABASE_POOL_SIZE_ENV, "0");
+
+    let error = load().expect_err("config load must fail for non-positive database pool size");
+
+    assert!(error.to_string().contains(DATABASE_POOL_SIZE_ENV));
+}
+
+#[test]
 fn open_database_creates_parent_directory() {
     let temp_dir = unique_temp_dir();
     let database_path = temp_dir.join("nested").join("ask.sqlite3");
@@ -260,6 +277,20 @@ fn open_database_creates_parent_directory() {
 
     assert!(database_path.exists());
 
+    std::fs::remove_dir_all(&temp_dir).expect("temporary test directory must be removable");
+}
+
+#[test]
+fn create_pool_with_max_size_uses_requested_pool_limit() {
+    let temp_dir = unique_temp_dir();
+    let database_path = temp_dir.join("ask.sqlite3");
+
+    let pool = create_pool_with_max_size(&database_path.to_string_lossy(), 3)
+        .expect("pool creation must succeed");
+
+    assert_eq!(pool.max_size(), 3);
+
+    drop(pool);
     std::fs::remove_dir_all(&temp_dir).expect("temporary test directory must be removable");
 }
 
