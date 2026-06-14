@@ -70,8 +70,8 @@ impl JobHandler for EmbedDocumentHandler {
         );
 
         let path = Path::new(&document.filepath);
-        let raw_bytes = match std::fs::read(path) {
-            Ok(raw_bytes) => raw_bytes,
+        match std::fs::metadata(path) {
+            Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 info!(
                     job_id = ctx.entry.id,
@@ -93,12 +93,16 @@ impl JobHandler for EmbedDocumentHandler {
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!("failed to read document bytes from {}", document.filepath)
+                    format!(
+                        "failed to read document metadata from {}",
+                        document.filepath
+                    )
                 });
             }
         };
 
-        let current_hash = super::ingest::hash_bytes(&raw_bytes);
+        let current_hash = super::ingest::hash_file(path)
+            .with_context(|| format!("failed to hash document bytes from {}", document.filepath))?;
         if current_hash != document.file_hash {
             info!(
                 job_id = ctx.entry.id,
@@ -115,19 +119,13 @@ impl JobHandler for EmbedDocumentHandler {
             })?;
             repository::complete_job(&conn, ctx.entry.id)
                 .with_context(|| format!("failed to remove stale embed job {}", ctx.entry.id))?;
-            super::ingest::replan_document_from_bytes(
-                &mut conn,
-                &document,
-                &model,
-                &raw_bytes,
-                unix_now(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to replan document {} after hash mismatch",
-                    document.id
-                )
-            })?;
+            super::ingest::replan_document_from_path(&mut conn, &document, &model, unix_now())
+                .with_context(|| {
+                    format!(
+                        "failed to replan document {} after hash mismatch",
+                        document.id
+                    )
+                })?;
             return Ok(());
         }
 
@@ -152,15 +150,13 @@ impl JobHandler for EmbedDocumentHandler {
             return Ok(());
         }
 
-        let prepared_chunks =
-            prepare_embedded_chunks(path, &document, &recoverable_rows, &raw_bytes).with_context(
-                || {
-                    format!(
-                        "failed to prepare chunks for document {} and model {}",
-                        document.id, model.id
-                    )
-                },
-            )?;
+        let prepared_chunks = prepare_embedded_chunks(path, &document, &recoverable_rows)
+            .with_context(|| {
+                format!(
+                    "failed to prepare chunks for document {} and model {}",
+                    document.id, model.id
+                )
+            })?;
         let inputs = prepared_chunks
             .iter()
             .map(|chunk| chunk.input.clone())
@@ -239,7 +235,6 @@ fn prepare_embedded_chunks(
     path: &Path,
     document: &Document,
     rows: &[DocumentEmbedding],
-    raw_bytes: &[u8],
 ) -> Result<Vec<PreparedChunk>> {
     let filepath = path.to_string_lossy().into_owned();
     let filename = path
@@ -248,16 +243,25 @@ fn prepare_embedded_chunks(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| filepath.clone());
 
-    let content = match std::str::from_utf8(raw_bytes) {
-        Ok(content) => Some(content),
-        Err(err) => {
-            warn!(
-                path = %filepath,
-                error = %err,
-                "skipping content embedding for non-utf8 file"
-            );
-            None
+    let max_content_end = rows
+        .iter()
+        .filter(|row| row.chunk_type == ChunkType::Content)
+        .map(|row| row.chunk_end)
+        .max();
+    let content = match max_content_end {
+        Some(max_content_end) => {
+            let max_content_end = usize::try_from(max_content_end)
+                .context("content chunk_end must fit into usize")?;
+            let prefix = super::ingest::read_content_prefix_with_budget(path, max_content_end)?;
+            if prefix.content.is_none() {
+                warn!(
+                    path = %filepath,
+                    "skipping content embedding for non-utf8 file"
+                );
+            }
+            prefix.content
         }
+        None => None,
     };
 
     let mut chunks = Vec::with_capacity(rows.len());
@@ -265,7 +269,7 @@ fn prepare_embedded_chunks(
         let input = match row.chunk_type {
             ChunkType::Filename => filename.clone(),
             ChunkType::Content => {
-                let content = content.with_context(|| {
+                let content = content.as_deref().with_context(|| {
                     format!(
                         "document {} has content rows but is not valid UTF-8",
                         document.id

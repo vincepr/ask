@@ -2096,6 +2096,62 @@ async fn ingest_large_file_produces_many_chunks() {
 }
 
 #[tokio::test]
+async fn ingest_large_file_limits_content_chunks_but_hashes_full_file() {
+    let db = TempDb::new();
+    let now = current_time();
+
+    let conn = db.pool().get().unwrap();
+    let model = ask_core::models::EmbeddingModel {
+        id: 0,
+        name: "bounded-large".to_string(),
+        dimensions: 768,
+        chunk_size: 512,
+        chunk_overlap: 0,
+        created_at: now,
+    };
+    let model_id = repository::insert_model(&conn, &model).unwrap();
+    drop(conn);
+
+    let dir = db.create_dir("bounded_large");
+    let path = dir.join("big.txt");
+    let content = "a".repeat((1024 * 1024) + 4096);
+    std::fs::write(&path, &content).unwrap();
+
+    let payload = ingest_payload(&dir);
+    let conn = db.pool().get().unwrap();
+    repository::enqueue_job(&conn, &JobType::IngestFolder, &payload, now).unwrap();
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 1).unwrap().unwrap();
+    drop(conn);
+    dispatch_job(&db.pool(), &entry, model_id, test_embedding_client()).unwrap();
+
+    let conn = db.pool().get().unwrap();
+    let (file_size, file_hash, metadata_json): (i64, String, String) = conn
+        .query_row(
+            "SELECT file_size, file_hash, metadata_json FROM documents WHERE filepath = ?1",
+            [path.canonicalize().unwrap().to_string_lossy().into_owned()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let max_content_end: i64 = conn
+        .query_row(
+            "SELECT MAX(chunk_end) FROM document_embeddings WHERE chunk_type = 'content'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
+
+    assert_eq!(file_size, content.len() as i64);
+    assert_eq!(file_hash, hash_bytes(content.as_bytes()));
+    assert!(max_content_end <= 1024 * 1024);
+    assert_eq!(metadata["content_utf8"], true);
+    assert_eq!(metadata["content_truncated"], true);
+    assert_eq!(metadata["content_bytes_indexed"], 1024 * 1024);
+    assert_eq!(metadata["content_byte_budget"], 1024 * 1024);
+}
+
+#[tokio::test]
 async fn embed_document_job_replaces_rows_for_exact_document_model_pair() {
     let db = TempDb::new();
     let now = current_time();
@@ -2576,13 +2632,22 @@ async fn ingest_non_utf8_file_only_gets_filename_embedding() {
         .unwrap();
     assert_eq!(content_emb, 0);
 
-    let file_hash: String = conn
-        .query_row("SELECT file_hash FROM documents", [], |row| row.get(0))
+    let (file_hash, metadata_json): (String, String) = conn
+        .query_row(
+            "SELECT file_hash, metadata_json FROM documents",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
     assert!(
         !file_hash.is_empty(),
         "non-UTF-8 files still store raw byte hashes"
     );
+    let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
+    assert_eq!(metadata["content_utf8"], false);
+    assert_eq!(metadata["content_truncated"], false);
+    assert_eq!(metadata["content_bytes_indexed"], 0);
+    assert_eq!(metadata["content_byte_budget"], 1024 * 1024);
 }
 
 #[tokio::test]

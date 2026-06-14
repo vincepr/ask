@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,6 +23,31 @@ const GIT_IGNORED_FILE_EXTENSIONS: &[&str] = &[
     "7z", "bin", "bz2", "db", "dll", "dylib", "exe", "gif", "gz", "ico", "jpeg", "jpg", "pdf",
     "png", "rar", "so", "sqlite", "tar", "webp", "xz", "zip",
 ];
+const CONTENT_PROBE_BYTES: usize = 8 * 1024;
+const CONTENT_BYTE_BUDGET: usize = 1024 * 1024;
+const UTF8_MAX_SCALAR_BYTES: usize = 4;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ContentReadPlan {
+    pub(super) content: Option<String>,
+    pub(super) content_utf8: bool,
+    pub(super) content_truncated: bool,
+    pub(super) content_bytes_indexed: usize,
+    pub(super) content_byte_budget: usize,
+}
+
+impl ContentReadPlan {
+    fn filename_only() -> Self {
+        Self {
+            content: None,
+            content_utf8: false,
+            content_truncated: false,
+            content_bytes_indexed: 0,
+            content_byte_budget: CONTENT_BYTE_BUDGET,
+        }
+    }
+}
 
 pub(super) struct IngestFolderHandler;
 pub(super) struct IngestFolderGitHandler;
@@ -284,20 +311,31 @@ fn ingest_candidate_file(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(now);
     let file_size = metadata.len() as i64;
-    let raw_bytes = match std::fs::read(&canonical_path) {
-        Ok(raw_bytes) => raw_bytes,
+    let file_hash = match hash_file(&canonical_path) {
+        Ok(file_hash) => file_hash,
         Err(err) => {
             warn!(
                 job_id = ctx.entry.id,
                 path = ?canonical_path,
                 error = %err,
-                "failed to read file bytes; continuing"
+                "failed to hash file bytes; continuing"
             );
             return Ok(());
         }
     };
-    let file_hash = hash_bytes(&raw_bytes);
-    let planned = plan_pending_embeddings_for_bytes(&canonical_path, &raw_bytes, model);
+    let content_plan = match read_content_prefix(&canonical_path) {
+        Ok(content_plan) => content_plan,
+        Err(err) => {
+            warn!(
+                job_id = ctx.entry.id,
+                path = ?canonical_path,
+                error = %err,
+                "failed to read file content prefix; queueing filename-only embedding"
+            );
+            ContentReadPlan::filename_only()
+        }
+    };
+    let planned = plan_pending_embeddings_for_read_plan(&canonical_path, &content_plan, model);
 
     let mut conn = ctx
         .pool
@@ -557,18 +595,18 @@ pub(super) fn queue_pending_embeddings_for_document(
 ) -> Result<()> {
     let filepath = path.to_string_lossy();
 
-    let raw_bytes = match std::fs::read(path) {
-        Ok(raw_bytes) => raw_bytes,
+    let content_plan = match read_content_prefix(path) {
+        Ok(content_plan) => content_plan,
         Err(err) => {
             warn!(
                 path = %filepath,
                 error = %err,
                 "queueing filename-only embedding for unreadable file"
             );
-            Vec::new()
+            ContentReadPlan::filename_only()
         }
     };
-    let chunk_refs = plan_pending_embeddings_for_bytes(path, &raw_bytes, model).chunks;
+    let chunk_refs = plan_pending_embeddings_for_read_plan(path, &content_plan, model).chunks;
 
     repository::insert_pending_embeddings(conn, doc_id, model.id, &chunk_refs, now)
         .with_context(|| format!("failed to queue embeddings for {filepath}"))?;
@@ -576,11 +614,10 @@ pub(super) fn queue_pending_embeddings_for_document(
     Ok(())
 }
 
-pub(super) fn replan_document_from_bytes(
+pub(super) fn replan_document_from_path(
     conn: &mut rusqlite::Connection,
     doc: &Document,
     model: &EmbeddingModel,
-    raw_bytes: &[u8],
     now: i64,
 ) -> Result<()> {
     let path = Path::new(&doc.filepath);
@@ -592,7 +629,11 @@ pub(super) fn replan_document_from_bytes(
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(now);
-    let planned = plan_pending_embeddings_for_bytes(path, raw_bytes, model);
+    let file_hash = hash_file(path)
+        .with_context(|| format!("failed to hash document bytes for {}", doc.filepath))?;
+    let content_plan = read_content_prefix(path)
+        .with_context(|| format!("failed to read content prefix for {}", doc.filepath))?;
+    let planned = plan_pending_embeddings_for_read_plan(path, &content_plan, model);
     let updated_doc = Document {
         id: doc.id,
         filepath: doc.filepath.clone(),
@@ -600,7 +641,7 @@ pub(super) fn replan_document_from_bytes(
         doc_category: doc.doc_category,
         file_modified_at,
         file_size: metadata.len() as i64,
-        file_hash: hash_bytes(raw_bytes),
+        file_hash,
         metadata_json: planned.metadata_json,
         updated_at: now,
     };
@@ -617,38 +658,48 @@ pub(super) fn replan_document_from_bytes(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlannedEmbeddings {
-    chunks: Vec<(ChunkType, i64, i64)>,
-    metadata_json: String,
+pub(super) struct PlannedEmbeddings {
+    pub(super) chunks: Vec<(ChunkType, i64, i64)>,
+    pub(super) metadata_json: String,
 }
 
-fn plan_pending_embeddings_for_bytes(
+fn plan_pending_embeddings_for_read_plan(
     path: &Path,
-    raw_bytes: &[u8],
+    content_plan: &ContentReadPlan,
     model: &EmbeddingModel,
 ) -> PlannedEmbeddings {
-    let filepath = path.to_string_lossy();
+    plan_pending_embeddings_for_content(
+        path,
+        content_plan.content.as_deref(),
+        content_plan.content_truncated,
+        content_plan.content_bytes_indexed,
+        content_plan.content_byte_budget,
+        model,
+    )
+}
+
+pub(super) fn plan_pending_embeddings_for_content(
+    path: &Path,
+    content: Option<&str>,
+    content_truncated: bool,
+    content_bytes_indexed: usize,
+    content_byte_budget: usize,
+    model: &EmbeddingModel,
+) -> PlannedEmbeddings {
     let mut chunk_refs = vec![(ChunkType::Filename, 0, 0)];
 
-    let content = match std::str::from_utf8(raw_bytes) {
-        Ok(content) if !content.is_empty() => content,
-        Ok(_) => {
-            return PlannedEmbeddings {
-                chunks: chunk_refs,
-                metadata_json: metadata_json("structure", 0, false),
-            };
-        }
-        Err(err) => {
-            warn!(
-                path = %filepath,
-                error = %err,
-                "skipping content chunking for non-utf8 file"
-            );
-            return PlannedEmbeddings {
-                chunks: chunk_refs,
-                metadata_json: metadata_json("structure", 0, false),
-            };
-        }
+    let Some(content) = content.filter(|content| !content.is_empty()) else {
+        return PlannedEmbeddings {
+            chunks: chunk_refs,
+            metadata_json: metadata_json(
+                "structure",
+                0,
+                false,
+                content_truncated,
+                content_bytes_indexed,
+                content_byte_budget,
+            ),
+        };
     };
 
     let plan = chunking::plan_chunks(
@@ -665,27 +716,167 @@ fn plan_pending_embeddings_for_bytes(
 
     PlannedEmbeddings {
         chunks: chunk_refs,
-        metadata_json: plan_metadata_json(&plan),
+        metadata_json: plan_metadata_json(
+            &plan,
+            content_truncated,
+            content_bytes_indexed,
+            content_byte_budget,
+        ),
     }
 }
 
-fn plan_metadata_json(plan: &ChunkPlan) -> String {
-    metadata_json(plan.strategy, plan.spans.len(), true)
+fn plan_metadata_json(
+    plan: &ChunkPlan,
+    content_truncated: bool,
+    content_bytes_indexed: usize,
+    content_byte_budget: usize,
+) -> String {
+    metadata_json(
+        plan.strategy,
+        plan.spans.len(),
+        true,
+        content_truncated,
+        content_bytes_indexed,
+        content_byte_budget,
+    )
 }
 
-fn metadata_json(strategy: &str, chunk_count: usize, content_utf8: bool) -> String {
+fn metadata_json(
+    strategy: &str,
+    chunk_count: usize,
+    content_utf8: bool,
+    content_truncated: bool,
+    content_bytes_indexed: usize,
+    content_byte_budget: usize,
+) -> String {
     serde_json::json!({
         "strategy": strategy,
         "planned_chunk_count": chunk_count,
         "content_utf8": content_utf8,
+        "content_truncated": content_truncated,
+        "content_bytes_indexed": content_bytes_indexed,
+        "content_byte_budget": content_byte_budget,
     })
     .to_string()
 }
 
+#[cfg(test)]
 pub(super) fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hash = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    hex_digest(Sha256::digest(bytes))
+}
+
+pub(super) fn hash_file(path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex_digest(hasher.finalize()))
+}
+
+pub(super) fn read_content_prefix(path: &Path) -> Result<ContentReadPlan> {
+    read_content_prefix_with_budget(path, CONTENT_BYTE_BUDGET)
+}
+
+pub(super) fn read_content_prefix_with_budget(
+    path: &Path,
+    content_byte_budget: usize,
+) -> Result<ContentReadPlan> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let file_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let read_limit = content_byte_budget.saturating_add(UTF8_MAX_SCALAR_BYTES - 1);
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(read_limit.min(file_len));
+    let mut handle = (&mut file).take(read_limit as u64);
+    handle
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read content prefix from {}", path.display()))?;
+
+    if bytes
+        .iter()
+        .take(CONTENT_PROBE_BYTES)
+        .any(|byte| *byte == 0)
+    {
+        return Ok(ContentReadPlan {
+            content: None,
+            content_utf8: false,
+            content_truncated: file_len > bytes.len(),
+            content_bytes_indexed: 0,
+            content_byte_budget,
+        });
+    }
+
+    let read_truncated = file_len > bytes.len();
+    let Some(content) = decode_bounded_utf8_prefix(&bytes, content_byte_budget, read_truncated)
+    else {
+        return Ok(ContentReadPlan {
+            content: None,
+            content_utf8: false,
+            content_truncated: read_truncated,
+            content_bytes_indexed: 0,
+            content_byte_budget,
+        });
+    };
+    let content_bytes_indexed = content.len();
+    let content = (!content.is_empty()).then_some(content);
+
+    Ok(ContentReadPlan {
+        content,
+        content_utf8: content_bytes_indexed > 0,
+        content_truncated: content_bytes_indexed < file_len,
+        content_bytes_indexed,
+        content_byte_budget,
+    })
+}
+
+fn decode_bounded_utf8_prefix(
+    bytes: &[u8],
+    content_byte_budget: usize,
+    read_truncated: bool,
+) -> Option<String> {
+    if bytes.is_empty() || content_byte_budget == 0 {
+        return Some(String::new());
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(content) => {
+            let end = floor_char_boundary(content, content.len().min(content_byte_budget));
+            Some(content[..end].to_string())
+        }
+        Err(err) if err.error_len().is_none() && read_truncated => {
+            let valid = std::str::from_utf8(&bytes[..err.valid_up_to()])
+                .expect("valid_up_to must identify valid UTF-8");
+            let end = floor_char_boundary(valid, valid.len().min(content_byte_budget));
+            Some(valid[..end].to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+fn floor_char_boundary(content: &str, mut index: usize) -> usize {
+    index = index.min(content.len());
+    while index > 0 && !content.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let bytes = digest.as_ref();
+    let mut hash = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut hash, "{byte:02x}").expect("writing to String cannot fail");
     }

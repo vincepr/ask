@@ -791,6 +791,100 @@ mod tests {
     }
 
     #[test]
+    fn hash_file_matches_in_memory_sha256() {
+        let db = TempDb::new();
+        let path = db.dir.join("hash.txt");
+        let raw_bytes = b"full file identity must include every byte";
+        std::fs::write(&path, raw_bytes).unwrap();
+
+        let hash = ingest::hash_file(&path).unwrap();
+
+        assert_eq!(hash, ingest::hash_bytes(raw_bytes));
+    }
+
+    #[test]
+    fn bounded_content_prefix_keeps_valid_utf8_before_split_scalar() {
+        let db = TempDb::new();
+        let path = db.dir.join("multibyte.txt");
+        std::fs::write(&path, "éé").unwrap();
+
+        let prefix = ingest::read_content_prefix_with_budget(&path, 3).unwrap();
+
+        assert_eq!(prefix.content.as_deref(), Some("é"));
+        assert!(prefix.content_utf8);
+        assert!(prefix.content_truncated);
+        assert_eq!(prefix.content_bytes_indexed, "é".len());
+        assert_eq!(prefix.content_byte_budget, 3);
+    }
+
+    #[test]
+    fn bounded_content_prefix_rejects_nul_binary_content() {
+        let db = TempDb::new();
+        let path = db.dir.join("binary.bin");
+        std::fs::write(&path, b"abc\0def").unwrap();
+
+        let prefix = ingest::read_content_prefix_with_budget(&path, 1024).unwrap();
+
+        assert!(prefix.content.is_none());
+        assert!(!prefix.content_utf8);
+        assert!(!prefix.content_truncated);
+        assert_eq!(prefix.content_bytes_indexed, 0);
+        assert_eq!(prefix.content_byte_budget, 1024);
+    }
+
+    #[test]
+    fn bounded_content_prefix_rejects_incomplete_utf8_at_file_end() {
+        let db = TempDb::new();
+        let path = db.dir.join("broken.txt");
+        std::fs::write(&path, [b'a', 0xC3]).unwrap();
+
+        let prefix = ingest::read_content_prefix_with_budget(&path, 1024).unwrap();
+
+        assert!(prefix.content.is_none());
+        assert!(!prefix.content_utf8);
+        assert!(!prefix.content_truncated);
+        assert_eq!(prefix.content_bytes_indexed, 0);
+    }
+
+    #[test]
+    fn bounded_content_planner_records_truncation_metadata() {
+        let model = EmbeddingModel {
+            id: 1,
+            name: "bounded".to_string(),
+            dimensions: 1,
+            chunk_size: 2,
+            chunk_overlap: 0,
+            created_at: 100,
+        };
+        let content = "abcd";
+
+        let planned = ingest::plan_pending_embeddings_for_content(
+            std::path::Path::new("bounded.txt"),
+            Some(content),
+            true,
+            content.len(),
+            1024,
+            &model,
+        );
+        let metadata: serde_json::Value = serde_json::from_str(&planned.metadata_json).unwrap();
+
+        assert_eq!(metadata["strategy"], "structure");
+        assert_eq!(metadata["planned_chunk_count"], 2);
+        assert_eq!(metadata["content_utf8"], true);
+        assert_eq!(metadata["content_truncated"], true);
+        assert_eq!(metadata["content_bytes_indexed"], 4);
+        assert_eq!(metadata["content_byte_budget"], 1024);
+        assert_eq!(
+            planned.chunks,
+            vec![
+                (ask_core::types::ChunkType::Filename, 0, 0),
+                (ask_core::types::ChunkType::Content, 0, 2),
+                (ask_core::types::ChunkType::Content, 2, 4),
+            ]
+        );
+    }
+
+    #[test]
     fn malformed_payload_failure_does_not_insert_documents() {
         let db = TempDb::new();
         let entry = enqueue_and_claim_job(&db, r#"{"root_path":1}"#, 10, 100);
