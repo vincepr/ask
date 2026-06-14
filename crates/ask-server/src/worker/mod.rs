@@ -527,6 +527,69 @@ mod tests {
     }
 
     #[test]
+    fn embed_document_with_no_recoverable_rows_is_completed_without_deleting_embeddings() {
+        let db = TempDb::new();
+        let pool = db.pool();
+        let file_path = db.dir.join("no-recoverable.txt");
+        let raw_bytes = b"hello";
+        std::fs::write(&file_path, raw_bytes).unwrap();
+        let file_hash = ingest::hash_bytes(raw_bytes);
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO embedding_models (id, name, dimensions, chunk_size, chunk_overlap, created_at)
+             VALUES (1, 'test-model', 1, 16, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents
+                (id, filepath, file_type, doc_category, file_modified_at, file_size,
+                 file_hash, metadata_json, updated_at)
+             VALUES
+                (?1, ?2, 'txt', 'resource', 100, 5, ?3, '{}', 100)",
+            rusqlite::params![7_i64, file_path.to_string_lossy().to_string(), file_hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document_embeddings
+                (document_id, model_id, chunk_type, chunk_start, chunk_end, state, embedding, created_at)
+             VALUES
+                (7, 1, 'filename', 0, 0, 'embedded', X'0000803F', 100)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let entry = enqueue_and_claim_job_with_type(
+            &db,
+            JobType::EmbedDocument,
+            r#"{"document_id":7,"model_id":1}"#,
+            10,
+            100,
+        );
+
+        dispatch_job(
+            &pool,
+            &entry,
+            1,
+            Arc::new(DeterministicEmbeddingClient::new()),
+        )
+        .expect("jobs with no recoverable rows should be treated as completed no-ops");
+
+        assert_eq!(job_queue_count(&pool), 0);
+        let conn = pool.get().unwrap();
+        let embedded_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM document_embeddings
+                 WHERE document_id = 7 AND model_id = 1 AND state = 'embedded'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedded_count, 1);
+    }
+
+    #[test]
     fn dispatcher_surfaces_payload_decode_failures_and_keeps_job_row() {
         let db = TempDb::new();
         let entry = enqueue_and_claim_job(&db, "{not json", 10, 100);

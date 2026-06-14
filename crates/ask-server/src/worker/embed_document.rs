@@ -36,6 +36,12 @@ impl JobHandler for EmbedDocumentHandler {
 
             let Some(document) = repository::find_document_by_id(&conn, payload.document_id)?
             else {
+                info!(
+                    job_id = ctx.entry.id,
+                    document_id = payload.document_id,
+                    model_id = payload.model_id,
+                    "completing orphaned embed_document job for missing document"
+                );
                 repository::complete_job(&conn, ctx.entry.id).with_context(|| {
                     format!(
                         "failed to complete orphaned embed job {} for missing document {}",
@@ -55,10 +61,25 @@ impl JobHandler for EmbedDocumentHandler {
             (document, model)
         };
 
+        info!(
+            job_id = ctx.entry.id,
+            document_id = document.id,
+            model_id = model.id,
+            path = %document.filepath,
+            "loaded embed_document target"
+        );
+
         let path = Path::new(&document.filepath);
         let raw_bytes = match std::fs::read(path) {
             Ok(raw_bytes) => raw_bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    job_id = ctx.entry.id,
+                    document_id = document.id,
+                    model_id = model.id,
+                    path = %document.filepath,
+                    "deleting embed_document target that no longer exists on disk"
+                );
                 let mut conn = ctx.pool.get().with_context(|| {
                     format!(
                         "failed to acquire connection to delete missing document {}",
@@ -79,6 +100,13 @@ impl JobHandler for EmbedDocumentHandler {
 
         let current_hash = super::ingest::hash_bytes(&raw_bytes);
         if current_hash != document.file_hash {
+            info!(
+                job_id = ctx.entry.id,
+                document_id = document.id,
+                model_id = model.id,
+                path = %document.filepath,
+                "document changed since embed job was queued; replanning"
+            );
             let mut conn = ctx.pool.get().with_context(|| {
                 format!(
                     "failed to acquire connection to replan document {}",
@@ -112,6 +140,17 @@ impl JobHandler for EmbedDocumentHandler {
             })?;
             repository::list_recoverable_embeddings_for_model(&conn, document.id, model.id)?
         };
+
+        if recoverable_rows.is_empty() {
+            info!(
+                job_id = ctx.entry.id,
+                document_id = document.id,
+                model_id = model.id,
+                path = %document.filepath,
+                "skipping embed_document job because no recoverable chunks remain"
+            );
+            return Ok(());
+        }
 
         let prepared_chunks =
             prepare_embedded_chunks(path, &document, &recoverable_rows, &raw_bytes).with_context(
@@ -155,6 +194,15 @@ impl JobHandler for EmbedDocumentHandler {
                 embedding: serialize_embedding(&vector),
             })
             .collect::<Vec<_>>();
+
+        info!(
+            job_id = ctx.entry.id,
+            document_id = document.id,
+            model_id = model.id,
+            path = %document.filepath,
+            chunk_count = rows.len(),
+            "persisting embedded document chunks"
+        );
 
         let mut conn = ctx.pool.get().with_context(|| {
             format!(
