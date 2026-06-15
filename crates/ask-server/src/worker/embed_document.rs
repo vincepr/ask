@@ -237,11 +237,6 @@ fn prepare_embedded_chunks(
     rows: &[DocumentEmbedding],
 ) -> Result<Vec<PreparedChunk>> {
     let filepath = path.to_string_lossy().into_owned();
-    let filename = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| filepath.clone());
 
     let max_content_end = rows
         .iter()
@@ -267,7 +262,7 @@ fn prepare_embedded_chunks(
     let mut chunks = Vec::with_capacity(rows.len());
     for row in rows {
         let input = match row.chunk_type {
-            ChunkType::Filename => filename.clone(),
+            ChunkType::Filename => filepath.clone(),
             ChunkType::Content => {
                 let content = content.as_deref().with_context(|| {
                     format!(
@@ -310,4 +305,51 @@ pub(super) fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ask_core::models::{Document, DocumentEmbedding};
+    use ask_core::types::{DocCategory, EmbedState};
+
+    fn document(filepath: String) -> Document {
+        Document {
+            id: 7,
+            filepath,
+            file_type: "rs".to_string(),
+            doc_category: DocCategory::Resource,
+            file_modified_at: 100,
+            file_size: 0,
+            file_hash: "hash".to_string(),
+            metadata_json: "{}".to_string(),
+            updated_at: 100,
+        }
+    }
+
+    fn embedding_row(chunk_type: ChunkType, chunk_start: i64, chunk_end: i64) -> DocumentEmbedding {
+        DocumentEmbedding {
+            id: 11,
+            document_id: 7,
+            model_id: 3,
+            chunk_type,
+            chunk_start,
+            chunk_end,
+            state: EmbedState::Pending,
+            embedding: None,
+            created_at: 100,
+        }
+    }
+
+    #[test]
+    fn filename_chunk_embedding_input_uses_full_filepath() {
+        let path = Path::new("crates/ask-server/tests/http.rs");
+        let document = document(path.to_string_lossy().into_owned());
+        let rows = [embedding_row(ChunkType::Filename, 0, 0)];
+
+        let chunks = prepare_embedded_chunks(path, &document, &rows).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].input, path.to_string_lossy());
+    }
 }

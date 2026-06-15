@@ -15,7 +15,7 @@ use ask_server::config::{
     DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE, DEFAULT_EMBEDDING_MAX_BATCH_SIZE,
     DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
 };
-use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient};
+use ask_server::embeddings::{DeterministicEmbeddingClient, EmbeddingClient, EmbeddingError};
 use ask_server::startup::{StartupSummaryKind, reconcile_embedding_startup};
 use ask_server::vector_index;
 use ask_server::worker::{backfill_pending_for_model, dispatch_job};
@@ -276,6 +276,31 @@ fn delete_jobs_by_type(conn: &rusqlite::Connection, job_type: JobType) {
 
 fn test_embedding_client() -> Arc<DeterministicEmbeddingClient> {
     Arc::new(DeterministicEmbeddingClient::new())
+}
+
+#[derive(Debug, Default)]
+struct RecordingEmbeddingClient {
+    inputs: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingEmbeddingClient {
+    fn batches(&self) -> Vec<Vec<String>> {
+        self.inputs.lock().unwrap().clone()
+    }
+}
+
+impl EmbeddingClient for RecordingEmbeddingClient {
+    fn embed(
+        &self,
+        model: &ask_core::models::EmbeddingModel,
+        inputs: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.inputs.lock().unwrap().push(inputs.to_vec());
+        let dimensions = usize::try_from(model.dimensions)
+            .expect("test embedding dimensions must fit into usize");
+
+        Ok(vec![vec![0.0; dimensions]; inputs.len()])
+    }
 }
 
 fn serialize_embedding(vector: &[f32]) -> Vec<u8> {
@@ -2236,6 +2261,45 @@ async fn embed_document_job_replaces_rows_for_exact_document_model_pair() {
     assert_eq!(other_model_embedding, vec![1]);
 
     assert_eq!(count_jobs_by_type(&conn, JobType::EmbedDocument), 0);
+}
+
+#[tokio::test]
+async fn embed_document_job_embeds_full_filepath_for_filename_chunk() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "embed-full-path", 4);
+
+    let nested_dir = db.dir.join("crates").join("ask-server").join("tests");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    let file_path = nested_dir.join("http.rs");
+    std::fs::write(&file_path, "mod http_tests;").unwrap();
+    let canonical_path = file_path.canonicalize().unwrap();
+    let expected_input = canonical_path.to_string_lossy().into_owned();
+    let document_id = insert_document(&db.pool(), now, &file_path);
+
+    let conn = db.pool().get().unwrap();
+    insert_embedding_row(
+        &conn,
+        document_id,
+        model_id,
+        ChunkType::Filename,
+        0..0,
+        EmbedState::Pending,
+        now,
+    );
+    enqueue_embed_document_job(&conn, document_id, model_id, now + 1);
+    let mut conn = db.pool().get().unwrap();
+    let entry = repository::claim_job(&mut conn, now + 2).unwrap().unwrap();
+    drop(conn);
+
+    let client = Arc::new(RecordingEmbeddingClient::default());
+    dispatch_job(&db.pool(), &entry, 1, client.clone()).unwrap();
+
+    let batches = client.batches();
+    assert_eq!(batches, vec![vec![expected_input.clone()]]);
+    assert!(expected_input.contains("tests"));
+    assert!(expected_input.ends_with("http.rs"));
+    assert_ne!(expected_input, "http.rs");
 }
 
 #[tokio::test]
