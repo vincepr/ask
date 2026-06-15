@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -172,12 +171,7 @@ fn ingest_git_repo(
     let tracked_paths = git_list_tracked_files(repo_root)
         .with_context(|| format!("failed to list tracked files for {}", repo_root.display()))?;
 
-    for ignored_path in tracked_paths.ignored {
-        let candidate_path = repo_root.join(ignored_path);
-        delete_existing_candidate_file(ctx, request_root, &candidate_path, file_pattern)?;
-    }
-
-    for tracked_path in tracked_paths.included {
+    for tracked_path in tracked_paths {
         let candidate_path = repo_root.join(tracked_path);
         ingest_candidate_file(
             ctx,
@@ -188,40 +182,6 @@ fn ingest_git_repo(
             true,
         )?;
     }
-
-    Ok(())
-}
-
-fn delete_existing_candidate_file(
-    ctx: &JobContext<'_>,
-    request_root: &Path,
-    candidate_path: &Path,
-    file_pattern: &Regex,
-) -> Result<()> {
-    let relative_path = match ingest::normalize_relative_path(request_root, candidate_path) {
-        Some(relative_path) => relative_path,
-        None => return Ok(()),
-    };
-
-    if !file_pattern.is_match(&relative_path) {
-        return Ok(());
-    }
-
-    let canonical_path = match std::fs::canonicalize(candidate_path) {
-        Ok(path) => path,
-        Err(_) => return Ok(()),
-    };
-    let filepath = canonical_path.to_string_lossy();
-    let mut conn = ctx.pool.get().with_context(|| {
-        format!("failed to acquire connection while deleting ignored document {filepath}")
-    })?;
-
-    let Some(document) = repository::find_document_by_path(&conn, &filepath)? else {
-        return Ok(());
-    };
-
-    repository::delete_document(&mut conn, document.id)
-        .with_context(|| format!("failed to delete ignored document {filepath}"))?;
 
     Ok(())
 }
@@ -566,60 +526,24 @@ fn gitdir_points_to_submodule(gitdir: &Path) -> bool {
     false
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitTrackedFiles {
-    included: Vec<PathBuf>,
-    ignored: Vec<PathBuf>,
-}
-
-fn git_list_tracked_files(repo_root: &Path) -> Result<GitTrackedFiles> {
-    let tracked_paths = git_ls_files(repo_root, &["ls-files", "--cached", "-z"])?;
-    let ignored_paths = git_ls_files(
-        repo_root,
-        &[
-            "ls-files",
-            "--cached",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ],
-    )?
-    .into_iter()
-    .collect::<HashSet<PathBuf>>();
-
-    let mut included = Vec::with_capacity(tracked_paths.len());
-    let mut ignored = Vec::new();
-
-    for path in tracked_paths {
-        if ignored_paths.contains(&path) {
-            ignored.push(path);
-        } else {
-            included.push(path);
-        }
-    }
-
-    Ok(GitTrackedFiles { included, ignored })
-}
-
-fn git_ls_files(repo_root: &Path, args: &[&str]) -> Result<Vec<PathBuf>> {
+fn git_list_tracked_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(args)
+        .args(["ls-files", "--cached", "-z"])
         .output()
         .with_context(|| format!("failed to invoke git for {}", repo_root.display()))?;
 
-    if output.status.success() {
-        return Ok(parse_git_path_list(&output.stdout));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "git ls-files failed for {}: {}",
+            repo_root.display(),
+            stderr.trim()
+        ));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(anyhow!(
-        "git ls-files failed for {} with args [{}]: {}",
-        repo_root.display(),
-        args.join(" "),
-        stderr.trim()
-    ))
+    Ok(parse_git_path_list(&output.stdout))
 }
 
 fn parse_git_path_list(stdout: &[u8]) -> Vec<PathBuf> {
