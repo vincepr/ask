@@ -18,12 +18,12 @@ function locationBlock(config, location) {
     return match[1];
 }
 
-test("nginx gives search requests twice the general API proxy timeout", () => {
+test("nginx gives search requests a 120 second proxy timeout", () => {
     const config = readNginxTemplate();
 
     const searchBlock = locationBlock(config, "= /api/search");
     const apiBlock = locationBlock(config, "/api/");
 
-    assert.match(searchBlock, /proxy_read_timeout 20s;/);
+    assert.match(searchBlock, /proxy_read_timeout 120s;/);
     assert.match(apiBlock, /proxy_read_timeout 10s;/);
 });
