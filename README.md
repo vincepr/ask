@@ -72,6 +72,11 @@ The static frontend is exposed at `http://localhost:13001/` by default and
 proxies API requests to the server container under `/api/*`. Override that host
 port with `ASK_FRONTEND_EXPOSE_PORT`.
 
+Docker mounts `ASK_DATA_DIR` into the server container at `/data` and
+`ASK_RESOURCE_DIR` at `/resources`. These host-side values may be relative or
+absolute paths. Inside the container, `ASK_SERVER_DATA_DIR` remains `/data` and
+`ASK_SERVER_RESOURCE_DIR` remains `/resources`.
+
 ## Ingesting documents
 
 After the server is running, tell it what to index by POSTing to `/ingest`:

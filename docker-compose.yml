@@ -47,8 +47,8 @@ services:
     ports:
       - "${ASK_SERVER_EXPOSE_PORT:-13000}:3000"
     volumes:
-      - ./${ASK_DATA_DIR:-.data}:/data
-      - ./${ASK_SERVER_RESOURCE_DIR:-.}:/resources
+      - ${ASK_DATA_DIR:-./.data}:/data
+      - ${ASK_RESOURCE_DIR:-${ASK_SERVER_RESOURCE_DIR:-.}}:/resources
 
   # text embedding server using openai-standard api
   tei:
