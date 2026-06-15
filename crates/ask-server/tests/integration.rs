@@ -204,6 +204,14 @@ fn json_body(text: &str) -> Body {
     Body::from(Bytes::from(text.to_owned()))
 }
 
+fn display_path(path: &std::path::Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn ingest_payload(root_path: &std::path::Path) -> String {
     ingest_payload_with_pattern(root_path, DEFAULT_FILE_PATTERN)
 }
@@ -3608,16 +3616,204 @@ async fn search_returns_unique_documents_with_match_score_only_by_default() {
     let results = body.as_array().unwrap();
     assert_eq!(results.len(), 2, "dedupe should still return 2 documents");
 
-    let filepath_a = doc_a_path.canonicalize().unwrap().display().to_string();
-    let filepath_b = doc_b_path.canonicalize().unwrap().display().to_string();
-    assert_eq!(results[0]["filepath"], filepath_a);
-    assert_eq!(results[1]["filepath"], filepath_b);
+    assert_eq!(
+        results[0]["filepath"],
+        format!("{}/search-a.txt", display_path(&db.dir))
+    );
+    assert_eq!(
+        results[1]["filepath"],
+        format!("{}/search-b.txt", display_path(&db.dir))
+    );
 
     assert!(
         results[0]["match_score"].as_f64().unwrap() >= results[1]["match_score"].as_f64().unwrap()
     );
     assert!(results[0].get("byte_start").is_none());
     assert!(results[0].get("byte_end").is_none());
+}
+
+#[tokio::test]
+async fn search_returns_data_relative_path_for_document_under_data_root() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-data-path", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let data_dir = db.dir.join("data");
+    std::fs::create_dir_all(data_dir.join("memory")).unwrap();
+    let data_path = data_dir.join("memory").join("daily.md");
+    std::fs::write(&data_path, "daily memory").unwrap();
+    let state = http::AppState::new_with_data_dir(db.pool().pool().clone(), &db.dir, &data_dir)
+        .unwrap()
+        .with_embedding_client(client.clone());
+    let doc_id = insert_document(&state, now, &data_path);
+
+    let conn = state.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let vectors = client.embed(&model, &["daily-query".to_string()]).unwrap();
+    let mut conn = state.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&vectors[0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = http::router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"daily-query","limit":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(
+        body.as_array().unwrap()[0]["filepath"],
+        format!("{}/memory/daily.md", display_path(&data_dir))
+    );
+}
+
+#[tokio::test]
+async fn search_uses_configured_display_root_for_resource_paths() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-display-path", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let resource_dir = db.dir.join("resources");
+    let data_dir = db.dir.join("data");
+    std::fs::create_dir_all(&resource_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let resource_path = resource_dir.join("notes.md");
+    std::fs::write(&resource_path, "resource notes").unwrap();
+    let state = http::AppState::new_with_display_dirs(
+        db.pool().pool().clone(),
+        &resource_dir,
+        &data_dir,
+        ".",
+        ".data",
+    )
+    .unwrap()
+    .with_embedding_client(client.clone());
+    let doc_id = insert_document(&state, now, &resource_path);
+
+    let conn = state.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let vectors = client
+        .embed(&model, &["display-query".to_string()])
+        .unwrap();
+    let mut conn = state.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&vectors[0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = http::router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"display-query","limit":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body.as_array().unwrap()[0]["filepath"], "./notes.md");
+}
+
+#[tokio::test]
+async fn search_leaves_paths_outside_configured_roots_unchanged() {
+    let db = TempDb::new();
+    let now = current_time();
+    let model_id = register_model_with_dimensions(&db.pool(), now, "search-outside-path", 4);
+    let client = Arc::new(DeterministicEmbeddingClient::new());
+
+    let outside_dir = unique_temp_dir();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_path = outside_dir.join("outside-search.txt");
+    std::fs::write(&outside_path, "outside").unwrap();
+    let outside_display = outside_path.canonicalize().unwrap().display().to_string();
+    let doc_id = insert_document(&db.pool(), now, &outside_path);
+
+    let conn = db.pool().get().unwrap();
+    let model = repository::find_model_by_id(&conn, model_id)
+        .unwrap()
+        .unwrap();
+    vector_index::ensure_active_search_model(&conn, &model, now).unwrap();
+    drop(conn);
+
+    let vectors = client
+        .embed(&model, &["outside-query".to_string()])
+        .unwrap();
+    let mut conn = db.pool().get().unwrap();
+    repository::replace_embeddings_for_document_model(
+        &mut conn,
+        doc_id,
+        model_id,
+        &[ask_core::models::EmbeddedChunk {
+            chunk_type: ask_core::types::ChunkType::Filename,
+            chunk_start: 0,
+            chunk_end: 0,
+            embedding: serialize_embedding(&vectors[0]),
+        }],
+        now,
+    )
+    .unwrap();
+    drop(conn);
+
+    let response = db
+        .router_with_embedding_client(client)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header("content-type", "application/json")
+                .body(json_body(r#"{"query":"outside-query","limit":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body.as_array().unwrap()[0]["filepath"], outside_display);
+
+    let _ = std::fs::remove_dir_all(outside_dir);
 }
 
 #[tokio::test]

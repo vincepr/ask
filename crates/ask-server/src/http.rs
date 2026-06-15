@@ -2,6 +2,7 @@ mod documents;
 mod health;
 mod ingest;
 mod progress;
+mod response_paths;
 mod search;
 
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use self::documents::MarkStalePayload;
 use self::ingest::IngestRequest;
 use self::progress::EmbeddingStatsResponse;
+use self::response_paths::{ResponsePathRoot, ResponsePathTranslator, display_path_root};
 use self::search::{SearchDocumentResult, SearchRequest};
 use crate::DbPool;
 use crate::config::{
@@ -72,6 +74,8 @@ impl RuntimeConfig {
 pub struct AppState {
     pool: DbPool,
     resource_root: PathBuf,
+    data_root: PathBuf,
+    path_translator: ResponsePathTranslator,
     embedding_client: SharedEmbeddingClient,
     runtime_config: RuntimeConfig,
 }
@@ -92,10 +96,77 @@ impl AppState {
     ///
     /// Returns an error if `resource_dir` cannot be canonicalized.
     pub fn new(pool: DbPool, resource_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let resource_dir = resource_dir.as_ref();
+        Self::new_with_data_dir(pool, resource_dir, resource_dir)
+    }
+
+    /// Creates HTTP state with canonicalized ingest and data roots.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Shared SQLite connection pool.
+    /// * `resource_dir` - Configured filesystem root allowed for ingest requests.
+    /// * `data_dir` - Configured filesystem root used for persistent server data.
+    ///
+    /// # Returns
+    ///
+    /// Canonicalized application state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either configured root cannot be canonicalized.
+    pub fn new_with_data_dir(
+        pool: DbPool,
+        resource_dir: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        let resource_dir = resource_dir.as_ref();
+        let data_dir = data_dir.as_ref();
+        Self::new_with_display_dirs(pool, resource_dir, data_dir, resource_dir, data_dir)
+    }
+
+    /// Creates HTTP state with canonical matching roots and separate response display roots.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Shared SQLite connection pool.
+    /// * `resource_dir` - Filesystem root allowed for ingest requests.
+    /// * `data_dir` - Filesystem root used for persistent server data.
+    /// * `resource_display_dir` - User-facing root used in response file paths for resources.
+    /// * `data_display_dir` - User-facing root used in response file paths for data files.
+    ///
+    /// # Returns
+    ///
+    /// Canonicalized application state that renders paths through the display roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either configured filesystem root cannot be canonicalized.
+    pub fn new_with_display_dirs(
+        pool: DbPool,
+        resource_dir: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        resource_display_dir: impl AsRef<Path>,
+        data_display_dir: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
         let resource_root = std::fs::canonicalize(resource_dir)?;
+        let data_root = std::fs::canonicalize(data_dir)?;
+        let path_translator = ResponsePathTranslator::new([
+            ResponsePathRoot {
+                root: resource_root.clone(),
+                display_root: display_path_root(resource_display_dir.as_ref()),
+            },
+            ResponsePathRoot {
+                root: data_root.clone(),
+                display_root: display_path_root(data_display_dir.as_ref()),
+            },
+        ]);
+
         Ok(Self {
             pool,
             resource_root: resource_root.clone(),
+            data_root,
+            path_translator,
             embedding_client: Arc::new(DeterministicEmbeddingClient::new()),
             runtime_config: RuntimeConfig {
                 data_dir: DEFAULT_DATA_DIR.to_string(),
@@ -141,10 +212,21 @@ impl AppState {
         &self.resource_root
     }
 
+    /// Returns the canonicalized server data root.
+    #[must_use]
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
     /// Returns the non-secret runtime configuration summary.
     #[must_use]
     pub fn runtime_config(&self) -> &RuntimeConfig {
         &self.runtime_config
+    }
+
+    #[must_use]
+    pub(crate) fn response_filepath(&self, stored_filepath: &str) -> String {
+        self.path_translator.response_filepath(stored_filepath)
     }
 }
 
