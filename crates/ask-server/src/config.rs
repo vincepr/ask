@@ -2,8 +2,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use ask_core::models::EmbeddingIdentity;
 
 pub const DATA_DIR_ENV: &str = "ASK_SERVER_DATA_DIR";
+pub const DATA_DISPLAY_DIR_ENV: &str = "ASK_SERVER_DATA_DISPLAY_DIR";
 pub const DATABASE_POOL_SIZE_ENV: &str = "ASK_SERVER_DATABASE_POOL_SIZE";
 pub const RESOURCE_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DIR";
+pub const RESOURCE_DISPLAY_DIR_ENV: &str = "ASK_SERVER_RESOURCE_DISPLAY_DIR";
 pub const BIND_HOST_ENV: &str = "ASK_SERVER_BIND_HOST";
 pub const BIND_PORT_ENV: &str = "ASK_SERVER_BIND_PORT";
 pub const EMBEDDING_MODEL_ENV: &str = "ASK_SERVER_EMBEDDING_MODEL";
@@ -69,10 +71,14 @@ impl EmbeddingProvider {
 pub struct Config {
     /// Filesystem path to the directory containing persistent server data.
     pub data_dir: String,
+    /// User-facing path prefix for files under `data_dir` in API responses.
+    pub data_display_dir: String,
     /// Maximum number of SQLite connections in the shared pool.
     pub database_pool_size: usize,
     /// Filesystem path to the directory containing resource files (code, configs, etc.).
     pub resource_dir: String,
+    /// User-facing path prefix for files under `resource_dir` in API responses.
+    pub resource_display_dir: String,
     /// Host or interface the HTTP server binds to.
     pub bind_host: String,
     /// TCP port the HTTP server binds to.
@@ -129,6 +135,7 @@ impl Config {
 /// missing required configuration.
 pub fn load() -> Result<Config> {
     let data_dir = std::env::var(DATA_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_DATA_DIR));
+    let data_display_dir = std::env::var(DATA_DISPLAY_DIR_ENV).unwrap_or_else(|_| data_dir.clone());
     let database_pool_size = match std::env::var(DATABASE_POOL_SIZE_ENV) {
         Ok(raw) => raw.parse::<usize>().with_context(|| {
             format!(
@@ -140,6 +147,8 @@ pub fn load() -> Result<Config> {
     };
     let resource_dir =
         std::env::var(RESOURCE_DIR_ENV).unwrap_or_else(|_| String::from(DEFAULT_RESOURCE_DIR));
+    let resource_display_dir =
+        std::env::var(RESOURCE_DISPLAY_DIR_ENV).unwrap_or_else(|_| resource_dir.clone());
     let bind_host =
         std::env::var(BIND_HOST_ENV).unwrap_or_else(|_| String::from(DEFAULT_BIND_HOST));
     let bind_port = match std::env::var(BIND_PORT_ENV) {
@@ -213,8 +222,10 @@ pub fn load() -> Result<Config> {
 
     Ok(Config {
         data_dir,
+        data_display_dir,
         database_pool_size,
         resource_dir,
+        resource_display_dir,
         bind_host,
         bind_port,
         embedding_model,

@@ -4,13 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ask_server::{
     config::{
-        BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DATABASE_POOL_SIZE_ENV, DEFAULT_BIND_HOST,
-        DEFAULT_BIND_PORT, DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE,
+        BIND_HOST_ENV, BIND_PORT_ENV, DATA_DIR_ENV, DATA_DISPLAY_DIR_ENV, DATABASE_POOL_SIZE_ENV,
+        DEFAULT_BIND_HOST, DEFAULT_BIND_PORT, DEFAULT_DATA_DIR, DEFAULT_DATABASE_POOL_SIZE,
         DEFAULT_EMBEDDING_MAX_BATCH_SIZE, DEFAULT_TEI_BASE_URL, DEFAULT_WORKER_COUNT,
         EMBEDDING_AUTH_TOKEN_ENV, EMBEDDING_BASE_URL_ENV, EMBEDDING_CHUNK_OVERLAP_ENV,
         EMBEDDING_CHUNK_SIZE_ENV, EMBEDDING_DIMENSIONS_ENV, EMBEDDING_MAX_BATCH_SIZE_ENV,
         EMBEDDING_MODE_ENV, EMBEDDING_MODEL_ENV, EMBEDDING_WORKER_COUNT_ENV, EmbeddingProvider,
-        load,
+        RESOURCE_DISPLAY_DIR_ENV, load,
     },
     create_pool_with_max_size, open_database,
 };
@@ -19,6 +19,8 @@ use ask_server::{
 fn load_uses_defaults_when_optional_env_is_missing() {
     let _env_lock = env_lock();
     let _data_dir_guard = EnvVarGuard::unset(DATA_DIR_ENV);
+    let _data_display_dir_guard = EnvVarGuard::unset(DATA_DISPLAY_DIR_ENV);
+    let _resource_display_dir_guard = EnvVarGuard::unset(RESOURCE_DISPLAY_DIR_ENV);
     let _host_guard = EnvVarGuard::unset(BIND_HOST_ENV);
     let _port_guard = EnvVarGuard::unset(BIND_PORT_ENV);
     let _mode_guard = EnvVarGuard::unset(EMBEDDING_MODE_ENV);
@@ -33,6 +35,7 @@ fn load_uses_defaults_when_optional_env_is_missing() {
     let config = load().expect("config load must succeed");
 
     assert_eq!(config.data_dir, DEFAULT_DATA_DIR);
+    assert_eq!(config.data_display_dir, DEFAULT_DATA_DIR);
     assert_eq!(config.bind_host, DEFAULT_BIND_HOST);
     assert_eq!(config.bind_port, DEFAULT_BIND_PORT);
     assert_eq!(config.bind_address(), "0.0.0.0:3000");
@@ -60,6 +63,8 @@ fn load_uses_defaults_when_optional_env_is_missing() {
 fn load_uses_env_overrides_when_present() {
     let _env_lock = env_lock();
     let _data_dir_guard = EnvVarGuard::set(DATA_DIR_ENV, "custom-data");
+    let _data_display_dir_guard = EnvVarGuard::unset(DATA_DISPLAY_DIR_ENV);
+    let _resource_display_dir_guard = EnvVarGuard::unset(RESOURCE_DISPLAY_DIR_ENV);
     let _host_guard = EnvVarGuard::set(BIND_HOST_ENV, "127.0.0.1");
     let _port_guard = EnvVarGuard::set(BIND_PORT_ENV, "4123");
     let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "tei");
@@ -72,6 +77,7 @@ fn load_uses_env_overrides_when_present() {
     let config = load().expect("config load must succeed");
 
     assert_eq!(config.data_dir, "custom-data");
+    assert_eq!(config.data_display_dir, "custom-data");
     assert_eq!(config.bind_host, "127.0.0.1");
     assert_eq!(config.bind_port, 4123);
     assert_eq!(config.bind_address(), "127.0.0.1:4123");
@@ -86,6 +92,23 @@ fn load_uses_env_overrides_when_present() {
     assert_eq!(config.embedding_max_batch_size, 64);
     assert_eq!(config.embedding_worker_count, 4);
     assert_eq!(config.database_pool_size, 9);
+}
+
+#[test]
+fn load_uses_internal_display_dir_overrides_when_present() {
+    let _env_lock = env_lock();
+    let _data_dir_guard = EnvVarGuard::set(DATA_DIR_ENV, "/data");
+    let _data_display_dir_guard = EnvVarGuard::set(DATA_DISPLAY_DIR_ENV, ".data");
+    let _resource_display_dir_guard = EnvVarGuard::set(RESOURCE_DISPLAY_DIR_ENV, ".");
+    let _mode_guard = EnvVarGuard::set(EMBEDDING_MODE_ENV, "tei");
+    let _base_url_guard = EnvVarGuard::set(EMBEDDING_BASE_URL_ENV, "http://127.0.0.1:18080");
+    let _model_guard = EnvVarGuard::set(EMBEDDING_MODEL_ENV, "custom-model");
+
+    let config = load().expect("config load must succeed");
+
+    assert_eq!(config.data_dir, "/data");
+    assert_eq!(config.data_display_dir, ".data");
+    assert_eq!(config.resource_display_dir, ".");
 }
 
 #[test]

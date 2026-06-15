@@ -75,7 +75,9 @@ port with `ASK_FRONTEND_EXPOSE_PORT`.
 Docker mounts `ASK_DATA_DIR` into the server container at `/data` and
 `ASK_RESOURCE_DIR` at `/resources`. These host-side values may be relative or
 absolute paths. Inside the container, `ASK_SERVER_DATA_DIR` remains `/data` and
-`ASK_SERVER_RESOURCE_DIR` remains `/resources`.
+`ASK_SERVER_RESOURCE_DIR` remains `/resources`. Search responses render file
+paths with the host-side values, so `ASK_RESOURCE_DIR=.` returns paths such as
+`./crates/ask-server/src/http/search.rs`.
 
 ## Ingesting documents
 
