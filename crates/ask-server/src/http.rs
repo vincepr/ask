@@ -2,6 +2,7 @@ mod documents;
 mod health;
 mod ingest;
 mod progress;
+mod response_paths;
 mod search;
 
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use self::documents::MarkStalePayload;
 use self::ingest::IngestRequest;
 use self::progress::EmbeddingStatsResponse;
+use self::response_paths::{ResponsePathRoot, ResponsePathTranslator, display_path_root};
 use self::search::{SearchDocumentResult, SearchRequest};
 use crate::DbPool;
 use crate::config::{
@@ -73,20 +75,9 @@ pub struct AppState {
     pool: DbPool,
     resource_root: PathBuf,
     data_root: PathBuf,
-    path_translator: PathTranslator,
+    path_translator: ResponsePathTranslator,
     embedding_client: SharedEmbeddingClient,
     runtime_config: RuntimeConfig,
-}
-
-#[derive(Clone)]
-struct PathTranslator {
-    roots: Vec<ResponsePathRoot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResponsePathRoot {
-    root: PathBuf,
-    display_root: String,
 }
 
 impl AppState {
@@ -160,7 +151,7 @@ impl AppState {
     ) -> std::io::Result<Self> {
         let resource_root = std::fs::canonicalize(resource_dir)?;
         let data_root = std::fs::canonicalize(data_dir)?;
-        let path_translator = PathTranslator::new([
+        let path_translator = ResponsePathTranslator::new([
             ResponsePathRoot {
                 root: resource_root.clone(),
                 display_root: display_path_root(resource_display_dir.as_ref()),
@@ -314,84 +305,6 @@ pub(super) fn load_active_model(conn: &rusqlite::Connection) -> anyhow::Result<E
         .ok_or_else(|| anyhow!("active model {active_model_id} does not exist"))
 }
 
-impl PathTranslator {
-    fn new<const N: usize>(roots: [ResponsePathRoot; N]) -> Self {
-        let mut roots = roots.into_iter().collect::<Vec<_>>();
-        roots.sort_by(|left, right| {
-            right
-                .root
-                .components()
-                .count()
-                .cmp(&left.root.components().count())
-        });
-        Self { roots }
-    }
-
-    fn response_filepath(&self, stored_filepath: &str) -> String {
-        let stored_path = Path::new(stored_filepath);
-        for root in &self.roots {
-            let Ok(relative) = stored_path.strip_prefix(&root.root) else {
-                continue;
-            };
-            if relative.as_os_str().is_empty() {
-                return root.display_root.clone();
-            }
-            return join_display_path(&root.display_root, relative);
-        }
-
-        stored_filepath.to_string()
-    }
-}
-
-fn display_path_root(path: &Path) -> String {
-    let normalized = path.display().to_string().replace('\\', "/");
-    if normalized.is_empty() {
-        return ".".to_string();
-    }
-
-    trim_display_root(&normalized).to_string()
-}
-
-fn trim_display_root(path: &str) -> &str {
-    let mut end = path.len();
-    while end > 1 && path[..end].ends_with('/') && !is_windows_drive_root(&path[..end]) {
-        end -= 1;
-    }
-    &path[..end]
-}
-
-fn is_windows_drive_root(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() == 3 && bytes[1] == b':' && bytes[2] == b'/'
-}
-
-fn join_display_path(display_root: &str, relative: &Path) -> String {
-    let relative = normalize_relative_response_path(relative);
-    if relative.is_empty() {
-        return display_root.to_string();
-    }
-
-    match display_root {
-        "/" => format!("/{relative}"),
-        "." => format!("./{relative}"),
-        _ if display_root.ends_with('/') => format!("{display_root}{relative}"),
-        _ => format!("{display_root}/{relative}"),
-    }
-}
-
-fn normalize_relative_response_path(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            std::path::Component::CurDir
-            | std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -410,33 +323,6 @@ mod tests {
     struct BlockingEmbeddingClient {
         entered_tx: Mutex<Option<mpsc::Sender<()>>>,
         release_rx: Mutex<mpsc::Receiver<()>>,
-    }
-
-    struct TempHttpDb {
-        dir: PathBuf,
-        pool: DbPool,
-    }
-
-    impl TempHttpDb {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "ask-http-path-test-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let db_path = dir.join("ask.sqlite3");
-            let pool = create_pool(&db_path.to_string_lossy()).unwrap();
-            Self { dir, pool }
-        }
-    }
-
-    impl Drop for TempHttpDb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
     }
 
     impl BlockingEmbeddingClient {
@@ -463,153 +349,6 @@ mod tests {
                 .map(|_| vec![0.0_f32; model.dimensions as usize])
                 .collect())
         }
-    }
-
-    #[test]
-    fn response_filepath_returns_resource_relative_path_for_matching_root() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        std::fs::create_dir_all(resource_root.join("nested")).unwrap();
-        std::fs::create_dir_all(&data_root).unwrap();
-        let state =
-            AppState::new_with_data_dir(db.pool.clone(), &resource_root, &data_root).unwrap();
-        let path = resource_root.join("nested").join("notes.md");
-        std::fs::write(&path, "notes").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(
-            state.response_filepath(&stored),
-            format!("{}/nested/notes.md", display_path_root(&resource_root))
-        );
-    }
-
-    #[test]
-    fn response_filepath_returns_data_relative_path_for_matching_root() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        std::fs::create_dir_all(&resource_root).unwrap();
-        std::fs::create_dir_all(data_root.join("memory")).unwrap();
-        let state =
-            AppState::new_with_data_dir(db.pool.clone(), &resource_root, &data_root).unwrap();
-        let path = data_root.join("memory").join("daily.md");
-        std::fs::write(&path, "daily").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(
-            state.response_filepath(&stored),
-            format!("{}/memory/daily.md", display_path_root(&data_root))
-        );
-    }
-
-    #[test]
-    fn response_filepath_uses_relative_resource_display_root() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        std::fs::create_dir_all(resource_root.join("nested")).unwrap();
-        std::fs::create_dir_all(&data_root).unwrap();
-        let state = AppState::new_with_display_dirs(
-            db.pool.clone(),
-            &resource_root,
-            &data_root,
-            ".",
-            ".data",
-        )
-        .unwrap();
-        let path = resource_root.join("nested").join("notes.md");
-        std::fs::write(&path, "notes").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(state.response_filepath(&stored), "./nested/notes.md");
-    }
-
-    #[test]
-    fn response_filepath_uses_windows_display_root() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        std::fs::create_dir_all(resource_root.join("nested")).unwrap();
-        std::fs::create_dir_all(&data_root).unwrap();
-        let state = AppState::new_with_display_dirs(
-            db.pool.clone(),
-            &resource_root,
-            &data_root,
-            r"C:\coding\ask\",
-            ".data",
-        )
-        .unwrap();
-        let path = resource_root.join("nested").join("notes.md");
-        std::fs::write(&path, "notes").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(
-            state.response_filepath(&stored),
-            "C:/coding/ask/nested/notes.md"
-        );
-    }
-
-    #[test]
-    fn response_filepath_uses_relative_data_display_root() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        std::fs::create_dir_all(&resource_root).unwrap();
-        std::fs::create_dir_all(data_root.join("memory")).unwrap();
-        let state = AppState::new_with_display_dirs(
-            db.pool.clone(),
-            &resource_root,
-            &data_root,
-            ".",
-            ".data",
-        )
-        .unwrap();
-        let path = data_root.join("memory").join("daily.md");
-        std::fs::write(&path, "daily").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(state.response_filepath(&stored), ".data/memory/daily.md");
-    }
-
-    #[test]
-    fn response_filepath_prefers_longest_matching_root() {
-        let db = TempHttpDb::new();
-        let data_root = db.dir.join("data");
-        let resource_root = data_root.join("resources");
-        std::fs::create_dir_all(resource_root.join("nested")).unwrap();
-        let state =
-            AppState::new_with_data_dir(db.pool.clone(), &resource_root, &data_root).unwrap();
-        let path = resource_root.join("nested").join("notes.md");
-        std::fs::write(&path, "notes").unwrap();
-        let stored = path.canonicalize().unwrap().to_string_lossy().into_owned();
-
-        assert_eq!(
-            state.response_filepath(&stored),
-            format!("{}/nested/notes.md", display_path_root(&resource_root))
-        );
-    }
-
-    #[test]
-    fn response_filepath_leaves_path_outside_configured_roots_unchanged() {
-        let db = TempHttpDb::new();
-        let resource_root = db.dir.join("resources");
-        let data_root = db.dir.join("data");
-        let outside_root = db.dir.join("outside");
-        std::fs::create_dir_all(&resource_root).unwrap();
-        std::fs::create_dir_all(&data_root).unwrap();
-        std::fs::create_dir_all(&outside_root).unwrap();
-        let outside = outside_root.join("notes.md");
-        std::fs::write(&outside, "outside").unwrap();
-        let state =
-            AppState::new_with_data_dir(db.pool.clone(), &resource_root, &data_root).unwrap();
-        let stored = outside
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(state.response_filepath(&stored), stored);
     }
 
     #[test]
