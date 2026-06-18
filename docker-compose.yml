@@ -108,6 +108,16 @@ services:
       - "8080"
       - --alias
       - onnx-community/Qwen3-Embedding-0.6B-ONNX
+      # Memory bounds: the defaults (32k ctx, auto slots, 8 GiB prompt cache) can
+      # exceed a small Docker VM and trigger OOM restarts during bulk embedding.
+      # Chunks are tiny (~150 tokens) and embeddings don't reuse cache, so cap hard.
+      - --ctx-size
+      - "4096"
+      - --parallel
+      - "2"
+      - --cache-ram
+      - "512"
+      - --no-cache-idle-slots
     ports:
       - "18080:8080"
     volumes:
