@@ -56,11 +56,23 @@ The server exposes a health endpoint at `GET /health`.
 
 ## Docker
 
-Use the local TEI-backed stack:
+Use the local TEI-backed stack (TEI publishes only `linux/amd64`, so on Apple
+Silicon this runs under emulation):
 
 ```bash
 docker compose --profile tei up --build
 ```
+
+Use the bundled llama.cpp embedding server instead — native `linux/arm64`, no
+emulation, same Qwen3-Embedding-0.6B model over an OpenAI-compatible endpoint.
+It is preconfigured in `.env.example` (set `ASK_SERVER_EMBEDDING_MODE=openai`
+and `ASK_USE_BUNDLED_LLAMACPP=1`):
+
+```bash
+docker compose --profile llamacpp up --build
+```
+
+The first start downloads the GGUF (~640 MB) into the `llamacpp_cache` volume.
 
 Use an external OpenAI-compatible embeddings backend:
 

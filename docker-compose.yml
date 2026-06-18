@@ -26,6 +26,12 @@ services:
             until wget -qO- http://tei/health >/dev/null; do
               sleep 1
             done
+          elif [ "${ASK_SERVER_EMBEDDING_MODE:-tei}" = "openai" ] && [ "${ASK_USE_BUNDLED_LLAMACPP:-0}" = "1" ]; then
+            # Bundled native-arm64 llama.cpp embedding server (llamacpp profile).
+            export ASK_SERVER_EMBEDDING_BASE_URL=http://llamacpp:8080/v1
+            until wget -qO- http://llamacpp:8080/health >/dev/null; do
+              sleep 1
+            done
           fi
           echo "http://localhost:${ASK_SERVER_EXPOSE_PORT:-13000}"
           exec ask-server
@@ -46,6 +52,8 @@ services:
       ASK_SERVER_EMBEDDING_MODE: ${ASK_SERVER_EMBEDDING_MODE:-tei}
       ASK_SERVER_EMBEDDING_BASE_URL: ${ASK_SERVER_EMBEDDING_BASE_URL:-http://tei:80}
       ASK_SERVER_EMBEDDING_AUTH_TOKEN: ${ASK_SERVER_EMBEDDING_AUTH_TOKEN:-}
+      # Compose-only: when 1 (with openai mode), target the bundled llamacpp service.
+      ASK_USE_BUNDLED_LLAMACPP: ${ASK_USE_BUNDLED_LLAMACPP:-0}
     ports:
       - "${ASK_SERVER_EXPOSE_PORT:-13000}:3000"
     volumes:
@@ -55,6 +63,7 @@ services:
   # text embedding server using openai-standard api
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    platform: linux/amd64
     container_name: ask-tei-qwen3-embedding
     restart: unless-stopped
     profiles:
@@ -78,5 +87,39 @@ services:
       timeout: 5s
       retries: 12
 
+  # OpenAI-compatible embedding server with native linux/arm64 support (no emulation).
+  # Serves the same Qwen3-Embedding-0.6B model as the tei profile via /v1/embeddings.
+  # Select with: ASK_SERVER_EMBEDDING_MODE=openai + ASK_USE_BUNDLED_LLAMACPP=1.
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: ask-llamacpp-qwen3-embedding
+    restart: unless-stopped
+    profiles:
+      - llamacpp
+    command:
+      - -hf
+      - Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+      - --embeddings
+      - --pooling
+      - last
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --alias
+      - onnx-community/Qwen3-Embedding-0.6B-ONNX
+    ports:
+      - "18080:8080"
+    volumes:
+      - llamacpp_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      # First boot downloads the GGUF (~640 MB); allow a long startup window.
+      retries: 60
+      start_period: 10s
+
 volumes:
   hf_cache:
+  llamacpp_cache:
