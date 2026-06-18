@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 const DOCUMENT_EMBEDDING_VEC_TABLE: &str = "document_embedding_vec";
 type SqliteAutoExtension = unsafe extern "C" fn(
     *mut rusqlite::ffi::sqlite3,
-    *mut *mut i8,
+    *mut *mut std::os::raw::c_char,
     *const rusqlite::ffi::sqlite3_api_routines,
 ) -> i32;
 
